@@ -1,0 +1,69 @@
+# MCP Server Configuration with OAuth 2.1 Authentication
+#
+# This example demonstrates how to configure OAuth authentication for your MCP server.
+# To use this config:
+# 1. Create a GitHub OAuth App at https://github.com/settings/developers
+# 2. Set the callback URL to: http://your-domain/callback
+# 3. Replace the clientId and clientSecret below with your GitHub OAuth App credentials
+# 4. Configure the allowlist to restrict access
+
+server:
+  mode: "http"
+  http:
+    host: "0.0.0.0"
+    port: 8080
+
+auth:
+  # Enable OAuth authentication (default: false)
+  enabled: true
+
+  # OAuth issuer URL - must match your server's public URL
+  issuer: "https://mcp.example.com"
+
+  github:
+    # GitHub OAuth App credentials
+    clientId: "Iv1.xxxxxxxxxxxxxxxxxx"
+    clientSecret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+    # Alternative: Load credentials from mounted secret files (for Docker/Kubernetes)
+    # clientIdFile: "/run/secrets/github_client_id"
+    # clientSecretFile: "/run/secrets/github_client_secret"
+
+  storage:
+    # Path to BoltDB file for storing OAuth tokens, sessions, and client registrations
+    dbPath: "/var/lib/go-mcp/oauth.db"
+
+  allowlist:
+    # GitHub usernames allowed to access the MCP server
+    users:
+      - "my-github-user"
+      - "another-user"
+
+    # GitHub organizations - any member can access
+    orgs:
+      - "my-company"
+      - "partner-org"
+
+    # GitHub teams - only members of these teams can access
+    teams:
+      - org: "my-company"
+        team: "platform-team"  # Use team slug, not display name
+      - org: "my-company"
+        team: "security-team"
+
+  # Pre-configured static clients (for apps like Claude Desktop)
+  clients:
+    - clientId: "claude-desktop-static"
+      clientSecret: "some-secure-random-secret"
+      name: "Claude Desktop"
+      redirectUris:
+        - "http://localhost:8765/callback"
+      scopes:
+        - "mcp:tools"
+        - "mcp:resources"
+
+    - clientId: "another-client"
+      clientSecret: "another-secure-secret"
+      name: "Custom MCP Client"
+      redirectUris:
+        - "https://app.example.com/oauth/callback"
