@@ -4,15 +4,16 @@ A reusable Go framework for building Model Context Protocol (MCP) servers with s
 
 ## Build Commands
 
-### Standard Go Build
+### Building the Example Application
+
 ```bash
-go build -o go-mcp ./cmd/go-mcp
+go build -o go-mcp ./examples/go-mcp
 ```
 
 ### Cross-Compilation
 For static binaries without CGO dependencies:
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o go-mcp ./cmd/go-mcp
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o go-mcp ./examples/go-mcp
 ```
 
 ### Multi-Platform Docker Builds
@@ -24,7 +25,7 @@ WORKDIR /build
 COPY . .
 # Cross-compile for target platform
 ARG TARGETPLATFORM
-RUN CGO_ENABLED=0 go build -o go-mcp ./cmd/go-mcp
+RUN CGO_ENABLED=0 go build -o go-mcp ./examples/go-mcp
 
 # Runtime stage
 FROM alpine:latest
@@ -37,23 +38,51 @@ Build for multiple platforms:
 docker buildx build --platform linux/amd64,linux/arm64 -t go-mcp:latest .
 ```
 
+## Using as a Library
+
+This framework is designed to be used as a library for building custom MCP servers:
+
+```go
+package main
+
+import (
+    "github.com/spirilis/generic-go-mcp/mcp"
+    "github.com/spirilis/generic-go-mcp/transport"
+)
+
+func main() {
+    // Create tool registry and register your tools
+    registry := mcp.NewToolRegistry()
+    registry.Register(myToolDef, myToolFunc)
+
+    // Create MCP server with custom name/version
+    server := mcp.NewServer(registry, &mcp.ServerConfig{
+        Name:    "my-mcp-server",
+        Version: "1.0.0",
+    })
+
+    // Create and start transport
+    trans := transport.NewStdioTransport()
+    trans.Start(server)
+}
+```
+
 ## Architecture Overview
 
 The framework follows a layered architecture pattern:
 
-### Transport Layer (`internal/transport/`)
+### Transport Layer (`transport/`)
 Abstracts communication mechanisms (stdio vs HTTP/SSE) behind a common interface. Allows MCP servers to run in different environments without protocol-specific code changes.
 
 **Key Interface:**
 ```go
 type Transport interface {
-    Read() ([]byte, error)
-    Write([]byte) error
-    Close() error
+    Start(handler MessageHandler) error
+    Stop() error
 }
 ```
 
-### MCP Protocol Layer (`internal/mcp/`)
+### MCP Protocol Layer (`mcp/`)
 Handles JSON-RPC 2.0 message parsing, validation, and routing. Manages tool definitions and their registration.
 
 **Responsibilities:**
@@ -61,8 +90,9 @@ Handles JSON-RPC 2.0 message parsing, validation, and routing. Manages tool defi
 - Tool definition schema
 - Method routing
 - Error handling per MCP specification
+- Server name/version configuration
 
-### Auth Layer (`internal/auth/`)
+### Auth Layer (`auth/`)
 Implements authentication and authorization for HTTP/SSE mode.
 
 **Components:**
@@ -71,16 +101,7 @@ Implements authentication and authorization for HTTP/SSE mode.
 - Session management
 - Authentication middleware
 
-### Server Layer (`internal/server/`)
-HTTP server implementation using Chi router.
-
-**Features:**
-- RESTful endpoint routing
-- SSE endpoint for MCP protocol
-- OAuth callback handling
-- Middleware chain (auth, logging, CORS)
-
-### Config Layer (`internal/config/`)
+### Config Layer (`config/`)
 Flexible configuration loading supporting multiple sources:
 
 **Sources (in priority order):**
@@ -88,6 +109,14 @@ Flexible configuration loading supporting multiple sources:
 2. Environment variables
 3. YAML configuration files
 4. Defaults
+
+### Logging Layer (`logging/`)
+Structured logging with multiple levels and formats.
+
+**Features:**
+- Trace, Debug, Info, Warn, Error levels
+- JSON and text output formats
+- Header sanitization for security
 
 ## Key Patterns
 
@@ -180,16 +209,19 @@ Executes the local `fortune` CLI command and returns output.
 
 ```
 generic-go-mcp/
-├── cmd/
-│   └── go-mcp/           # Main entry point
-├── internal/
-│   ├── transport/        # Transport abstraction
-│   ├── mcp/              # MCP protocol implementation
-│   ├── auth/             # OAuth and authentication
-│   ├── server/           # HTTP server (Chi)
-│   └── config/           # Configuration loading
-└── CLAUDE.md             # This file
+├── config/               # PUBLIC: Configuration types and loading
+├── logging/              # PUBLIC: Structured logging
+├── auth/                 # PUBLIC: OAuth authentication (HTTP mode)
+├── transport/            # PUBLIC: Transport abstractions (stdio, HTTP/SSE)
+├── mcp/                  # PUBLIC: MCP protocol implementation
+├── examples/             # Example implementations
+│   ├── go-mcp/           # Example MCP server application
+│   └── tools/            # Reference tool implementations (date, fortune)
+├── CLAUDE.md             # This file
+└── go.mod                # Go module definition
 ```
+
+All packages under the root are public and importable by third-party code, enabling you to build custom MCP servers using this framework as a library.
 
 ## Development Guidelines
 
