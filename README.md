@@ -1,10 +1,10 @@
 # generic-go-mcp
 
-A reusable Go framework for building [Model Context Protocol](https://spec.modelcontextprotocol.io/) (MCP) servers with support for both stdio and HTTP/SSE transports.
+A reusable Go framework for building [Model Context Protocol](https://spec.modelcontextprotocol.io/) (MCP) servers with support for both stdio and Streaming HTTP transports.
 
 ## Overview
 
-**generic-go-mcp** is a production-ready library that abstracts away the complexity of implementing MCP servers. It handles JSON-RPC 2.0 message parsing, transport layer management, authentication, and configuration—allowing you to focus on building powerful tools for Claude and other MCP clients.
+**generic-go-mcp** is a library that abstracts away the complexity of implementing MCP servers. It handles JSON-RPC 2.0 message parsing, transport layer management, authentication, and configuration—allowing you to focus on building powerful tools for Claude and other MCP clients.
 
 ### What is MCP?
 
@@ -12,7 +12,7 @@ The Model Context Protocol enables AI assistants like Claude to interact with ex
 
 ## Features
 
-- **Dual Transport Support** - Run in stdio mode (for desktop integration) or HTTP/SSE mode (for web services)
+- **Dual Transport Support** - Run in stdio mode (for desktop integration) or Streaming HTTP mode (for web services)
 - **OAuth Authentication** - Built-in GitHub OAuth 2.0 support with PKCE for HTTP mode
 - **Flexible Configuration** - Load from YAML files, environment variables, or mounted secrets
 - **Structured Logging** - Multi-level logging (trace/debug/info/warn/error) with JSON and text formats
@@ -82,14 +82,14 @@ generic-go-mcp/
 ├── config/               # Configuration loading (YAML, env vars, secrets)
 ├── logging/              # Structured logging with multiple levels
 ├── auth/                 # OAuth 2.0 authentication (GitHub)
-├── transport/            # Transport abstractions (stdio, HTTP/SSE)
+├── transport/            # Transport abstractions (stdio, Streaming HTTP)
 ├── mcp/                  # MCP protocol implementation (JSON-RPC 2.0)
 ├── examples/
 │   ├── go-mcp/           # Complete example server application
 │   └── tools/            # Reference tool implementations (date, fortune)
 ├── CLAUDE-new-project-harness.md  # Comprehensive getting started guide
 ├── CLAUDE.md             # Architecture and design patterns
-├── HTTP-TRANSPORT.md     # HTTP/SSE transport documentation
+├── HTTP-TRANSPORT.md     # HTTP transport documentation
 └── LOGGING.md            # Logging system documentation
 ```
 
@@ -156,7 +156,7 @@ See [examples/](examples/) for more configuration samples.
 
 - **[CLAUDE-new-project-harness.md](CLAUDE-new-project-harness.md)** - Complete guide to building MCP servers with this library
 - **[CLAUDE.md](CLAUDE.md)** - Architecture overview and design patterns
-- **[HTTP-TRANSPORT.md](HTTP-TRANSPORT.md)** - HTTP/SSE transport details
+- **[HTTP-TRANSPORT.md](HTTP-TRANSPORT.md)** - HTTP transport details
 - **[LOGGING.md](LOGGING.md)** - Logging system documentation
 - **[MCP Specification](https://spec.modelcontextprotocol.io/)** - Official Model Context Protocol specification
 
@@ -180,7 +180,7 @@ go build -o go-mcp ./examples/go-mcp
 ### Transport Layer
 Abstracts communication mechanisms behind a common interface:
 - **StdioTransport** - Reads from stdin, writes to stdout (for Claude Code, desktop apps)
-- **HTTPTransport** - HTTP/SSE streaming (for web services, remote access)
+- **HTTPTransport** - HTTP streaming (for web services, remote access)
 
 ### Tool Registry
 Simple API for registering and invoking tools:
@@ -224,7 +224,7 @@ Contributions are welcome! This library is designed to be general-purpose and no
 
 1. Keep the core library transport-agnostic
 2. Follow JSON-RPC 2.0 and MCP specification conventions
-3. Add tests for both stdio and HTTP/SSE transports
+3. Add tests for both stdio and HTTP transports
 4. Document new features in the appropriate .md files
 
 ## Acknowledgments
