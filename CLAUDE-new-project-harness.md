@@ -407,10 +407,8 @@ trans = transport.NewHTTPTransport(transport.HTTPTransportConfig{
 
 The library supports multiple configuration sources (in priority order):
 
-1. **Mounted secrets** (Kubernetes/Docker) - `/run/secrets/`
-2. **Environment variables** - `MCP_SERVER_MODE`, `MCP_LOGGING_LEVEL`, etc.
-3. **YAML files** - Specified with `-config` flag
-4. **Defaults** - Fallback values
+1. **YAML files** - Specified with `-config` flag
+2. **Defaults** - Fallback values
 
 ## Build Commands
 

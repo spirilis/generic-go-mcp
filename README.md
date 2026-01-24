@@ -112,10 +112,8 @@ This guide covers:
 
 The library supports flexible configuration from multiple sources (in priority order):
 
-1. Mounted secrets (Kubernetes/Docker) - `/run/secrets/`
-2. Environment variables - `MCP_SERVER_MODE`, `MCP_LOGGING_LEVEL`, etc.
-3. YAML configuration files - Specified via `-config` flag
-4. Defaults - Fallback values
+1. YAML configuration files - Specified via `-config` flag
+2. Defaults - Fallback values
 
 ### Example Configuration (stdio mode)
 
