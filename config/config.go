@@ -92,9 +92,14 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
+	return LoadFromBytes(data)
+}
+
+// LoadFromBytes parses configuration from a YAML byte slice
+func LoadFromBytes(data []byte) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
 	// Apply defaults
@@ -143,4 +148,22 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// LoadFromString parses configuration from a YAML string
+func LoadFromString(yamlContent string) (*Config, error) {
+	return LoadFromBytes([]byte(yamlContent))
+}
+
+// NewDefaultConfig creates a Config with all defaults applied
+func NewDefaultConfig() *Config {
+	return &Config{
+		Server: ServerConfig{
+			Mode: "stdio",
+		},
+		Logging: &LoggingConfig{
+			Level:  "info",
+			Format: "text",
+		},
+	}
 }

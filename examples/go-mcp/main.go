@@ -16,15 +16,164 @@ import (
 	"github.com/spirilis/generic-go-mcp/transport"
 )
 
+// cliFlags holds all command-line flag values
+type cliFlags struct {
+	mode         string
+	unixSocket   string
+	unixName     string
+	unixFileMode string
+	httpHost     string
+	httpPort     int
+	logLevel     string
+	logFormat    string
+}
+
+// applyCLIOverrides applies command-line flags to the configuration
+func applyCLIOverrides(cfg *config.Config, flags cliFlags) {
+	// Override mode
+	if flags.mode != "" {
+		cfg.Server.Mode = flags.mode
+	}
+
+	// Override unix settings
+	if flags.unixSocket != "" || flags.unixName != "" || flags.unixFileMode != "" {
+		if cfg.Server.Unix == nil {
+			cfg.Server.Unix = &config.UnixConfig{}
+		}
+		if flags.unixSocket != "" {
+			cfg.Server.Unix.SocketPath = flags.unixSocket
+		}
+		if flags.unixName != "" {
+			cfg.Server.Unix.Name = flags.unixName
+		}
+		if flags.unixFileMode != "" {
+			// Parse octal file mode
+			var mode uint64
+			_, err := fmt.Sscanf(flags.unixFileMode, "%o", &mode)
+			if err == nil {
+				cfg.Server.Unix.FileMode = uint32(mode)
+			}
+		}
+	}
+
+	// Override HTTP settings
+	if flags.httpHost != "" || flags.httpPort != 0 {
+		if cfg.Server.HTTP == nil {
+			cfg.Server.HTTP = &config.HTTPConfig{}
+		}
+		if flags.httpHost != "" {
+			cfg.Server.HTTP.Host = flags.httpHost
+		}
+		if flags.httpPort != 0 {
+			cfg.Server.HTTP.Port = flags.httpPort
+		}
+	}
+
+	// Override logging settings
+	if flags.logLevel != "" {
+		if cfg.Logging == nil {
+			cfg.Logging = &config.LoggingConfig{}
+		}
+		cfg.Logging.Level = flags.logLevel
+	}
+	if flags.logFormat != "" {
+		if cfg.Logging == nil {
+			cfg.Logging = &config.LoggingConfig{}
+		}
+		cfg.Logging.Format = flags.logFormat
+	}
+}
+
+// validateConfig validates the configuration
+func validateConfig(cfg *config.Config) error {
+	// Validate mode
+	switch cfg.Server.Mode {
+	case "stdio", "http", "unix":
+		// Valid modes
+	default:
+		return fmt.Errorf("invalid mode '%s', must be stdio, http, or unix", cfg.Server.Mode)
+	}
+
+	// Validate unix mode requirements
+	if cfg.Server.Mode == "unix" {
+		if cfg.Server.Unix == nil {
+			return fmt.Errorf("unix configuration required when mode is 'unix'")
+		}
+		if cfg.Server.Unix.SocketPath == "" {
+			return fmt.Errorf("unix-socket is required for unix mode")
+		}
+		if cfg.Server.Unix.Name == "" {
+			return fmt.Errorf("unix-name is required for unix mode")
+		}
+		// Apply default file mode if not set
+		if cfg.Server.Unix.FileMode == 0 {
+			cfg.Server.Unix.FileMode = 0660
+		}
+	}
+
+	// Validate HTTP mode requirements
+	if cfg.Server.Mode == "http" {
+		if cfg.Server.HTTP == nil {
+			cfg.Server.HTTP = &config.HTTPConfig{
+				Host: "0.0.0.0",
+				Port: 8080,
+			}
+		}
+		if cfg.Server.HTTP.Host == "" {
+			cfg.Server.HTTP.Host = "0.0.0.0"
+		}
+		if cfg.Server.HTTP.Port == 0 {
+			cfg.Server.HTTP.Port = 8080
+		}
+	}
+
+	return nil
+}
+
 func main() {
-	// Parse command-line flags
-	configPath := flag.String("config", "config.yaml", "Path to configuration file")
+	// Define command-line flags
+	configPath := flag.String("config", "", "Path to configuration file (optional)")
+	mode := flag.String("mode", "", "Transport mode: stdio, http, unix")
+	unixSocket := flag.String("unix-socket", "", "Unix socket path")
+	unixName := flag.String("unix-name", "", "Server name for /name resource")
+	unixFileMode := flag.String("unix-filemode", "", "Socket permissions (octal, e.g., 0660)")
+	httpHost := flag.String("http-host", "", "HTTP bind address")
+	httpPort := flag.Int("http-port", 0, "HTTP port")
+	logLevel := flag.String("log-level", "", "Logging level")
+	logFormat := flag.String("log-format", "", "Logging format")
 	flag.Parse()
 
 	// Load configuration
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+	var cfg *config.Config
+	var err error
+
+	if *configPath != "" {
+		// Load from file
+		cfg, err = config.Load(*configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		// Start with defaults
+		cfg = config.NewDefaultConfig()
+	}
+
+	// Apply CLI overrides
+	applyCLIOverrides(cfg, cliFlags{
+		mode:         *mode,
+		unixSocket:   *unixSocket,
+		unixName:     *unixName,
+		unixFileMode: *unixFileMode,
+		httpHost:     *httpHost,
+		httpPort:     *httpPort,
+		logLevel:     *logLevel,
+		logFormat:    *logFormat,
+	})
+
+	// Validate configuration
+	if err := validateConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
 		os.Exit(1)
 	}
 

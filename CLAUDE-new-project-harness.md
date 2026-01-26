@@ -241,6 +241,7 @@ import (
     "fmt"
     "os"
     "os/signal"
+    "strconv"
     "syscall"
 
     "github.com/spirilis/generic-go-mcp/config"
@@ -253,15 +254,29 @@ import (
 )
 
 func main() {
-    // 1. Parse command-line flags
-    configPath := flag.String("config", "config.yaml", "Path to configuration file")
+    // 1. Parse command-line flags (optional CLI override support)
+    configPath := flag.String("config", "", "Path to configuration file (optional)")
+    mode := flag.String("mode", "", "Transport mode: stdio, http, unix")
+    // Add other flags as needed for your use case
     flag.Parse()
 
-    // 2. Load configuration
-    cfg, err := config.Load(*configPath)
-    if err != nil {
-        fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
-        os.Exit(1)
+    // 2. Load configuration (with CLI override support)
+    var cfg *config.Config
+    var err error
+
+    if *configPath != "" {
+        cfg, err = config.Load(*configPath)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+            os.Exit(1)
+        }
+    } else {
+        cfg = config.NewDefaultConfig()
+    }
+
+    // Apply CLI overrides if provided
+    if *mode != "" {
+        cfg.Server.Mode = *mode
     }
 
     // 3. Initialize logger early (so all subsequent code can use logging)
@@ -274,13 +289,16 @@ func main() {
     // Add more tools as needed
     // registry.Register(tools.GetMyToolDefinition(), tools.MyTool)
 
-    // 5. Create MCP server with custom name and version
-    server := mcp.NewServer(registry, &mcp.ServerConfig{
+    // 5. Create resource registry (for unix mode /name and /pid resources)
+    resourceRegistry := mcp.NewResourceRegistry()
+
+    // 6. Create MCP server with custom name and version
+    server := mcp.NewServer(registry, resourceRegistry, &mcp.ServerConfig{
         Name:    "my-mcp-server",
         Version: "1.0.0",
     })
 
-    // 6. Create and start transport based on config
+    // 7. Create and start transport based on config
     var trans transport.Transport
     switch cfg.Server.Mode {
     case "stdio":
@@ -295,25 +313,52 @@ func main() {
         logging.Info("Starting MCP server in HTTP mode",
             "host", cfg.Server.HTTP.Host,
             "port", cfg.Server.HTTP.Port)
+    case "unix":
+        // Register /name resource
+        resourceRegistry.Register(mcp.Resource{
+            URI:         "/name",
+            Name:        "Endpoint Name",
+            Description: "The configured name of this MCP endpoint",
+            MimeType:    "text/plain",
+        }, func() (string, error) {
+            return cfg.Server.Unix.Name, nil
+        })
+
+        // Register /pid resource
+        resourceRegistry.Register(mcp.Resource{
+            URI:         "/pid",
+            Name:        "Process ID",
+            Description: "PID of the MCP server process (send SIGINT or SIGTERM to stop)",
+            MimeType:    "text/plain",
+        }, func() (string, error) {
+            return strconv.Itoa(os.Getpid()), nil
+        })
+
+        trans = transport.NewUnixTransport(transport.UnixTransportConfig{
+            SocketPath: cfg.Server.Unix.SocketPath,
+            FileMode:   os.FileMode(cfg.Server.Unix.FileMode),
+        })
+        logging.Info("Starting MCP server in UNIX socket mode",
+            "socket", cfg.Server.Unix.SocketPath, "name", cfg.Server.Unix.Name)
     default:
         logging.Error("Unknown transport mode", "mode", cfg.Server.Mode)
         os.Exit(1)
     }
 
-    // 7. Start the transport
+    // 8. Start the transport
     if err := trans.Start(server); err != nil {
         logging.Error("Error starting transport", "error", err)
         os.Exit(1)
     }
 
-    // 8. Wait for interrupt signal (Ctrl+C)
+    // 9. Wait for interrupt signal (Ctrl+C)
     sigCh := make(chan os.Signal, 1)
     signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
     <-sigCh
 
     logging.Info("Shutting down gracefully")
 
-    // 9. Graceful shutdown
+    // 10. Graceful shutdown
     if err := trans.Stop(); err != nil {
         logging.Error("Error stopping transport", "error", err)
         os.Exit(1)
@@ -353,6 +398,27 @@ logging:
   level: "info"
   format: "text"
 ```
+
+### Unix Mode Configuration
+
+Create `config-unix.yaml`:
+
+```yaml
+server:
+  mode: "unix"
+  unix:
+    socket_path: "/var/run/mcp/my-server.sock"
+    name: "my-mcp-server"
+    file_mode: 0660  # Optional, defaults to 0660
+
+logging:
+  level: "info"
+  format: "text"
+```
+
+**Note:** When running in Unix mode, the server automatically registers two resources:
+- `/name` - Returns the configured server name
+- `/pid` - Returns the process ID (useful for sending shutdown signals)
 
 ### Advanced Configuration with Auth
 
@@ -407,8 +473,79 @@ trans = transport.NewHTTPTransport(transport.HTTPTransportConfig{
 
 The library supports multiple configuration sources (in priority order):
 
-1. **YAML files** - Specified with `-config` flag
-2. **Defaults** - Fallback values
+1. **CLI arguments** (highest) - override everything
+2. **YAML files** - Specified with `--config` flag
+3. **Defaults** (lowest) - Fallback values
+
+## Command-Line Arguments
+
+You can configure your MCP server entirely through command-line arguments without requiring a configuration file, or use CLI arguments to override specific settings from a config file.
+
+### Available Flags
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--config` | string | Path to config file (optional) |
+| `--mode` | string | Transport mode: stdio, http, unix |
+| `--unix-socket` | string | Unix socket path |
+| `--unix-name` | string | Server name for /name resource |
+| `--unix-filemode` | string | Socket permissions (octal, e.g., 0660) |
+| `--http-host` | string | HTTP bind address |
+| `--http-port` | int | HTTP port |
+| `--log-level` | string | Logging level (trace, debug, info, warn, error) |
+| `--log-format` | string | Logging format (text, json) |
+
+### Configuration Priority
+
+Settings are applied in this order (later sources override earlier ones):
+
+1. Default values
+2. Configuration file (if `--config` is specified)
+3. Command-line arguments (highest priority)
+
+### Examples
+
+**Unix mode with CLI-only (no config file):**
+```bash
+./my-mcp-server --mode unix \
+  --unix-socket /var/run/mcp/my-server.sock \
+  --unix-name my-server \
+  --log-level debug
+```
+
+**With config file + CLI overrides:**
+```bash
+# Load base config from file, but override socket path
+./my-mcp-server --config config.yaml \
+  --mode unix \
+  --unix-socket /tmp/mcp.sock
+```
+
+**HTTP mode with CLI-only:**
+```bash
+./my-mcp-server --mode http \
+  --http-host 127.0.0.1 \
+  --http-port 9090 \
+  --log-level info \
+  --log-format json
+```
+
+**Stdio mode (default):**
+```bash
+# No arguments needed for stdio mode with defaults
+./my-mcp-server
+
+# Or be explicit:
+./my-mcp-server --mode stdio --log-level debug
+```
+
+**Override just logging:**
+```bash
+# Use config file for everything except logging
+./my-mcp-server --config config.yaml \
+  --log-level trace \
+  --log-format json
+```
 
 ## Build Commands
 
