@@ -16,14 +16,22 @@ type Config struct {
 
 // ServerConfig represents server-specific configuration
 type ServerConfig struct {
-	Mode string      `yaml:"mode"` // "stdio" or "http"
+	Mode string      `yaml:"mode"` // "stdio", "http", or "unix"
 	HTTP *HTTPConfig `yaml:"http,omitempty"`
+	Unix *UnixConfig `yaml:"unix,omitempty"`
 }
 
 // HTTPConfig represents HTTP server configuration
 type HTTPConfig struct {
 	Host string `yaml:"host"` // Default: "0.0.0.0"
 	Port int    `yaml:"port"` // Default: 8080
+}
+
+// UnixConfig represents UNIX domain socket configuration
+type UnixConfig struct {
+	SocketPath string `yaml:"socket_path"` // Required
+	Name       string `yaml:"name"`        // Required - exposed as /name resource
+	FileMode   uint32 `yaml:"file_mode"`   // Optional, default 0660
 }
 
 // LoggingConfig represents logging configuration
@@ -104,6 +112,22 @@ func Load(path string) (*Config, error) {
 		}
 		if cfg.Server.HTTP.Port == 0 {
 			cfg.Server.HTTP.Port = 8080
+		}
+	}
+
+	// Validate and apply UNIX defaults
+	if cfg.Server.Mode == "unix" {
+		if cfg.Server.Unix == nil {
+			return nil, fmt.Errorf("unix configuration required when mode is 'unix'")
+		}
+		if cfg.Server.Unix.SocketPath == "" {
+			return nil, fmt.Errorf("socket_path is required for unix mode")
+		}
+		if cfg.Server.Unix.Name == "" {
+			return nil, fmt.Errorf("name is required for unix mode")
+		}
+		if cfg.Server.Unix.FileMode == 0 {
+			cfg.Server.Unix.FileMode = 0660
 		}
 	}
 

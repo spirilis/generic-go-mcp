@@ -1,0 +1,10 @@
+server:
+  mode: unix
+  unix:
+    socket_path: /tmp/go-mcp.sock
+    name: go-mcp-example-endpoint
+    file_mode: 0660
+
+logging:
+  level: debug
+  format: text

@@ -27,7 +27,8 @@ type InitializeResult struct {
 
 // Capabilities represents server capabilities
 type Capabilities struct {
-	Tools map[string]interface{} `json:"tools"`
+	Tools     map[string]interface{}  `json:"tools"`
+	Resources *map[string]interface{} `json:"resources,omitempty"`
 }
 
 // ServerInfo contains information about the server
@@ -43,11 +44,19 @@ func (s *Server) handleInitialize(params json.RawMessage) (interface{}, error) {
 		return nil, fmt.Errorf("invalid initialize params: %w", err)
 	}
 
+	capabilities := Capabilities{
+		Tools: map[string]interface{}{},
+	}
+
+	// Include resources capability if we have any resources
+	if s.resourceRegistry.HasResources() {
+		emptyMap := make(map[string]interface{})
+		capabilities.Resources = &emptyMap
+	}
+
 	return InitializeResult{
 		ProtocolVersion: "2024-11-05",
-		Capabilities: Capabilities{
-			Tools: map[string]interface{}{},
-		},
+		Capabilities:    capabilities,
 		ServerInfo: ServerInfo{
 			Name:    s.config.Name,
 			Version: s.config.Version,
@@ -95,4 +104,56 @@ func (s *Server) handleToolsCall(params json.RawMessage) (interface{}, error) {
 	}
 
 	return result, nil
+}
+
+// ResourcesListResult represents the result of resources/list request
+type ResourcesListResult struct {
+	Resources []Resource `json:"resources"`
+}
+
+// handleResourcesList returns the list of available resources
+func (s *Server) handleResourcesList(params json.RawMessage) (interface{}, error) {
+	return ResourcesListResult{
+		Resources: s.resourceRegistry.List(),
+	}, nil
+}
+
+// ResourcesReadParams represents the parameters for resources/read request
+type ResourcesReadParams struct {
+	URI string `json:"uri"`
+}
+
+// ResourcesReadResult represents the result of resources/read request
+type ResourcesReadResult struct {
+	Contents []ResourceContent `json:"contents"`
+}
+
+// ResourceContent represents the content of a resource
+type ResourceContent struct {
+	URI      string `json:"uri"`
+	MimeType string `json:"mimeType,omitempty"`
+	Text     string `json:"text,omitempty"`
+}
+
+// handleResourcesRead reads a resource and returns its content
+func (s *Server) handleResourcesRead(params json.RawMessage) (interface{}, error) {
+	var readParams ResourcesReadParams
+	if err := json.Unmarshal(params, &readParams); err != nil {
+		return nil, fmt.Errorf("invalid resources/read params: %w", err)
+	}
+
+	content, err := s.resourceRegistry.Read(readParams.URI)
+	if err != nil {
+		return nil, err
+	}
+
+	return ResourcesReadResult{
+		Contents: []ResourceContent{
+			{
+				URI:      readParams.URI,
+				MimeType: "text/plain",
+				Text:     content,
+			},
+		},
+	}, nil
 }

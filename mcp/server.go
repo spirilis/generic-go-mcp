@@ -15,14 +15,15 @@ type ServerConfig struct {
 
 // Server implements the MCP protocol
 type Server struct {
-	registry    *ToolRegistry
-	config      ServerConfig
-	initialized bool
+	registry         *ToolRegistry
+	resourceRegistry *ResourceRegistry
+	config           ServerConfig
+	initialized      bool
 }
 
-// NewServer creates a new MCP server with the given registry and configuration.
+// NewServer creates a new MCP server with the given registry, resource registry, and configuration.
 // If config is nil, default values are used.
-func NewServer(registry *ToolRegistry, config *ServerConfig) *Server {
+func NewServer(registry *ToolRegistry, resourceRegistry *ResourceRegistry, config *ServerConfig) *Server {
 	cfg := ServerConfig{
 		Name:    "generic-go-mcp",
 		Version: "0.1.0",
@@ -36,9 +37,10 @@ func NewServer(registry *ToolRegistry, config *ServerConfig) *Server {
 		}
 	}
 	return &Server{
-		registry:    registry,
-		config:      cfg,
-		initialized: false,
+		registry:         registry,
+		resourceRegistry: resourceRegistry,
+		config:           cfg,
+		initialized:      false,
 	}
 }
 
@@ -76,6 +78,10 @@ func (s *Server) HandleMessage(data []byte) []byte {
 		result, err = s.handleToolsList(req.Params)
 	case "tools/call":
 		result, err = s.handleToolsCall(req.Params)
+	case "resources/list":
+		result, err = s.handleResourcesList(req.Params)
+	case "resources/read":
+		result, err = s.handleResourcesRead(req.Params)
 	default:
 		logging.Debug("JSON-RPC method not found", "method", req.Method)
 		return s.errorResponse(req.ID, transport.MethodNotFound, "Method not found", nil)

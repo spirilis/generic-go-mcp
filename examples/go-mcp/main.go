@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/spirilis/generic-go-mcp/auth"
@@ -35,8 +36,11 @@ func main() {
 	registry.Register(tools.GetDateToolDefinition(), tools.DateTool)
 	registry.Register(tools.GetFortuneToolDefinition(), tools.FortuneTool)
 
+	// Create resource registry
+	resourceRegistry := mcp.NewResourceRegistry()
+
 	// Create MCP server
-	server := mcp.NewServer(registry, &mcp.ServerConfig{
+	server := mcp.NewServer(registry, resourceRegistry, &mcp.ServerConfig{
 		Name:    "go-mcp-example",
 		Version: "0.1.0",
 	})
@@ -66,6 +70,33 @@ func main() {
 			AuthService: authService,
 		})
 		logging.Info("Starting MCP server in HTTP mode", "host", cfg.Server.HTTP.Host, "port", cfg.Server.HTTP.Port)
+	case "unix":
+		// Register /name resource
+		resourceRegistry.Register(mcp.Resource{
+			URI:         "/name",
+			Name:        "Endpoint Name",
+			Description: "The configured name of this MCP endpoint",
+			MimeType:    "text/plain",
+		}, func() (string, error) {
+			return cfg.Server.Unix.Name, nil
+		})
+
+		// Register /pid resource
+		resourceRegistry.Register(mcp.Resource{
+			URI:         "/pid",
+			Name:        "Process ID",
+			Description: "PID of the MCP server process (send SIGINT or SIGTERM to stop)",
+			MimeType:    "text/plain",
+		}, func() (string, error) {
+			return strconv.Itoa(os.Getpid()), nil
+		})
+
+		trans = transport.NewUnixTransport(transport.UnixTransportConfig{
+			SocketPath: cfg.Server.Unix.SocketPath,
+			FileMode:   os.FileMode(cfg.Server.Unix.FileMode),
+		})
+		logging.Info("Starting MCP server in UNIX socket mode",
+			"socket", cfg.Server.Unix.SocketPath, "name", cfg.Server.Unix.Name)
 	default:
 		logging.Error("Unknown transport mode", "mode", cfg.Server.Mode)
 		os.Exit(1)
