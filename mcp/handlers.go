@@ -33,8 +33,9 @@ type Capabilities struct {
 
 // ServerInfo contains information about the server
 type ServerInfo struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
+	Name         string `json:"name"`
+	Version      string `json:"version"`
+	Instructions string `json:"instructions,omitempty"`
 }
 
 // handleInitialize processes the initialize request
@@ -58,8 +59,9 @@ func (s *Server) handleInitialize(params json.RawMessage) (interface{}, error) {
 		ProtocolVersion: "2024-11-05",
 		Capabilities:    capabilities,
 		ServerInfo: ServerInfo{
-			Name:    s.config.Name,
-			Version: s.config.Version,
+			Name:         s.config.Name,
+			Version:      s.config.Version,
+			Instructions: s.config.Instructions,
 		},
 	}, nil
 }

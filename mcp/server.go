@@ -9,8 +9,9 @@ import (
 
 // ServerConfig holds configuration for the MCP server
 type ServerConfig struct {
-	Name    string // Server name (default: "generic-go-mcp")
-	Version string // Server version (default: "0.1.0")
+	Name         string // Server name (default: "generic-go-mcp")
+	Version      string // Server version (default: "0.1.0")
+	Instructions string // Optional instructions for MCP clients
 }
 
 // Server implements the MCP protocol
@@ -34,6 +35,9 @@ func NewServer(registry *ToolRegistry, resourceRegistry *ResourceRegistry, confi
 		}
 		if config.Version != "" {
 			cfg.Version = config.Version
+		}
+		if config.Instructions != "" {
+			cfg.Instructions = config.Instructions
 		}
 	}
 	return &Server{
