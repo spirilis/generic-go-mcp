@@ -147,11 +147,17 @@ func (s *Server) handleResourcesRead(params json.RawMessage) (interface{}, error
 		return nil, err
 	}
 
+	// Get the resource metadata for MIME type
+	mimeType := "text/plain" // default fallback
+	if res, found := s.resourceRegistry.Get(readParams.URI); found && res.MimeType != "" {
+		mimeType = res.MimeType
+	}
+
 	return ResourcesReadResult{
 		Contents: []ResourceContent{
 			{
 				URI:      readParams.URI,
-				MimeType: "text/plain",
+				MimeType: mimeType,
 				Text:     content,
 			},
 		},

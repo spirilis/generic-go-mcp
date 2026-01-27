@@ -49,6 +49,18 @@ func (r *ResourceRegistry) List() []Resource {
 	return result
 }
 
+// Get returns the Resource metadata for the given URI
+func (r *ResourceRegistry) Get(uri string) (Resource, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, res := range r.resources {
+		if res.URI == uri {
+			return res, true
+		}
+	}
+	return Resource{}, false
+}
+
 // Read executes the function for the given resource URI and returns its content
 func (r *ResourceRegistry) Read(uri string) (string, error) {
 	r.mu.RLock()
