@@ -1,0 +1,615 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  CLAUDE CODE HINTS FOR SONNET 4.5
+
+  This document is optimized for Claude Sonnet 4.5's coding assistance.
+  It provides clear success criteria, examples with edge cases,
+  step-by-step guidance, and explicit constraints.
+-->
+<mcp-library-hints
+  name="generic-go-mcp"
+  module="github.com/spirilis/generic-go-mcp"
+  go-version="1.24.0"
+  mcp-protocol-version="2024-11-05">
+
+  <!-- ============================================
+       ENVIRONMENT CONTEXT
+       Explicit context Sonnet 4.5 needs
+       ============================================ -->
+  <environment>
+    <go-version>1.24.0</go-version>
+    <wire-protocol>JSON-RPC 2.0 over newline-delimited messages</wire-protocol>
+    <mcp-version>2024-11-05</mcp-version>
+    <dependencies>
+      <dep name="go.etcd.io/bbolt" version="v1.4.3" purpose="embedded key-value store for OAuth"/>
+      <dep name="gopkg.in/yaml.v3" version="v3.0.1" purpose="YAML config parsing"/>
+    </dependencies>
+    <transports>
+      <transport name="stdio" use-case="CLI tools, Claude Desktop integration"/>
+      <transport name="http" use-case="Web deployment, multi-client, requires auth in production"/>
+      <transport name="unix" use-case="Local IPC, single machine, daemon communication"/>
+    </transports>
+  </environment>
+
+  <!-- ============================================
+       SUCCESS CRITERIA FOR COMMON TASKS
+       ============================================ -->
+  <success-criteria>
+
+    <task name="implement-new-tool">
+      <description>Adding a new tool to an MCP server</description>
+      <criteria>
+        <criterion>Tool has unique name (lowercase, no spaces, use hyphens)</criterion>
+        <criterion>Description clearly explains what the tool does in 1-2 sentences</criterion>
+        <criterion>InputSchema is valid JSON Schema with "type": "object"</criterion>
+        <criterion>All required parameters listed in "required" array</criterion>
+        <criterion>ToolFunction handles json.Unmarshal errors gracefully</criterion>
+        <criterion>Returns mcp.ToolCallResult (not raw data) for proper MCP formatting</criterion>
+        <criterion>Uses IsError: true for user-visible errors, Go error for internal failures</criterion>
+      </criteria>
+      <anti-patterns>
+        <bad>Returning raw strings instead of ToolCallResult</bad>
+        <bad>Missing "type": "object" in InputSchema root</bad>
+        <bad>Panicking on invalid input instead of returning error</bad>
+        <bad>Forgetting to register tool with ToolRegistry.Register()</bad>
+      </anti-patterns>
+    </task>
+
+    <task name="implement-new-resource">
+      <description>Adding a new resource to an MCP server</description>
+      <criteria>
+        <criterion>URI follows scheme://path format (e.g., "info://server/status")</criterion>
+        <criterion>MimeType matches actual content (text/plain, application/json, etc.)</criterion>
+        <criterion>ResourceFunction returns consistent content type</criterion>
+        <criterion>Errors are returned, not panicked</criterion>
+      </criteria>
+      <anti-patterns>
+        <bad>Using file paths as URIs without a scheme</bad>
+        <bad>Returning JSON content with text/plain MimeType</bad>
+        <bad>ResourceFunction with side effects (should be read-only)</bad>
+      </anti-patterns>
+    </task>
+
+    <task name="configure-http-transport">
+      <description>Setting up HTTP/SSE transport</description>
+      <criteria>
+        <criterion>Host defaults to "0.0.0.0" for container deployment</criterion>
+        <criterion>Port defaults to 8080 if not specified</criterion>
+        <criterion>AuthService configured for production (nil only for development)</criterion>
+        <criterion>CORS headers are set automatically by transport</criterion>
+      </criteria>
+      <production-vs-development>
+        <development>AuthService can be nil, any client can connect</development>
+        <production>AuthService MUST be configured with OAuth, allowlist users/orgs</production>
+      </production-vs-development>
+    </task>
+
+  </success-criteria>
+
+  <!-- ============================================
+       STEP-BY-STEP RECIPES
+       Multi-phase task breakdowns
+       ============================================ -->
+  <recipes>
+
+    <recipe name="create-minimal-mcp-server">
+      <description>Create a working MCP server from scratch</description>
+      <steps>
+        <step order="1" action="create-registries">
+          <code><![CDATA[
+toolRegistry := mcp.NewToolRegistry()
+resourceRegistry := mcp.NewResourceRegistry()
+]]></code>
+        </step>
+        <step order="2" action="register-tools">
+          <code><![CDATA[
+toolRegistry.Register(
+    mcp.Tool{
+        Name:        "my-tool",
+        Description: "Does something useful",
+        InputSchema: json.RawMessage(`{
+            "type": "object",
+            "properties": {
+                "param1": {"type": "string", "description": "First parameter"}
+            },
+            "required": ["param1"]
+        }`),
+    },
+    myToolHandler,
+)
+]]></code>
+        </step>
+        <step order="3" action="create-server">
+          <code><![CDATA[
+server := mcp.NewServer(toolRegistry, resourceRegistry, &mcp.ServerConfig{
+    Name:    "my-server",
+    Version: "1.0.0",
+})
+]]></code>
+        </step>
+        <step order="4" action="create-transport">
+          <code><![CDATA[
+// Choose ONE transport:
+trans := transport.NewStdioTransport()           // For CLI
+// OR
+trans := transport.NewHTTPTransport(transport.HTTPTransportConfig{Port: 8080})  // For web
+// OR
+trans := transport.NewUnixTransport(transport.UnixTransportConfig{SocketPath: "/tmp/mcp.sock", FileMode: 0660})
+]]></code>
+        </step>
+        <step order="5" action="start-and-block">
+          <code><![CDATA[
+trans.Start(server)
+select {} // Block forever (or use signal handling)
+]]></code>
+        </step>
+      </steps>
+    </recipe>
+
+    <recipe name="implement-tool-handler">
+      <description>Implement a tool function with proper error handling</description>
+      <steps>
+        <step order="1" action="define-args-struct">
+          <code><![CDATA[
+type MyToolArgs struct {
+    Param1 string `json:"param1"`
+    Param2 int    `json:"param2,omitempty"` // optional
+}
+]]></code>
+        </step>
+        <step order="2" action="implement-handler">
+          <code><![CDATA[
+func myToolHandler(args json.RawMessage) (interface{}, error) {
+    // Step 2a: Parse arguments
+    var params MyToolArgs
+    if err := json.Unmarshal(args, &params); err != nil {
+        return mcp.ToolCallResult{
+            Content: []mcp.ToolContent{{Type: "text", Text: "Invalid arguments: " + err.Error()}},
+            IsError: true,
+        }, nil  // Return nil error - this is a user error, not internal
+    }
+
+    // Step 2b: Validate required fields (JSON Schema validates, but double-check)
+    if params.Param1 == "" {
+        return mcp.ToolCallResult{
+            Content: []mcp.ToolContent{{Type: "text", Text: "param1 is required"}},
+            IsError: true,
+        }, nil
+    }
+
+    // Step 2c: Do the work
+    result, err := doActualWork(params)
+    if err != nil {
+        // Internal error - return Go error
+        return nil, fmt.Errorf("internal error: %w", err)
+    }
+
+    // Step 2d: Return success
+    return mcp.ToolCallResult{
+        Content: []mcp.ToolContent{{Type: "text", Text: result}},
+    }, nil
+}
+]]></code>
+        </step>
+      </steps>
+      <edge-cases>
+        <case name="empty-arguments">
+          <input><![CDATA[{}]]></input>
+          <behavior>Should fail validation if required params missing</behavior>
+        </case>
+        <case name="null-arguments">
+          <input><![CDATA[null]]></input>
+          <behavior>json.Unmarshal succeeds with zero values, check required fields</behavior>
+        </case>
+        <case name="extra-fields">
+          <input><![CDATA[{"param1": "value", "unknown": "ignored"}]]></input>
+          <behavior>Extra fields silently ignored by json.Unmarshal</behavior>
+        </case>
+        <case name="wrong-types">
+          <input><![CDATA[{"param1": 123}]]></input>
+          <behavior>json.Unmarshal fails, return IsError: true result</behavior>
+        </case>
+      </edge-cases>
+    </recipe>
+
+    <recipe name="add-oauth-to-http">
+      <description>Add OAuth authentication to HTTP transport</description>
+      <prerequisites>
+        <prereq>GitHub OAuth App created at github.com/settings/developers</prereq>
+        <prereq>Client ID and Client Secret available</prereq>
+        <prereq>Writable path for BoltDB storage</prereq>
+      </prerequisites>
+      <steps>
+        <step order="1" action="create-config">
+          <code><![CDATA[
+authCfg := &config.AuthConfig{
+    Enabled: true,
+    Issuer:  "https://your-domain.com",  // Your server's public URL
+    GitHub: config.GitHubConfig{
+        ClientID:     "your-github-client-id",
+        ClientSecret: "your-github-client-secret",
+    },
+    Storage: config.StorageConfig{
+        DBPath: "/var/lib/myapp/oauth.db",
+    },
+    Allowlist: config.AllowlistConfig{
+        Users: []string{"allowed-github-user"},
+        // OR
+        Orgs: []string{"your-org"},
+    },
+}
+]]></code>
+        </step>
+        <step order="2" action="create-auth-service">
+          <code><![CDATA[
+authService, err := auth.NewAuthService(authCfg)
+if err != nil {
+    log.Fatal("Failed to create auth service:", err)
+}
+defer authService.Close()
+]]></code>
+        </step>
+        <step order="3" action="configure-transport">
+          <code><![CDATA[
+trans := transport.NewHTTPTransport(transport.HTTPTransportConfig{
+    Host:        "0.0.0.0",
+    Port:        8080,
+    AuthService: authService,  // This enables auth middleware on /mcp
+})
+]]></code>
+        </step>
+      </steps>
+      <endpoints-created>
+        <endpoint path="/authorize" method="GET">OAuth authorization endpoint</endpoint>
+        <endpoint path="/token" method="POST">Token exchange endpoint</endpoint>
+        <endpoint path="/callback" method="GET">GitHub OAuth callback</endpoint>
+        <endpoint path="/mcp" method="POST,GET,DELETE">MCP endpoint (protected)</endpoint>
+        <endpoint path="/.well-known/oauth-authorization-server" method="GET">OAuth metadata</endpoint>
+      </endpoints-created>
+    </recipe>
+
+  </recipes>
+
+  <!-- ============================================
+       TYPE REFERENCE WITH CONSTRAINTS
+       ============================================ -->
+  <types>
+
+    <type name="ToolFunction" package="mcp">
+      <signature>func(arguments json.RawMessage) (interface{}, error)</signature>
+      <constraints>
+        <constraint>MUST return mcp.ToolCallResult for proper MCP formatting</constraint>
+        <constraint>MUST NOT panic - always return error instead</constraint>
+        <constraint>SHOULD set IsError: true for user-visible validation errors</constraint>
+        <constraint>SHOULD return Go error only for unexpected internal failures</constraint>
+      </constraints>
+      <return-patterns>
+        <pattern name="success">
+          <code><![CDATA[return mcp.ToolCallResult{Content: []mcp.ToolContent{{Type: "text", Text: "result"}}}, nil]]></code>
+        </pattern>
+        <pattern name="user-error">
+          <code><![CDATA[return mcp.ToolCallResult{Content: []mcp.ToolContent{{Type: "text", Text: "error message"}}, IsError: true}, nil]]></code>
+        </pattern>
+        <pattern name="internal-error">
+          <code><![CDATA[return nil, fmt.Errorf("internal failure: %w", err)]]></code>
+        </pattern>
+      </return-patterns>
+    </type>
+
+    <type name="ResourceFunction" package="mcp">
+      <signature>func() (string, error)</signature>
+      <constraints>
+        <constraint>MUST be idempotent and side-effect free</constraint>
+        <constraint>SHOULD return content matching the Resource's MimeType</constraint>
+        <constraint>MUST NOT block indefinitely - use timeouts for external calls</constraint>
+      </constraints>
+    </type>
+
+    <type name="Tool" package="mcp">
+      <fields>
+        <field name="Name" type="string" required="true">
+          <constraints>
+            <constraint>Unique within registry</constraint>
+            <constraint>Lowercase with hyphens preferred (e.g., "get-user", "send-email")</constraint>
+            <constraint>No spaces or special characters</constraint>
+          </constraints>
+        </field>
+        <field name="Description" type="string" required="true">
+          <constraints>
+            <constraint>1-2 sentences explaining what the tool does</constraint>
+            <constraint>Should help LLM decide when to use this tool</constraint>
+          </constraints>
+        </field>
+        <field name="InputSchema" type="json.RawMessage" required="true">
+          <constraints>
+            <constraint>MUST be valid JSON Schema</constraint>
+            <constraint>Root MUST have "type": "object"</constraint>
+            <constraint>MUST list required params in "required" array</constraint>
+          </constraints>
+          <template><![CDATA[{
+    "type": "object",
+    "properties": {
+        "paramName": {
+            "type": "string|number|boolean|array|object",
+            "description": "What this parameter does"
+        }
+    },
+    "required": ["paramName"]
+}]]></template>
+        </field>
+      </fields>
+    </type>
+
+    <type name="Resource" package="mcp">
+      <fields>
+        <field name="URI" type="string" required="true">
+          <constraints>
+            <constraint>MUST follow scheme://path format</constraint>
+            <constraint>Scheme can be custom (e.g., "info://", "config://", "data://")</constraint>
+            <constraint>Unique within registry</constraint>
+          </constraints>
+          <examples>
+            <example>"info://server/status"</example>
+            <example>"config://app/settings"</example>
+            <example>"data://users/current"</example>
+          </examples>
+        </field>
+        <field name="MimeType" type="string" required="false">
+          <constraints>
+            <constraint>MUST match actual content returned by ResourceFunction</constraint>
+            <constraint>Defaults to "text/plain" if omitted</constraint>
+          </constraints>
+          <common-values>
+            <value>text/plain</value>
+            <value>application/json</value>
+            <value>text/markdown</value>
+            <value>application/xml</value>
+          </common-values>
+        </field>
+      </fields>
+    </type>
+
+    <type name="ToolCallResult" package="mcp">
+      <fields>
+        <field name="Content" type="[]ToolContent" required="true">
+          <constraints>
+            <constraint>Array with at least one ToolContent item</constraint>
+          </constraints>
+        </field>
+        <field name="IsError" type="bool" required="false">
+          <constraints>
+            <constraint>Set to true when returning user-visible error messages</constraint>
+            <constraint>Defaults to false (success)</constraint>
+          </constraints>
+        </field>
+      </fields>
+    </type>
+
+    <type name="ToolContent" package="mcp">
+      <fields>
+        <field name="Type" type="string" required="true">
+          <constraints>
+            <constraint>Currently only "text" is widely supported</constraint>
+          </constraints>
+        </field>
+        <field name="Text" type="string" required="true">
+          <constraints>
+            <constraint>The actual content/message</constraint>
+          </constraints>
+        </field>
+      </fields>
+    </type>
+
+  </types>
+
+  <!-- ============================================
+       MULTIPLE VALID APPROACHES
+       Guidance when there are choices
+       ============================================ -->
+  <approach-guidance>
+
+    <decision name="transport-selection">
+      <question>Which transport should I use?</question>
+      <options>
+        <option name="stdio">
+          <when>
+            <condition>Building CLI tool</condition>
+            <condition>Integrating with Claude Desktop</condition>
+            <condition>Single client at a time</condition>
+            <condition>No authentication needed (local execution)</condition>
+          </when>
+          <trade-offs>
+            <pro>Simplest to implement</pro>
+            <pro>No network configuration</pro>
+            <con>Single client only</con>
+            <con>Process must stay alive</con>
+          </trade-offs>
+        </option>
+        <option name="http">
+          <when>
+            <condition>Multi-client support needed</condition>
+            <condition>Web deployment</condition>
+            <condition>Need authentication/authorization</condition>
+            <condition>Cloud/container deployment</condition>
+          </when>
+          <trade-offs>
+            <pro>Multiple concurrent clients</pro>
+            <pro>OAuth authentication available</pro>
+            <pro>Standard HTTP tooling works</pro>
+            <con>More complex setup</con>
+            <con>Need to handle auth in production</con>
+          </trade-offs>
+        </option>
+        <option name="unix">
+          <when>
+            <condition>Local IPC between processes</condition>
+            <condition>Same-machine daemon communication</condition>
+            <condition>Want file permission-based access control</condition>
+          </when>
+          <trade-offs>
+            <pro>Fast local communication</pro>
+            <pro>OS-level permission control</pro>
+            <con>Single machine only</con>
+            <con>Unix/Linux only</con>
+          </trade-offs>
+        </option>
+      </options>
+    </decision>
+
+    <decision name="error-handling-strategy">
+      <question>How should my tool report errors?</question>
+      <options>
+        <option name="toolcallresult-with-iserror">
+          <when>
+            <condition>User provided invalid input</condition>
+            <condition>Requested resource doesn't exist</condition>
+            <condition>Operation failed but it's not a bug</condition>
+          </when>
+          <code><![CDATA[return mcp.ToolCallResult{
+    Content: []mcp.ToolContent{{Type: "text", Text: "File not found: " + filename}},
+    IsError: true,
+}, nil]]></code>
+        </option>
+        <option name="go-error">
+          <when>
+            <condition>Internal/unexpected failure</condition>
+            <condition>Bug in tool implementation</condition>
+            <condition>System-level failures (disk full, OOM)</condition>
+          </when>
+          <code><![CDATA[return nil, fmt.Errorf("database connection failed: %w", err)]]></code>
+        </option>
+      </options>
+    </decision>
+
+    <decision name="resource-vs-tool">
+      <question>Should this be a Resource or a Tool?</question>
+      <options>
+        <option name="resource">
+          <when>
+            <condition>Read-only data access</condition>
+            <condition>No parameters needed</condition>
+            <condition>Content doesn't change based on input</condition>
+            <condition>Examples: server status, config values, documentation</condition>
+          </when>
+        </option>
+        <option name="tool">
+          <when>
+            <condition>Takes parameters/arguments</condition>
+            <condition>Performs actions or computations</condition>
+            <condition>Output depends on input</condition>
+            <condition>Examples: search, calculate, send message, query database</condition>
+          </when>
+        </option>
+      </options>
+    </decision>
+
+  </approach-guidance>
+
+  <!-- ============================================
+       DOMAIN-SPECIFIC GUIDANCE
+       MCP protocol specifics
+       ============================================ -->
+  <domain-knowledge>
+
+    <concept name="json-rpc-2.0">
+      <description>Wire protocol for MCP messages</description>
+      <key-points>
+        <point>Every request has jsonrpc: "2.0", method, optional params, optional id</point>
+        <point>Requests with id expect a response; without id are notifications (no response)</point>
+        <point>Responses have result (success) OR error (failure), never both</point>
+      </key-points>
+      <handled-by>Server.HandleMessage() - you don't need to deal with this directly</handled-by>
+    </concept>
+
+    <concept name="mcp-initialization">
+      <description>Handshake between client and server</description>
+      <sequence>
+        <step>Client sends "initialize" with protocol version and capabilities</step>
+        <step>Server responds with its capabilities and info</step>
+        <step>Client sends "notifications/initialized" notification</step>
+        <step>Normal operation begins</step>
+      </sequence>
+      <handled-by>Server automatically handles this</handled-by>
+    </concept>
+
+    <concept name="mcp-sessions">
+      <description>HTTP transport session management</description>
+      <key-points>
+        <point>Sessions created on first request (GET or POST with initialize)</point>
+        <point>Mcp-Session-Id header tracks the session</point>
+        <point>SSE (GET) provides server-to-client channel</point>
+        <point>POST provides client-to-server channel</point>
+        <point>DELETE ends the session</point>
+      </key-points>
+      <handled-by>HTTPTransport and SessionManager handle this</handled-by>
+    </concept>
+
+    <concept name="inputschema-json-schema">
+      <description>Tool argument schemas use JSON Schema</description>
+      <required-structure><![CDATA[{
+    "type": "object",          // REQUIRED: root must be object
+    "properties": {            // REQUIRED: define your parameters
+        "param": {
+            "type": "string",  // string, number, integer, boolean, array, object
+            "description": "Helps LLM understand the parameter"
+        }
+    },
+    "required": ["param"]      // REQUIRED if parameter is mandatory
+}]]></required-structure>
+      <common-mistakes>
+        <mistake>Forgetting "type": "object" at root</mistake>
+        <mistake>Using "required": true on individual properties (wrong - use "required" array)</mistake>
+        <mistake>Not escaping JSON in Go backtick strings (use json.RawMessage)</mistake>
+      </common-mistakes>
+    </concept>
+
+  </domain-knowledge>
+
+  <!-- ============================================
+       QUICK REFERENCE
+       Fast lookups
+       ============================================ -->
+  <quick-reference>
+
+    <imports>
+      <import purpose="MCP core">github.com/spirilis/generic-go-mcp/mcp</import>
+      <import purpose="Transport layer">github.com/spirilis/generic-go-mcp/transport</import>
+      <import purpose="Configuration">github.com/spirilis/generic-go-mcp/config</import>
+      <import purpose="Logging">github.com/spirilis/generic-go-mcp/logging</import>
+      <import purpose="OAuth authentication">github.com/spirilis/generic-go-mcp/auth</import>
+    </imports>
+
+    <constructors>
+      <constructor>mcp.NewServer(toolRegistry, resourceRegistry, config) *Server</constructor>
+      <constructor>mcp.NewToolRegistry() *ToolRegistry</constructor>
+      <constructor>mcp.NewResourceRegistry() *ResourceRegistry</constructor>
+      <constructor>transport.NewStdioTransport() *StdioTransport</constructor>
+      <constructor>transport.NewHTTPTransport(config) *HTTPTransport</constructor>
+      <constructor>transport.NewUnixTransport(config) *UnixTransport</constructor>
+      <constructor>auth.NewAuthService(config) (*AuthService, error)</constructor>
+      <constructor>config.Load(path) (*Config, error)</constructor>
+    </constructors>
+
+    <common-structs>
+      <struct name="mcp.ServerConfig" fields="Name, Version, Instructions"/>
+      <struct name="mcp.Tool" fields="Name, Description, InputSchema"/>
+      <struct name="mcp.Resource" fields="URI, Name, Description, MimeType"/>
+      <struct name="mcp.ToolCallResult" fields="Content, IsError"/>
+      <struct name="mcp.ToolContent" fields="Type, Text"/>
+      <struct name="transport.HTTPTransportConfig" fields="Host, Port, AuthService"/>
+      <struct name="transport.UnixTransportConfig" fields="SocketPath, FileMode"/>
+    </common-structs>
+
+    <method-cheatsheet>
+      <method>toolRegistry.Register(tool, handler)</method>
+      <method>toolRegistry.List() []Tool</method>
+      <method>resourceRegistry.Register(resource, handler)</method>
+      <method>resourceRegistry.List() []Resource</method>
+      <method>transport.Start(server) error</method>
+      <method>transport.Stop() error</method>
+      <method>auth.GetUserFromContext(ctx) *User</method>
+    </method-cheatsheet>
+
+  </quick-reference>
+
+</mcp-library-hints>

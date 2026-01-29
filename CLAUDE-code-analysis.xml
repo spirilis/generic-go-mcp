@@ -1,0 +1,1157 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mcp-library name="generic-go-mcp" version="0.1.0" module="github.com/spirilis/generic-go-mcp" go-version="1.24.0">
+
+  <!-- ============================================
+       OVERVIEW
+       ============================================ -->
+  <overview>
+    <description>
+      A reusable Go framework for building Model Context Protocol (MCP) servers with support for
+      multiple transport mechanisms (stdio, HTTP/SSE, UNIX domain sockets) and optional OAuth 2.0 authentication.
+    </description>
+    <protocol>
+      <name>Model Context Protocol (MCP)</name>
+      <version>2024-11-05</version>
+      <wire-format>JSON-RPC 2.0</wire-format>
+      <supported-methods>
+        <method name="initialize">Initial handshake with protocol version and capabilities</method>
+        <method name="notifications/initialized">Client notification that initialization is complete</method>
+        <method name="tools/list">List available tools</method>
+        <method name="tools/call">Execute a tool</method>
+        <method name="resources/list">List available resources</method>
+        <method name="resources/read">Read a resource's content</method>
+      </supported-methods>
+    </protocol>
+  </overview>
+
+  <!-- ============================================
+       PACKAGES
+       ============================================ -->
+  <packages>
+
+    <!-- MCP Package -->
+    <package name="mcp" import-path="github.com/spirilis/generic-go-mcp/mcp">
+      <description>Core MCP protocol implementation including server, tool registry, and resource registry</description>
+
+      <structs>
+        <struct name="ServerConfig">
+          <description>Configuration for the MCP server identity</description>
+          <fields>
+            <field name="Name" type="string" json-tag="name">Server name (default: "generic-go-mcp")</field>
+            <field name="Version" type="string" json-tag="version">Server version (default: "0.1.0")</field>
+            <field name="Instructions" type="string" json-tag="instructions">Optional instructions for MCP clients</field>
+          </fields>
+        </struct>
+
+        <struct name="Server">
+          <description>Main MCP server that implements MessageHandler interface</description>
+          <fields>
+            <field name="registry" type="*ToolRegistry" exported="false">Tool registry</field>
+            <field name="resourceRegistry" type="*ResourceRegistry" exported="false">Resource registry</field>
+            <field name="config" type="ServerConfig" exported="false">Server configuration</field>
+            <field name="initialized" type="bool" exported="false">Whether client has sent initialized notification</field>
+          </fields>
+          <methods>
+            <method name="HandleMessage" signature="(data []byte) []byte">Process incoming JSON-RPC messages (implements MessageHandler)</method>
+          </methods>
+        </struct>
+
+        <struct name="Tool">
+          <description>MCP tool definition</description>
+          <fields>
+            <field name="Name" type="string" json-tag="name">Tool name (unique identifier)</field>
+            <field name="Description" type="string" json-tag="description">Human-readable description</field>
+            <field name="InputSchema" type="json.RawMessage" json-tag="inputSchema">JSON Schema for tool arguments</field>
+          </fields>
+        </struct>
+
+        <struct name="ToolRegistry">
+          <description>Registry managing available tools and their implementations</description>
+          <fields>
+            <field name="tools" type="[]Tool" exported="false">List of registered tools</field>
+            <field name="functions" type="map[string]ToolFunction" exported="false">Map of tool name to implementation</field>
+          </fields>
+          <methods>
+            <method name="Register" signature="(tool Tool, fn ToolFunction)">Add a tool to the registry</method>
+            <method name="List" signature="() []Tool">Return all registered tools</method>
+            <method name="Call" signature="(name string, arguments json.RawMessage) (interface{}, error)">Execute a tool by name</method>
+          </methods>
+        </struct>
+
+        <struct name="ToolContent">
+          <description>Content item in a tool response</description>
+          <fields>
+            <field name="Type" type="string" json-tag="type">Content type (e.g., "text")</field>
+            <field name="Text" type="string" json-tag="text">Text content</field>
+          </fields>
+        </struct>
+
+        <struct name="ToolCallResult">
+          <description>Result returned from a tool call</description>
+          <fields>
+            <field name="Content" type="[]ToolContent" json-tag="content">Array of content items</field>
+            <field name="IsError" type="bool" json-tag="isError,omitempty">True if this result represents an error</field>
+          </fields>
+        </struct>
+
+        <struct name="Resource">
+          <description>MCP resource definition</description>
+          <fields>
+            <field name="URI" type="string" json-tag="uri">Resource URI (unique identifier)</field>
+            <field name="Name" type="string" json-tag="name">Human-readable name</field>
+            <field name="Description" type="string" json-tag="description,omitempty">Optional description</field>
+            <field name="MimeType" type="string" json-tag="mimeType,omitempty">MIME type of resource content</field>
+          </fields>
+        </struct>
+
+        <struct name="ResourceRegistry">
+          <description>Thread-safe registry managing available resources</description>
+          <fields>
+            <field name="mu" type="sync.RWMutex" exported="false">Read-write mutex for thread safety</field>
+            <field name="resources" type="[]Resource" exported="false">List of registered resources</field>
+            <field name="functions" type="map[string]ResourceFunction" exported="false">Map of URI to implementation</field>
+          </fields>
+          <methods>
+            <method name="Register" signature="(res Resource, fn ResourceFunction)">Add a resource to the registry</method>
+            <method name="List" signature="() []Resource">Return all registered resources (copy)</method>
+            <method name="Get" signature="(uri string) (Resource, bool)">Get resource metadata by URI</method>
+            <method name="Read" signature="(uri string) (string, error)">Execute resource function to get content</method>
+            <method name="HasResources" signature="() bool">Check if any resources are registered</method>
+          </methods>
+        </struct>
+
+        <!-- Handler-related structs -->
+        <struct name="InitializeParams">
+          <description>Parameters for initialize request</description>
+          <fields>
+            <field name="ProtocolVersion" type="string" json-tag="protocolVersion">MCP protocol version</field>
+            <field name="Capabilities" type="map[string]interface{}" json-tag="capabilities">Client capabilities</field>
+            <field name="ClientInfo" type="ClientInfo" json-tag="clientInfo">Client identification</field>
+          </fields>
+        </struct>
+
+        <struct name="ClientInfo">
+          <description>Client identification information</description>
+          <fields>
+            <field name="Name" type="string" json-tag="name">Client name</field>
+            <field name="Version" type="string" json-tag="version">Client version</field>
+          </fields>
+        </struct>
+
+        <struct name="InitializeResult">
+          <description>Result of initialize request</description>
+          <fields>
+            <field name="ProtocolVersion" type="string" json-tag="protocolVersion">Server protocol version</field>
+            <field name="Capabilities" type="Capabilities" json-tag="capabilities">Server capabilities</field>
+            <field name="ServerInfo" type="ServerInfo" json-tag="serverInfo">Server identification</field>
+          </fields>
+        </struct>
+
+        <struct name="Capabilities">
+          <description>Server capabilities</description>
+          <fields>
+            <field name="Tools" type="map[string]interface{}" json-tag="tools">Tools capability (empty object if tools available)</field>
+            <field name="Resources" type="*map[string]interface{}" json-tag="resources,omitempty">Resources capability (nil if no resources)</field>
+          </fields>
+        </struct>
+
+        <struct name="ServerInfo">
+          <description>Server identification information</description>
+          <fields>
+            <field name="Name" type="string" json-tag="name">Server name</field>
+            <field name="Version" type="string" json-tag="version">Server version</field>
+            <field name="Instructions" type="string" json-tag="instructions,omitempty">Optional instructions</field>
+          </fields>
+        </struct>
+
+        <struct name="ToolsListResult">
+          <description>Result of tools/list request</description>
+          <fields>
+            <field name="Tools" type="[]Tool" json-tag="tools">Array of available tools</field>
+          </fields>
+        </struct>
+
+        <struct name="ToolsCallParams">
+          <description>Parameters for tools/call request</description>
+          <fields>
+            <field name="Name" type="string" json-tag="name">Tool name to call</field>
+            <field name="Arguments" type="json.RawMessage" json-tag="arguments">Tool arguments as JSON</field>
+          </fields>
+        </struct>
+
+        <struct name="ResourcesListResult">
+          <description>Result of resources/list request</description>
+          <fields>
+            <field name="Resources" type="[]Resource" json-tag="resources">Array of available resources</field>
+          </fields>
+        </struct>
+
+        <struct name="ResourcesReadParams">
+          <description>Parameters for resources/read request</description>
+          <fields>
+            <field name="URI" type="string" json-tag="uri">URI of resource to read</field>
+          </fields>
+        </struct>
+
+        <struct name="ResourcesReadResult">
+          <description>Result of resources/read request</description>
+          <fields>
+            <field name="Contents" type="[]ResourceContent" json-tag="contents">Array of resource contents</field>
+          </fields>
+        </struct>
+
+        <struct name="ResourceContent">
+          <description>Content of a resource</description>
+          <fields>
+            <field name="URI" type="string" json-tag="uri">Resource URI</field>
+            <field name="MimeType" type="string" json-tag="mimeType,omitempty">MIME type</field>
+            <field name="Text" type="string" json-tag="text,omitempty">Text content</field>
+          </fields>
+        </struct>
+      </structs>
+
+      <type-aliases>
+        <type-alias name="ToolFunction" definition="func(arguments json.RawMessage) (interface{}, error)">
+          <description>Function type for tool implementations. Receives JSON arguments, returns result or error.</description>
+        </type-alias>
+        <type-alias name="ResourceFunction" definition="func() (string, error)">
+          <description>Function type for resource implementations. Returns content string or error.</description>
+        </type-alias>
+      </type-aliases>
+
+      <constructors>
+        <constructor name="NewServer" signature="(registry *ToolRegistry, resourceRegistry *ResourceRegistry, config *ServerConfig) *Server">
+          <description>Creates a new MCP server with the given registries and configuration</description>
+          <parameters>
+            <param name="registry" type="*ToolRegistry">Tool registry (required)</param>
+            <param name="resourceRegistry" type="*ResourceRegistry">Resource registry (can be nil)</param>
+            <param name="config" type="*ServerConfig">Server config (nil for defaults)</param>
+          </parameters>
+        </constructor>
+        <constructor name="NewToolRegistry" signature="() *ToolRegistry">
+          <description>Creates an empty tool registry</description>
+        </constructor>
+        <constructor name="NewResourceRegistry" signature="() *ResourceRegistry">
+          <description>Creates an empty resource registry</description>
+        </constructor>
+      </constructors>
+    </package>
+
+    <!-- Transport Package -->
+    <package name="transport" import-path="github.com/spirilis/generic-go-mcp/transport">
+      <description>Transport abstractions for different communication mechanisms</description>
+
+      <interfaces>
+        <interface name="Transport">
+          <description>Defines the interface for communication mechanisms</description>
+          <methods>
+            <method name="Start" signature="(handler MessageHandler) error">Begin accepting and processing messages</method>
+            <method name="Stop" signature="() error">Gracefully stop the transport</method>
+          </methods>
+        </interface>
+
+        <interface name="MessageHandler">
+          <description>Processes incoming JSON-RPC messages</description>
+          <methods>
+            <method name="HandleMessage" signature="(data []byte) []byte">Process message and return response (nil for notifications)</method>
+          </methods>
+        </interface>
+      </interfaces>
+
+      <structs>
+        <struct name="JSONRPCRequest">
+          <description>JSON-RPC 2.0 request structure</description>
+          <fields>
+            <field name="JSONRPC" type="string" json-tag="jsonrpc">Always "2.0"</field>
+            <field name="ID" type="interface{}" json-tag="id,omitempty">Request ID (nil for notifications)</field>
+            <field name="Method" type="string" json-tag="method">Method name</field>
+            <field name="Params" type="json.RawMessage" json-tag="params,omitempty">Method parameters</field>
+          </fields>
+        </struct>
+
+        <struct name="JSONRPCResponse">
+          <description>JSON-RPC 2.0 response structure</description>
+          <fields>
+            <field name="JSONRPC" type="string" json-tag="jsonrpc">Always "2.0"</field>
+            <field name="ID" type="interface{}" json-tag="id,omitempty">Request ID</field>
+            <field name="Result" type="interface{}" json-tag="result,omitempty">Success result</field>
+            <field name="Error" type="*RPCError" json-tag="error,omitempty">Error object</field>
+          </fields>
+        </struct>
+
+        <struct name="RPCError">
+          <description>JSON-RPC 2.0 error object</description>
+          <fields>
+            <field name="Code" type="int" json-tag="code">Error code</field>
+            <field name="Message" type="string" json-tag="message">Error message</field>
+            <field name="Data" type="interface{}" json-tag="data,omitempty">Additional error data</field>
+          </fields>
+        </struct>
+
+        <struct name="StdioTransport">
+          <description>Transport using stdin/stdout for communication</description>
+          <fields>
+            <field name="scanner" type="*bufio.Scanner" exported="false">Input scanner</field>
+            <field name="handler" type="MessageHandler" exported="false">Message handler</field>
+            <field name="stopCh" type="chan struct{}" exported="false">Stop signal channel</field>
+            <field name="wg" type="sync.WaitGroup" exported="false">Wait group for goroutines</field>
+          </fields>
+        </struct>
+
+        <struct name="HTTPTransportConfig">
+          <description>Configuration for HTTP transport</description>
+          <fields>
+            <field name="Host" type="string">Listen host (default: "0.0.0.0")</field>
+            <field name="Port" type="int">Listen port (default: 8080)</field>
+            <field name="AuthService" type="*auth.AuthService">Optional authentication service</field>
+          </fields>
+        </struct>
+
+        <struct name="HTTPTransport">
+          <description>Transport using HTTP/SSE for communication (Streamable HTTP)</description>
+          <fields>
+            <field name="config" type="HTTPTransportConfig" exported="false">Configuration</field>
+            <field name="sessionManager" type="*SessionManager" exported="false">Session manager</field>
+            <field name="handler" type="MessageHandler" exported="false">Message handler</field>
+            <field name="server" type="*http.Server" exported="false">HTTP server</field>
+            <field name="stopCh" type="chan struct{}" exported="false">Stop signal</field>
+            <field name="wg" type="sync.WaitGroup" exported="false">Wait group</field>
+            <field name="authService" type="*auth.AuthService" exported="false">Auth service</field>
+          </fields>
+        </struct>
+
+        <struct name="Session">
+          <description>SSE client session</description>
+          <fields>
+            <field name="ID" type="string">Unique session identifier</field>
+            <field name="Response" type="chan []byte">Channel for server-initiated messages</field>
+            <field name="Done" type="chan struct{}">Channel signaling session end</field>
+            <field name="User" type="*auth.User">Authenticated user (if auth enabled)</field>
+            <field name="ClientID" type="string">OAuth client ID (if auth enabled)</field>
+          </fields>
+        </struct>
+
+        <struct name="SessionManager">
+          <description>Manages active SSE sessions</description>
+          <fields>
+            <field name="sessions" type="sync.Map" exported="false">Thread-safe session map</field>
+          </fields>
+          <methods>
+            <method name="CreateSession" signature="() *Session">Create new session with unique ID</method>
+            <method name="GetSession" signature="(id string) (*Session, bool)">Retrieve session by ID</method>
+            <method name="RemoveSession" signature="(id string)">Remove and close session</method>
+          </methods>
+        </struct>
+
+        <struct name="UnixTransportConfig">
+          <description>Configuration for UNIX domain socket transport</description>
+          <fields>
+            <field name="SocketPath" type="string">Path to UNIX socket file</field>
+            <field name="FileMode" type="os.FileMode">Socket file permissions</field>
+          </fields>
+        </struct>
+
+        <struct name="UnixTransport">
+          <description>Transport using UNIX domain sockets</description>
+          <fields>
+            <field name="config" type="UnixTransportConfig" exported="false">Configuration</field>
+            <field name="listener" type="net.Listener" exported="false">Socket listener</field>
+            <field name="handler" type="MessageHandler" exported="false">Message handler</field>
+            <field name="stopCh" type="chan struct{}" exported="false">Stop signal</field>
+            <field name="wg" type="sync.WaitGroup" exported="false">Wait group</field>
+            <field name="connMu" type="sync.Mutex" exported="false">Connection mutex</field>
+            <field name="conn" type="net.Conn" exported="false">Current connection</field>
+          </fields>
+        </struct>
+      </structs>
+
+      <constants>
+        <constant name="ParseError" value="-32700">JSON parse error</constant>
+        <constant name="InvalidRequest" value="-32600">Invalid JSON-RPC request</constant>
+        <constant name="MethodNotFound" value="-32601">Method not found</constant>
+        <constant name="InvalidParams" value="-32602">Invalid method parameters</constant>
+        <constant name="InternalError" value="-32603">Internal server error</constant>
+      </constants>
+
+      <constructors>
+        <constructor name="NewStdioTransport" signature="() *StdioTransport">
+          <description>Creates a stdio transport reading from stdin, writing to stdout</description>
+        </constructor>
+        <constructor name="NewHTTPTransport" signature="(config HTTPTransportConfig) *HTTPTransport">
+          <description>Creates an HTTP/SSE transport with optional authentication</description>
+        </constructor>
+        <constructor name="NewUnixTransport" signature="(config UnixTransportConfig) *UnixTransport">
+          <description>Creates a UNIX domain socket transport</description>
+        </constructor>
+        <constructor name="NewSessionManager" signature="() *SessionManager">
+          <description>Creates a session manager for HTTP transport</description>
+        </constructor>
+      </constructors>
+
+      <functions>
+        <function name="generateUUID" signature="() string" exported="false">
+          <description>Generates a UUID v4 string</description>
+        </function>
+      </functions>
+    </package>
+
+    <!-- Config Package -->
+    <package name="config" import-path="github.com/spirilis/generic-go-mcp/config">
+      <description>Configuration loading from YAML files, environment variables, and secrets</description>
+
+      <structs>
+        <struct name="Config">
+          <description>Root configuration structure</description>
+          <fields>
+            <field name="Server" type="ServerConfig" yaml-tag="server">Server configuration</field>
+            <field name="Auth" type="*AuthConfig" yaml-tag="auth,omitempty">Optional authentication config</field>
+            <field name="Logging" type="*LoggingConfig" yaml-tag="logging,omitempty">Optional logging config</field>
+          </fields>
+        </struct>
+
+        <struct name="ServerConfig">
+          <description>Server-specific configuration</description>
+          <fields>
+            <field name="Mode" type="string" yaml-tag="mode">Transport mode: "stdio", "http", or "unix"</field>
+            <field name="HTTP" type="*HTTPConfig" yaml-tag="http,omitempty">HTTP configuration (when mode="http")</field>
+            <field name="Unix" type="*UnixConfig" yaml-tag="unix,omitempty">UNIX socket config (when mode="unix")</field>
+          </fields>
+        </struct>
+
+        <struct name="HTTPConfig">
+          <description>HTTP server configuration</description>
+          <fields>
+            <field name="Host" type="string" yaml-tag="host">Listen host (default: "0.0.0.0")</field>
+            <field name="Port" type="int" yaml-tag="port">Listen port (default: 8080)</field>
+          </fields>
+        </struct>
+
+        <struct name="UnixConfig">
+          <description>UNIX domain socket configuration</description>
+          <fields>
+            <field name="SocketPath" type="string" yaml-tag="socket_path">Socket file path (required)</field>
+            <field name="Name" type="string" yaml-tag="name">Server name for /name resource (required)</field>
+            <field name="FileMode" type="uint32" yaml-tag="file_mode">Socket permissions (default: 0660)</field>
+          </fields>
+        </struct>
+
+        <struct name="LoggingConfig">
+          <description>Logging configuration</description>
+          <fields>
+            <field name="Level" type="string" yaml-tag="level">Log level: "trace", "debug", "info", "warn", "error" (default: "info")</field>
+            <field name="Format" type="string" yaml-tag="format">Output format: "text" or "json" (default: "text")</field>
+          </fields>
+        </struct>
+
+        <struct name="AuthConfig">
+          <description>OAuth authentication configuration</description>
+          <fields>
+            <field name="Enabled" type="bool" yaml-tag="enabled">Enable authentication</field>
+            <field name="Issuer" type="string" yaml-tag="issuer">OAuth issuer URL</field>
+            <field name="GitHub" type="GitHubConfig" yaml-tag="github">GitHub OAuth provider config</field>
+            <field name="Storage" type="StorageConfig" yaml-tag="storage">Token storage config</field>
+            <field name="Allowlist" type="AllowlistConfig" yaml-tag="allowlist">Authorization allowlist</field>
+            <field name="Clients" type="[]StaticClient" yaml-tag="clients,omitempty">Pre-configured OAuth clients</field>
+          </fields>
+        </struct>
+
+        <struct name="GitHubConfig">
+          <description>GitHub OAuth provider configuration</description>
+          <fields>
+            <field name="ClientID" type="string" yaml-tag="clientId">GitHub OAuth App Client ID</field>
+            <field name="ClientSecret" type="string" yaml-tag="clientSecret">GitHub OAuth App Client Secret</field>
+            <field name="ClientIDFile" type="string" yaml-tag="clientIdFile,omitempty">Path to mounted secret file</field>
+            <field name="ClientSecretFile" type="string" yaml-tag="clientSecretFile,omitempty">Path to mounted secret file</field>
+          </fields>
+        </struct>
+
+        <struct name="StorageConfig">
+          <description>Storage paths configuration</description>
+          <fields>
+            <field name="DBPath" type="string" yaml-tag="dbPath">Path to BoltDB file</field>
+          </fields>
+        </struct>
+
+        <struct name="AllowlistConfig">
+          <description>Authorization allowlist</description>
+          <fields>
+            <field name="Users" type="[]string" yaml-tag="users,omitempty">Allowed GitHub usernames</field>
+            <field name="Orgs" type="[]string" yaml-tag="orgs,omitempty">Allowed GitHub organizations</field>
+            <field name="Teams" type="[]OrgTeam" yaml-tag="teams,omitempty">Allowed GitHub org/team pairs</field>
+          </fields>
+        </struct>
+
+        <struct name="OrgTeam">
+          <description>Organization and team pair</description>
+          <fields>
+            <field name="Org" type="string" yaml-tag="org">Organization name</field>
+            <field name="Team" type="string" yaml-tag="team">Team slug</field>
+          </fields>
+        </struct>
+
+        <struct name="StaticClient">
+          <description>Pre-configured OAuth client</description>
+          <fields>
+            <field name="ClientID" type="string" yaml-tag="clientId">Client identifier</field>
+            <field name="ClientSecret" type="string" yaml-tag="clientSecret">Client secret</field>
+            <field name="Name" type="string" yaml-tag="name">Display name</field>
+            <field name="RedirectURIs" type="[]string" yaml-tag="redirectUris">Allowed redirect URIs</field>
+            <field name="Scopes" type="[]string" yaml-tag="scopes,omitempty">Allowed scopes</field>
+          </fields>
+        </struct>
+      </structs>
+
+      <functions>
+        <function name="Load" signature="(path string) (*Config, error)">
+          <description>Load configuration from a YAML file</description>
+        </function>
+        <function name="LoadFromBytes" signature="(data []byte) (*Config, error)">
+          <description>Parse configuration from YAML bytes</description>
+        </function>
+        <function name="LoadFromString" signature="(yamlContent string) (*Config, error)">
+          <description>Parse configuration from YAML string</description>
+        </function>
+        <function name="NewDefaultConfig" signature="() *Config">
+          <description>Create a Config with all defaults applied</description>
+        </function>
+      </functions>
+    </package>
+
+    <!-- Logging Package -->
+    <package name="logging" import-path="github.com/spirilis/generic-go-mcp/logging">
+      <description>Structured logging with multiple levels and formats</description>
+
+      <constants>
+        <constant name="LevelTrace" type="slog.Level" value="-8">Custom trace level (below DEBUG)</constant>
+      </constants>
+
+      <functions>
+        <function name="Initialize" signature="(cfg *config.LoggingConfig)">
+          <description>Configure the global logger from config</description>
+        </function>
+        <function name="Trace" signature="(msg string, args ...any)">
+          <description>Log a trace-level message (most verbose)</description>
+        </function>
+        <function name="Debug" signature="(msg string, args ...any)">
+          <description>Log a debug-level message</description>
+        </function>
+        <function name="Info" signature="(msg string, args ...any)">
+          <description>Log an info-level message</description>
+        </function>
+        <function name="Warn" signature="(msg string, args ...any)">
+          <description>Log a warning-level message</description>
+        </function>
+        <function name="Error" signature="(msg string, args ...any)">
+          <description>Log an error-level message</description>
+        </function>
+        <function name="IsTraceEnabled" signature="() bool">
+          <description>Check if trace logging is enabled</description>
+        </function>
+        <function name="IsDebugEnabled" signature="() bool">
+          <description>Check if debug logging is enabled</description>
+        </function>
+        <function name="SanitizeHeaders" signature="(headers map[string][]string) map[string]string">
+          <description>Return headers with sensitive values redacted</description>
+        </function>
+      </functions>
+    </package>
+
+    <!-- Auth Package -->
+    <package name="auth" import-path="github.com/spirilis/generic-go-mcp/auth">
+      <description>OAuth 2.0 authentication using GitHub as identity provider</description>
+
+      <interfaces>
+        <interface name="Storage">
+          <description>Interface for persisting auth data (19 methods)</description>
+          <methods>
+            <method name="StoreAuthCode" signature="(ctx context.Context, code *AuthorizationCode) error"/>
+            <method name="GetAuthCode" signature="(ctx context.Context, code string) (*AuthorizationCode, error)"/>
+            <method name="DeleteAuthCode" signature="(ctx context.Context, code string) error"/>
+            <method name="StoreAccessToken" signature="(ctx context.Context, token *AccessToken) error"/>
+            <method name="GetAccessToken" signature="(ctx context.Context, token string) (*AccessToken, error)"/>
+            <method name="DeleteAccessToken" signature="(ctx context.Context, token string) error"/>
+            <method name="StoreRefreshToken" signature="(ctx context.Context, token *RefreshToken) error"/>
+            <method name="GetRefreshToken" signature="(ctx context.Context, token string) (*RefreshToken, error)"/>
+            <method name="DeleteRefreshToken" signature="(ctx context.Context, token string) error"/>
+            <method name="StoreClient" signature="(ctx context.Context, client *RegisteredClient) error"/>
+            <method name="GetClient" signature="(ctx context.Context, clientID string) (*RegisteredClient, error)"/>
+            <method name="DeleteClient" signature="(ctx context.Context, clientID string) error"/>
+            <method name="ListClients" signature="(ctx context.Context) ([]*RegisteredClient, error)"/>
+            <method name="StoreUser" signature="(ctx context.Context, user *User) error"/>
+            <method name="GetUser" signature="(ctx context.Context, userID string) (*User, error)"/>
+            <method name="GetUserByGitHubLogin" signature="(ctx context.Context, login string) (*User, error)"/>
+            <method name="StoreSession" signature="(ctx context.Context, session *AuthSession) error"/>
+            <method name="GetSession" signature="(ctx context.Context, sessionID string) (*AuthSession, error)"/>
+            <method name="GetSessionByAccessToken" signature="(ctx context.Context, token string) (*AuthSession, error)"/>
+            <method name="UpdateSessionLastUsed" signature="(ctx context.Context, sessionID string, lastUsed time.Time) error"/>
+            <method name="DeleteSession" signature="(ctx context.Context, sessionID string) error"/>
+            <method name="StoreAuthRequest" signature="(ctx context.Context, req *PendingAuthRequest) error"/>
+            <method name="GetAuthRequest" signature="(ctx context.Context, id string) (*PendingAuthRequest, error)"/>
+            <method name="DeleteAuthRequest" signature="(ctx context.Context, id string) error"/>
+            <method name="Close" signature="() error"/>
+          </methods>
+        </interface>
+      </interfaces>
+
+      <structs>
+        <struct name="AuthService">
+          <description>Main entry point for all auth operations</description>
+          <fields>
+            <field name="config" type="*config.AuthConfig" exported="false">Auth configuration</field>
+            <field name="storage" type="Storage" exported="false">Data storage</field>
+            <field name="githubClient" type="*GitHubClient" exported="false">GitHub API client</field>
+            <field name="tokenService" type="*TokenService" exported="false">Token management</field>
+          </fields>
+          <methods>
+            <method name="Close" signature="() error">Close the auth service and release resources</method>
+            <method name="Middleware" signature="(next http.Handler) http.Handler">Create HTTP middleware for token validation</method>
+            <method name="RegisterRoutes" signature="(mux *http.ServeMux)">Register OAuth endpoints</method>
+            <method name="RegisterAdminRoutes" signature="(mux *http.ServeMux)">Register admin endpoints</method>
+          </methods>
+        </struct>
+
+        <struct name="User">
+          <description>Authenticated user information</description>
+          <fields>
+            <field name="ID" type="string" json-tag="id">Internal user ID</field>
+            <field name="GitHubLogin" type="string" json-tag="github_login">GitHub username</field>
+            <field name="GitHubID" type="int64" json-tag="github_id">GitHub numeric ID</field>
+            <field name="Email" type="string" json-tag="email,omitempty">Email address</field>
+            <field name="Name" type="string" json-tag="name,omitempty">Display name</field>
+            <field name="AvatarURL" type="string" json-tag="avatar_url,omitempty">Avatar URL</field>
+            <field name="Organizations" type="[]string" json-tag="organizations,omitempty">GitHub org memberships</field>
+            <field name="Teams" type="[]string" json-tag="teams,omitempty">GitHub team memberships (format: "org/team")</field>
+          </fields>
+        </struct>
+
+        <struct name="AccessToken">
+          <description>Issued access token</description>
+          <fields>
+            <field name="Token" type="string" json-tag="token">Token string</field>
+            <field name="TokenType" type="string" json-tag="token_type">Always "Bearer"</field>
+            <field name="ClientID" type="string" json-tag="client_id">Issuing client</field>
+            <field name="UserID" type="string" json-tag="user_id">Token owner</field>
+            <field name="Scope" type="string" json-tag="scope">Granted scopes</field>
+            <field name="Resource" type="string" json-tag="resource,omitempty">RFC 8707 resource indicator</field>
+            <field name="ExpiresAt" type="time.Time" json-tag="expires_at">Expiration time</field>
+            <field name="CreatedAt" type="time.Time" json-tag="created_at">Creation time</field>
+          </fields>
+        </struct>
+
+        <struct name="RefreshToken">
+          <description>Refresh token for obtaining new access tokens</description>
+          <fields>
+            <field name="Token" type="string" json-tag="token">Token string</field>
+            <field name="ClientID" type="string" json-tag="client_id">Issuing client</field>
+            <field name="UserID" type="string" json-tag="user_id">Token owner</field>
+            <field name="Scope" type="string" json-tag="scope">Granted scopes</field>
+            <field name="Resource" type="string" json-tag="resource,omitempty">RFC 8707 resource</field>
+            <field name="ExpiresAt" type="time.Time" json-tag="expires_at">Expiration time</field>
+            <field name="CreatedAt" type="time.Time" json-tag="created_at">Creation time</field>
+          </fields>
+        </struct>
+
+        <struct name="AuthorizationCode">
+          <description>Pending authorization code</description>
+          <fields>
+            <field name="Code" type="string" json-tag="code">Authorization code</field>
+            <field name="ClientID" type="string" json-tag="client_id">Requesting client</field>
+            <field name="RedirectURI" type="string" json-tag="redirect_uri">Callback URI</field>
+            <field name="Scope" type="string" json-tag="scope">Requested scopes</field>
+            <field name="CodeChallenge" type="string" json-tag="code_challenge">PKCE challenge</field>
+            <field name="CodeChallengeMethod" type="string" json-tag="code_challenge_method">PKCE method</field>
+            <field name="Resource" type="string" json-tag="resource,omitempty">RFC 8707 resource</field>
+            <field name="UserID" type="string" json-tag="user_id">Authorized user</field>
+            <field name="ExpiresAt" type="time.Time" json-tag="expires_at">Expiration</field>
+            <field name="CreatedAt" type="time.Time" json-tag="created_at">Creation time</field>
+          </fields>
+        </struct>
+
+        <struct name="RegisteredClient">
+          <description>OAuth client (dynamic or static)</description>
+          <fields>
+            <field name="ClientID" type="string" json-tag="client_id">Client identifier</field>
+            <field name="ClientSecret" type="string" json-tag="client_secret,omitempty">Hashed secret</field>
+            <field name="ClientName" type="string" json-tag="client_name">Display name</field>
+            <field name="ClientURI" type="string" json-tag="client_uri,omitempty">Client homepage</field>
+            <field name="LogoURI" type="string" json-tag="logo_uri,omitempty">Logo URL</field>
+            <field name="RedirectURIs" type="[]string" json-tag="redirect_uris">Allowed redirects</field>
+            <field name="Scopes" type="[]string" json-tag="scope,omitempty">Allowed scopes</field>
+            <field name="GrantTypes" type="[]string" json-tag="grant_types,omitempty">Allowed grants</field>
+            <field name="ResponseTypes" type="[]string" json-tag="response_types,omitempty">Allowed responses</field>
+            <field name="TokenEndpointAuthMethod" type="string" json-tag="token_endpoint_auth_method,omitempty">Auth method</field>
+            <field name="IsStatic" type="bool" json-tag="is_static">True if from config</field>
+            <field name="CreatedAt" type="time.Time" json-tag="created_at">Registration time</field>
+          </fields>
+        </struct>
+
+        <struct name="AuthSession">
+          <description>MCP session tied to authenticated user</description>
+          <fields>
+            <field name="SessionID" type="string" json-tag="session_id">MCP session ID</field>
+            <field name="UserID" type="string" json-tag="user_id">Authenticated user</field>
+            <field name="ClientID" type="string" json-tag="client_id">OAuth client</field>
+            <field name="AccessToken" type="string" json-tag="access_token">Associated token</field>
+            <field name="CreatedAt" type="time.Time" json-tag="created_at">Creation time</field>
+            <field name="LastUsedAt" type="time.Time" json-tag="last_used_at">Last activity</field>
+          </fields>
+        </struct>
+
+        <struct name="PendingAuthRequest">
+          <description>Pending OAuth authorization request</description>
+          <fields>
+            <field name="ID" type="string" json-tag="id">Request identifier</field>
+            <field name="ClientID" type="string" json-tag="client_id">Requesting client</field>
+            <field name="RedirectURI" type="string" json-tag="redirect_uri">Callback URI</field>
+            <field name="Scope" type="string" json-tag="scope">Requested scopes</field>
+            <field name="State" type="string" json-tag="state">CSRF state</field>
+            <field name="CodeChallenge" type="string" json-tag="code_challenge">PKCE challenge</field>
+            <field name="CodeChallengeMethod" type="string" json-tag="code_challenge_method">PKCE method</field>
+            <field name="Resource" type="string" json-tag="resource,omitempty">RFC 8707 resource</field>
+            <field name="CreatedAt" type="time.Time" json-tag="created_at">Creation time</field>
+            <field name="ExpiresAt" type="time.Time" json-tag="expires_at">Expiration</field>
+          </fields>
+        </struct>
+
+        <struct name="BoltStorage">
+          <description>Storage implementation using BoltDB</description>
+          <fields>
+            <field name="db" type="*bolt.DB" exported="false">BoltDB instance</field>
+          </fields>
+        </struct>
+
+        <struct name="OAuthError">
+          <description>OAuth error response per RFC 6749</description>
+          <fields>
+            <field name="Error" type="string" json-tag="error">Error code</field>
+            <field name="ErrorDescription" type="string" json-tag="error_description,omitempty">Human-readable description</field>
+            <field name="ErrorURI" type="string" json-tag="error_uri,omitempty">Error documentation URL</field>
+          </fields>
+        </struct>
+      </structs>
+
+      <constants>
+        <constant name="ContextKeyUser" type="contextKey" value="auth_user">Context key for User</constant>
+        <constant name="ContextKeyAccessToken" type="contextKey" value="auth_access_token">Context key for AccessToken</constant>
+        <constant name="ContextKeySession" type="contextKey" value="auth_session">Context key for AuthSession</constant>
+        <constant name="BucketAuthCodes" value="auth_codes">BoltDB bucket for auth codes</constant>
+        <constant name="BucketAccessTokens" value="access_tokens">BoltDB bucket for access tokens</constant>
+        <constant name="BucketRefreshTokens" value="refresh_tokens">BoltDB bucket for refresh tokens</constant>
+        <constant name="BucketClients" value="clients">BoltDB bucket for registered clients</constant>
+        <constant name="BucketUsers" value="users">BoltDB bucket for users</constant>
+        <constant name="BucketUsersByGitHub" value="users_by_github">BoltDB bucket for GitHub login index</constant>
+        <constant name="BucketSessions" value="sessions">BoltDB bucket for sessions</constant>
+        <constant name="BucketSessionsByToken" value="sessions_by_token">BoltDB bucket for token index</constant>
+        <constant name="BucketAuthRequests" value="auth_requests">BoltDB bucket for pending requests</constant>
+      </constants>
+
+      <errors>
+        <error name="ErrTokenNotFound">Token not found in storage</error>
+        <error name="ErrTokenExpired">Token has expired</error>
+        <error name="ErrClientNotFound">OAuth client not found</error>
+        <error name="ErrInvalidCredentials">Invalid client credentials</error>
+        <error name="ErrUserNotFound">User not found</error>
+        <error name="ErrSessionNotFound">Session not found</error>
+      </errors>
+
+      <constructors>
+        <constructor name="NewAuthService" signature="(cfg *config.AuthConfig) (*AuthService, error)">
+          <description>Create a new authentication service</description>
+        </constructor>
+        <constructor name="NewBoltStorage" signature="(path string) (*BoltStorage, error)">
+          <description>Create BoltDB storage at the specified path</description>
+        </constructor>
+      </constructors>
+
+      <functions>
+        <function name="GetUserFromContext" signature="(ctx context.Context) *User">
+          <description>Retrieve authenticated user from request context</description>
+        </function>
+        <function name="GetAccessTokenFromContext" signature="(ctx context.Context) *AccessToken">
+          <description>Retrieve access token from request context</description>
+        </function>
+      </functions>
+    </package>
+
+  </packages>
+
+  <!-- ============================================
+       USER-INTERFACING SECTION
+       ============================================ -->
+  <user-interfacing>
+    <description>
+      This section documents the critical entry points and types that library users interact with directly.
+    </description>
+
+    <functions-users-must-call>
+      <function package="mcp" name="NewServer" required="true">
+        <description>Create the MCP server instance</description>
+        <signature>NewServer(registry *ToolRegistry, resourceRegistry *ResourceRegistry, config *ServerConfig) *Server</signature>
+      </function>
+      <function package="mcp" name="NewToolRegistry" required="true">
+        <description>Create a tool registry to register tools</description>
+        <signature>NewToolRegistry() *ToolRegistry</signature>
+      </function>
+      <function package="mcp" name="NewResourceRegistry" required="false">
+        <description>Create a resource registry (optional, only if exposing resources)</description>
+        <signature>NewResourceRegistry() *ResourceRegistry</signature>
+      </function>
+      <function package="transport" name="NewStdioTransport" required="one-of-transport">
+        <description>Create stdio transport for CLI usage</description>
+        <signature>NewStdioTransport() *StdioTransport</signature>
+      </function>
+      <function package="transport" name="NewHTTPTransport" required="one-of-transport">
+        <description>Create HTTP/SSE transport for web deployment</description>
+        <signature>NewHTTPTransport(config HTTPTransportConfig) *HTTPTransport</signature>
+      </function>
+      <function package="transport" name="NewUnixTransport" required="one-of-transport">
+        <description>Create UNIX socket transport for local IPC</description>
+        <signature>NewUnixTransport(config UnixTransportConfig) *UnixTransport</signature>
+      </function>
+      <function package="logging" name="Initialize" required="recommended">
+        <description>Initialize the logging system</description>
+        <signature>Initialize(cfg *config.LoggingConfig)</signature>
+      </function>
+      <function package="auth" name="NewAuthService" required="false">
+        <description>Create auth service (only for HTTP mode with authentication)</description>
+        <signature>NewAuthService(cfg *config.AuthConfig) (*AuthService, error)</signature>
+      </function>
+    </functions-users-must-call>
+
+    <structs-users-instantiate>
+      <struct package="mcp" name="ServerConfig">
+        <description>Configure server identity (name, version, instructions)</description>
+        <usage>Pass to NewServer() to customize server identification</usage>
+      </struct>
+      <struct package="mcp" name="Tool">
+        <description>Define a tool with name, description, and JSON schema</description>
+        <usage>Create and pass to ToolRegistry.Register() along with a ToolFunction</usage>
+      </struct>
+      <struct package="mcp" name="Resource">
+        <description>Define a resource with URI, name, description, and MIME type</description>
+        <usage>Create and pass to ResourceRegistry.Register() along with a ResourceFunction</usage>
+      </struct>
+      <struct package="mcp" name="ToolCallResult">
+        <description>Return value from tool implementations</description>
+        <usage>Return from ToolFunction implementations</usage>
+      </struct>
+      <struct package="mcp" name="ToolContent">
+        <description>Content item within ToolCallResult</description>
+        <usage>Create as part of ToolCallResult.Content array</usage>
+      </struct>
+      <struct package="transport" name="HTTPTransportConfig">
+        <description>Configure HTTP transport (host, port, auth)</description>
+        <usage>Pass to NewHTTPTransport()</usage>
+      </struct>
+      <struct package="transport" name="UnixTransportConfig">
+        <description>Configure UNIX socket transport (path, permissions)</description>
+        <usage>Pass to NewUnixTransport()</usage>
+      </struct>
+      <struct package="config" name="LoggingConfig">
+        <description>Configure logging level and format</description>
+        <usage>Pass to logging.Initialize() or use from loaded Config</usage>
+      </struct>
+    </structs-users-instantiate>
+
+    <interfaces-users-implement>
+      <interface package="mcp" name="ToolFunction" required="true">
+        <description>REQUIRED: Users must implement this for each tool</description>
+        <signature>func(arguments json.RawMessage) (interface{}, error)</signature>
+        <notes>
+          - Receives tool arguments as raw JSON
+          - Should unmarshal arguments into tool-specific struct
+          - Return ToolCallResult for success or error for failure
+        </notes>
+      </interface>
+      <interface package="mcp" name="ResourceFunction" required="false">
+        <description>OPTIONAL: Implement for dynamic resource content</description>
+        <signature>func() (string, error)</signature>
+        <notes>
+          - Called when client reads the resource
+          - Return content string or error
+        </notes>
+      </interface>
+      <interface package="auth" name="Storage" required="advanced">
+        <description>ADVANCED: Only implement if custom storage needed (BoltStorage is default)</description>
+        <notes>
+          - 24-method interface for persisting OAuth data
+          - BoltStorage provides a complete implementation
+          - Only implement for non-BoltDB backends
+        </notes>
+      </interface>
+    </interfaces-users-implement>
+
+    <type-signatures>
+      <type name="ToolFunction">
+        <definition>func(arguments json.RawMessage) (interface{}, error)</definition>
+        <input>
+          <param name="arguments" type="json.RawMessage">
+            Raw JSON containing tool arguments. Unmarshal into your argument struct.
+          </param>
+        </input>
+        <output>
+          <param name="result" type="interface{}">
+            Should be a ToolCallResult struct for proper MCP response formatting.
+          </param>
+          <param name="error" type="error">
+            Non-nil error indicates tool execution failure.
+          </param>
+        </output>
+      </type>
+      <type name="ResourceFunction">
+        <definition>func() (string, error)</definition>
+        <input>None - resources are read-only and take no parameters</input>
+        <output>
+          <param name="content" type="string">
+            The resource content as a string.
+          </param>
+          <param name="error" type="error">
+            Non-nil error indicates resource read failure.
+          </param>
+        </output>
+      </type>
+    </type-signatures>
+  </user-interfacing>
+
+  <!-- ============================================
+       DATA FLOW
+       ============================================ -->
+  <data-flow>
+    <description>Message flow from transport layer through server to user code</description>
+
+    <flow name="tool-call">
+      <step order="1">Transport receives JSON-RPC message (stdin line, HTTP POST body, or socket read)</step>
+      <step order="2">Transport calls Server.HandleMessage(data []byte)</step>
+      <step order="3">Server parses JSON-RPC request, extracts method name</step>
+      <step order="4">For "tools/call", Server calls handleToolsCall(params)</step>
+      <step order="5">handleToolsCall unmarshals ToolsCallParams (name + arguments)</step>
+      <step order="6">Server calls ToolRegistry.Call(name, arguments)</step>
+      <step order="7">ToolRegistry looks up ToolFunction by name</step>
+      <step order="8">ToolRegistry invokes user's ToolFunction(arguments)</step>
+      <step order="9">User function returns (result, error)</step>
+      <step order="10">Result flows back: ToolRegistry -> Server -> Transport -> Client</step>
+    </flow>
+
+    <flow name="resource-read">
+      <step order="1">Transport receives JSON-RPC message</step>
+      <step order="2">Transport calls Server.HandleMessage(data []byte)</step>
+      <step order="3">Server routes to handleResourcesRead(params)</step>
+      <step order="4">handleResourcesRead unmarshals ResourcesReadParams (URI)</step>
+      <step order="5">Server calls ResourceRegistry.Read(uri)</step>
+      <step order="6">ResourceRegistry looks up ResourceFunction by URI</step>
+      <step order="7">ResourceRegistry invokes user's ResourceFunction()</step>
+      <step order="8">User function returns (content, error)</step>
+      <step order="9">Server wraps in ResourcesReadResult with MIME type</step>
+      <step order="10">Result flows back: Server -> Transport -> Client</step>
+    </flow>
+
+    <flow name="http-auth">
+      <step order="1">HTTP request arrives at /mcp endpoint</step>
+      <step order="2">AuthService.Middleware extracts Bearer token from Authorization header</step>
+      <step order="3">Middleware validates token via TokenService</step>
+      <step order="4">Middleware retrieves User from Storage</step>
+      <step order="5">User and AccessToken added to request context</step>
+      <step order="6">Request proceeds to MCP handler</step>
+      <step order="7">Session can access User via auth.GetUserFromContext(ctx)</step>
+    </flow>
+  </data-flow>
+
+  <!-- ============================================
+       CODE PATTERNS
+       ============================================ -->
+  <code-patterns>
+    <pattern name="minimal-stdio-server">
+      <description>Minimal MCP server using stdio transport</description>
+      <code><![CDATA[
+package main
+
+import (
+    "encoding/json"
+    "github.com/spirilis/generic-go-mcp/mcp"
+    "github.com/spirilis/generic-go-mcp/transport"
+)
+
+func main() {
+    // Create registries
+    toolRegistry := mcp.NewToolRegistry()
+    resourceRegistry := mcp.NewResourceRegistry()
+
+    // Register a simple tool
+    toolRegistry.Register(
+        mcp.Tool{
+            Name:        "hello",
+            Description: "Says hello",
+            InputSchema: json.RawMessage(`{"type": "object", "properties": {}}`),
+        },
+        func(args json.RawMessage) (interface{}, error) {
+            return mcp.ToolCallResult{
+                Content: []mcp.ToolContent{
+                    {Type: "text", Text: "Hello, World!"},
+                },
+            }, nil
+        },
+    )
+
+    // Create server
+    server := mcp.NewServer(toolRegistry, resourceRegistry, &mcp.ServerConfig{
+        Name:    "my-server",
+        Version: "1.0.0",
+    })
+
+    // Create and start transport
+    trans := transport.NewStdioTransport()
+    trans.Start(server)
+
+    // Keep running
+    select {}
+}
+]]></code>
+    </pattern>
+
+    <pattern name="tool-with-arguments">
+      <description>Tool that accepts and parses arguments</description>
+      <code><![CDATA[
+// Define argument struct
+type GreetArgs struct {
+    Name string `json:"name"`
+}
+
+// Register tool with schema
+toolRegistry.Register(
+    mcp.Tool{
+        Name:        "greet",
+        Description: "Greet a person by name",
+        InputSchema: json.RawMessage(`{
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Name to greet"}
+            },
+            "required": ["name"]
+        }`),
+    },
+    func(args json.RawMessage) (interface{}, error) {
+        var params GreetArgs
+        if err := json.Unmarshal(args, &params); err != nil {
+            return nil, fmt.Errorf("invalid arguments: %w", err)
+        }
+        return mcp.ToolCallResult{
+            Content: []mcp.ToolContent{
+                {Type: "text", Text: fmt.Sprintf("Hello, %s!", params.Name)},
+            },
+        }, nil
+    },
+)
+]]></code>
+    </pattern>
+
+    <pattern name="dynamic-resource">
+      <description>Resource with dynamic content</description>
+      <code><![CDATA[
+resourceRegistry.Register(
+    mcp.Resource{
+        URI:         "info://server/status",
+        Name:        "Server Status",
+        Description: "Current server status",
+        MimeType:    "application/json",
+    },
+    func() (string, error) {
+        status := map[string]interface{}{
+            "uptime":     time.Since(startTime).String(),
+            "requests":   requestCount,
+            "healthy":    true,
+        }
+        data, _ := json.Marshal(status)
+        return string(data), nil
+    },
+)
+]]></code>
+    </pattern>
+
+    <pattern name="http-with-auth">
+      <description>HTTP transport with OAuth authentication</description>
+      <code><![CDATA[
+package main
+
+import (
+    "github.com/spirilis/generic-go-mcp/auth"
+    "github.com/spirilis/generic-go-mcp/config"
+    "github.com/spirilis/generic-go-mcp/mcp"
+    "github.com/spirilis/generic-go-mcp/transport"
+)
+
+func main() {
+    // Load config
+    cfg, _ := config.Load("config.yaml")
+
+    // Create auth service
+    authService, _ := auth.NewAuthService(cfg.Auth)
+    defer authService.Close()
+
+    // Create registries and server
+    toolRegistry := mcp.NewToolRegistry()
+    resourceRegistry := mcp.NewResourceRegistry()
+    server := mcp.NewServer(toolRegistry, resourceRegistry, nil)
+
+    // Create HTTP transport with auth
+    trans := transport.NewHTTPTransport(transport.HTTPTransportConfig{
+        Host:        cfg.Server.HTTP.Host,
+        Port:        cfg.Server.HTTP.Port,
+        AuthService: authService,
+    })
+
+    trans.Start(server)
+    select {}
+}
+]]></code>
+    </pattern>
+
+    <pattern name="error-handling-in-tool">
+      <description>Proper error handling in tool implementation</description>
+      <code><![CDATA[
+func myToolHandler(args json.RawMessage) (interface{}, error) {
+    var params MyToolArgs
+    if err := json.Unmarshal(args, &params); err != nil {
+        // Return error result (not Go error) for user-visible errors
+        return mcp.ToolCallResult{
+            Content: []mcp.ToolContent{
+                {Type: "text", Text: fmt.Sprintf("Invalid arguments: %v", err)},
+            },
+            IsError: true,
+        }, nil
+    }
+
+    result, err := doSomething(params)
+    if err != nil {
+        // Return Go error for unexpected/internal errors
+        return nil, fmt.Errorf("operation failed: %w", err)
+    }
+
+    return mcp.ToolCallResult{
+        Content: []mcp.ToolContent{
+            {Type: "text", Text: result},
+        },
+    }, nil
+}
+]]></code>
+    </pattern>
+  </code-patterns>
+
+  <!-- ============================================
+       DEPENDENCIES
+       ============================================ -->
+  <dependencies>
+    <dependency name="go.etcd.io/bbolt" version="v1.4.3">
+      <description>Embedded key-value database for OAuth token/session storage</description>
+      <usage>Used by auth.BoltStorage for persisting OAuth data</usage>
+    </dependency>
+    <dependency name="gopkg.in/yaml.v3" version="v3.0.1">
+      <description>YAML parsing library</description>
+      <usage>Used by config package to parse YAML configuration files</usage>
+    </dependency>
+    <dependency name="golang.org/x/sys" version="v0.40.0" indirect="true">
+      <description>Go extended system call support</description>
+      <usage>Indirect dependency of bbolt</usage>
+    </dependency>
+  </dependencies>
+
+</mcp-library>

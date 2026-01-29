@@ -289,7 +289,7 @@ func main() {
     // Add more tools as needed
     // registry.Register(tools.GetMyToolDefinition(), tools.MyTool)
 
-    // 5. Create resource registry (for unix mode /name and /pid resources)
+    // 5. Create resource registry (e.g. for unix mode /name and /pid resources)
     resourceRegistry := mcp.NewResourceRegistry()
 
     // 6. Create MCP server with custom name and version
