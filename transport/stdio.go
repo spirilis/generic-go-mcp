@@ -1,75 +1,50 @@
 package transport
 
 import (
-	"bufio"
-	"fmt"
+	"context"
 	"os"
-	"sync"
 )
 
-// StdioTransport implements Transport using stdin/stdout
+// StdioTransport implements Transport using stdin/stdout, framed as newline-delimited
+// JSON-RPC per the 2026-07-28 stdio binding. It is a thin wrapper around the shared
+// streamTransport, which handles concurrent request dispatch (mandatory now that
+// subscriptions/listen can hold a request open indefinitely) and notifications/cancelled.
 type StdioTransport struct {
-	scanner *bufio.Scanner
-	handler MessageHandler
-	stopCh  chan struct{}
-	wg      sync.WaitGroup
+	stream *streamTransport
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
-// NewStdioTransport creates a new stdio transport
+// NewStdioTransport creates a new stdio transport.
 func NewStdioTransport() *StdioTransport {
-	return &StdioTransport{
-		scanner: bufio.NewScanner(os.Stdin),
-		stopCh:  make(chan struct{}),
-	}
+	return &StdioTransport{stream: newStreamTransport("stdio")}
 }
 
-// Start begins reading from stdin and processing messages
+// Start begins reading from stdin and processing messages.
 func (t *StdioTransport) Start(handler MessageHandler) error {
-	t.handler = handler
+	t.stream.handler = handler
 
-	t.wg.Add(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.cancel = cancel
+	t.done = make(chan struct{})
+
 	go func() {
-		defer t.wg.Done()
-		t.readLoop()
+		defer close(t.done)
+		t.stream.serve(ctx, os.Stdin, os.Stdout)
 	}()
 
 	return nil
 }
 
-// Stop gracefully stops the transport
+// Stop signals in-flight requests to cancel and waits for the read loop to exit. Per the
+// spec, the primary and only fully portable shutdown signal for a stdio server is its
+// stdin being closed by the client; Stop cancels in-flight request contexts but cannot
+// interrupt a blocked stdin read itself, so callers that need a hard deadline should race
+// this against their own timeout.
 func (t *StdioTransport) Stop() error {
-	close(t.stopCh)
-	t.wg.Wait()
-	return nil
-}
-
-// readLoop continuously reads lines from stdin
-func (t *StdioTransport) readLoop() {
-	for {
-		select {
-		case <-t.stopCh:
-			return
-		default:
-			if t.scanner.Scan() {
-				line := t.scanner.Bytes()
-				if len(line) == 0 {
-					continue
-				}
-
-				// Handle the message
-				response := t.handler.HandleMessage(line)
-
-				// Write response to stdout
-				if response != nil {
-					fmt.Println(string(response))
-				}
-			} else {
-				// Check for scanner error or EOF
-				if err := t.scanner.Err(); err != nil {
-					fmt.Fprintf(os.Stderr, "Scanner error: %v\n", err)
-				}
-				return
-			}
-		}
+	if t.cancel != nil {
+		t.cancel()
 	}
+	<-t.done
+	return nil
 }

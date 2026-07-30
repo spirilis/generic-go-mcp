@@ -1,64 +1,73 @@
 #!/bin/bash
 
-# Test HTTP/SSE Transport
-echo "Starting HTTP/SSE Transport Test..."
+# Test Streamable HTTP Transport (MCP protocol version 2026-07-28)
+#
+# This protocol revision is stateless: there is no initialize handshake and no
+# Mcp-Session-Id. Every POST to /mcp carries its own MCP-Protocol-Version, Mcp-Method,
+# and (for tools/call, resources/read, prompts/get) Mcp-Name headers, matching the
+# corresponding fields in the JSON-RPC body.
+
+set -e
+
+echo "Starting Streamable HTTP Transport Test..."
 echo
 
-# Start the server in the background
 echo "Starting server..."
 ./go-mcp -config config-http.yaml &
 SERVER_PID=$!
 sleep 2
+trap 'kill $SERVER_PID 2>/dev/null' EXIT
 
-# Test 1: Open SSE connection and capture session ID
-echo "Test 1: Opening SSE connection..."
-rm -f /tmp/sse-output.txt
-curl -N http://localhost:8080/sse > /tmp/sse-output.txt 2>&1 &
-SSE_PID=$!
-sleep 2
+META='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test-http.sh","version":"1.0"},"io.modelcontextprotocol/clientCapabilities":{}}'
 
-# Extract session ID from SSE output
-SESSION_ID=$(grep -oP '"sessionId":"\K[^"]+' /tmp/sse-output.txt | head -1)
-echo "Received Session ID: $SESSION_ID"
-echo
-
-if [ -z "$SESSION_ID" ]; then
-    echo "ERROR: Failed to get session ID"
-    kill $SSE_PID $SERVER_PID 2>/dev/null
-    exit 1
-fi
-
-# Test 2: Send tools/list request
-echo "Test 2: Sending tools/list request..."
-curl -X POST http://localhost:8080/message \
+# Test 1: server/discover — the replacement for the old initialize handshake. No
+# session is created or returned; the response is a single JSON object.
+echo "Test 1: server/discover"
+curl -s -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{$META}}" \
   -w "\nHTTP Status: %{http_code}\n"
 echo
 
-# Wait for response in SSE stream
-sleep 2
-echo "SSE Stream Output:"
-cat /tmp/sse-output.txt
-echo
-
-# Test 3: Send tools/call request for date tool
-echo "Test 3: Sending tools/call request for date tool..."
-curl -X POST http://localhost:8080/message \
+# Test 2: tools/list
+echo "Test 2: tools/list"
+curl -s -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
-  -H "Mcp-Session-Id: $SESSION_ID" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"date","arguments":{"timezone":"America/New_York"}}}' \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{$META}}" \
   -w "\nHTTP Status: %{http_code}\n"
 echo
 
-# Wait for response
-sleep 2
+# Test 3: tools/call for the date tool. Mcp-Name must match params.name.
+echo "Test 3: tools/call (date tool)"
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/call" \
+  -H "Mcp-Name: date" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"date\",\"arguments\":{\"timezone\":\"America/New_York\"},$META}}" \
+  -w "\nHTTP Status: %{http_code}\n"
+echo
 
-# Cleanup
-echo "Cleaning up..."
-kill $SSE_PID 2>/dev/null
-kill $SERVER_PID 2>/dev/null
-sleep 1
+# Test 4: a request missing the required headers must be rejected with 400 and a
+# HeaderMismatch (-32020) JSON-RPC error — there is no fallback to session-based auth.
+echo "Test 4: tools/list without required headers (expect 400 / -32020)"
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\",\"params\":{$META}}" \
+  -w "\nHTTP Status: %{http_code}\n"
+echo
+
+# Test 5: a legacy "initialize" request gets a diagnostic naming the versions this
+# server supports, rather than a session.
+echo "Test 5: legacy initialize (expect 404 / -32601 diagnostic)"
+curl -s -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}' \
+  -w "\nHTTP Status: %{http_code}\n"
+echo
 
 echo "Test complete!"

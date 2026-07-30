@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -184,6 +185,7 @@ func main() {
 	registry := mcp.NewToolRegistry()
 	registry.Register(tools.GetDateToolDefinition(), tools.DateTool)
 	registry.Register(tools.GetFortuneToolDefinition(), tools.FortuneTool)
+	registry.Register(tools.GetConfirmToolDefinition(), tools.ConfirmTool)
 
 	// Create resource registry
 	resourceRegistry := mcp.NewResourceRegistry()
@@ -214,30 +216,32 @@ func main() {
 		logging.Info("Starting MCP server in stdio mode")
 	case "http":
 		trans = transport.NewHTTPTransport(transport.HTTPTransportConfig{
-			Host:        cfg.Server.HTTP.Host,
-			Port:        cfg.Server.HTTP.Port,
-			AuthService: authService,
+			Host:           cfg.Server.HTTP.Host,
+			Port:           cfg.Server.HTTP.Port,
+			AuthService:    authService,
+			AllowedOrigins: cfg.Server.HTTP.AllowedOrigins,
 		})
 		logging.Info("Starting MCP server in HTTP mode", "host", cfg.Server.HTTP.Host, "port", cfg.Server.HTTP.Port)
 	case "unix":
-		// Register /name resource
+		// Register /name resource. Bare "/name" is not a valid absolute URI (no scheme);
+		// this custom transport's resources use the mcp+unix:// scheme to identify them.
 		resourceRegistry.Register(mcp.Resource{
-			URI:         "/name",
+			URI:         "mcp+unix:///name",
 			Name:        "Endpoint Name",
 			Description: "The configured name of this MCP endpoint",
 			MimeType:    "text/plain",
-		}, func() (string, error) {
-			return cfg.Server.Unix.Name, nil
+		}, func(ctx context.Context) (mcp.ResourceContentResult, error) {
+			return mcp.ResourceContentResult{Text: cfg.Server.Unix.Name}, nil
 		})
 
 		// Register /pid resource
 		resourceRegistry.Register(mcp.Resource{
-			URI:         "/pid",
+			URI:         "mcp+unix:///pid",
 			Name:        "Process ID",
 			Description: "PID of the MCP server process (send SIGINT or SIGTERM to stop)",
 			MimeType:    "text/plain",
-		}, func() (string, error) {
-			return strconv.Itoa(os.Getpid()), nil
+		}, func(ctx context.Context) (mcp.ResourceContentResult, error) {
+			return mcp.ResourceContentResult{Text: strconv.Itoa(os.Getpid())}, nil
 		})
 
 		trans = transport.NewUnixTransport(transport.UnixTransportConfig{

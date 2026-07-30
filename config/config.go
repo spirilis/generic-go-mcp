@@ -25,6 +25,11 @@ type ServerConfig struct {
 type HTTPConfig struct {
 	Host string `yaml:"host"` // Default: "0.0.0.0"
 	Port int    `yaml:"port"` // Default: 8080
+
+	// AllowedOrigins is the Origin allow-list for the Streamable HTTP transport's DNS
+	// rebinding protection. If empty, only http(s)://localhost and http(s)://127.0.0.1
+	// are allowed. Use ["*"] to allow any origin (e.g. behind a trusted reverse proxy).
+	AllowedOrigins []string `yaml:"allowed_origins,omitempty"`
 }
 
 // UnixConfig represents UNIX domain socket configuration

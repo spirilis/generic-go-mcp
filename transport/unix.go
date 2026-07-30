@@ -1,7 +1,7 @@
 package transport
 
 import (
-	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -16,15 +16,21 @@ type UnixTransportConfig struct {
 	FileMode   os.FileMode
 }
 
-// UnixTransport implements Transport using UNIX domain sockets
+// UnixTransport implements Transport using UNIX domain sockets. Per the 2026-07-28 spec,
+// custom transports over a reliable bidirectional byte stream SHOULD reuse the stdio
+// newline-delimited JSON-RPC framing rather than defining a new one; this transport does,
+// via the shared streamTransport binding, so it inherits concurrent dispatch and
+// notifications/cancelled handling for free.
 type UnixTransport struct {
 	config   UnixTransportConfig
 	listener net.Listener
 	handler  MessageHandler
 	stopCh   chan struct{}
 	wg       sync.WaitGroup
-	connMu   sync.Mutex
-	conn     net.Conn
+
+	connMu     sync.Mutex
+	conn       net.Conn
+	cancelConn context.CancelFunc
 }
 
 // NewUnixTransport creates a new UNIX socket transport
@@ -78,10 +84,13 @@ func (t *UnixTransport) Stop() error {
 		t.listener.Close()
 	}
 
-	// Close any active connection
+	// Close any active connection and cancel its in-flight requests
 	t.connMu.Lock()
 	if t.conn != nil {
 		t.conn.Close()
+	}
+	if t.cancelConn != nil {
+		t.cancelConn()
 	}
 	t.connMu.Unlock()
 
@@ -96,7 +105,9 @@ func (t *UnixTransport) Stop() error {
 	return nil
 }
 
-// acceptLoop accepts connections from the socket
+// acceptLoop accepts connections from the socket. Only one connection is served at a
+// time: a new connection closes and replaces whatever the previous one was doing, same
+// as before this migration.
 func (t *UnixTransport) acceptLoop() {
 	for {
 		conn, err := t.listener.Accept()
@@ -110,61 +121,32 @@ func (t *UnixTransport) acceptLoop() {
 			}
 		}
 
-		// Handle one connection at a time
+		ctx, cancel := context.WithCancel(context.Background())
+
 		t.connMu.Lock()
 		if t.conn != nil {
-			// Close previous connection if one exists
 			t.conn.Close()
 		}
+		if t.cancelConn != nil {
+			t.cancelConn()
+		}
 		t.conn = conn
+		t.cancelConn = cancel
 		t.connMu.Unlock()
 
 		logging.Debug("Client connected to UNIX socket")
 
-		// Handle the connection in a goroutine
 		t.wg.Add(1)
-		go func(c net.Conn) {
+		go func(c net.Conn, ctx context.Context, cancel context.CancelFunc) {
 			defer t.wg.Done()
 			defer c.Close()
-			t.handleConnection(c)
-		}(conn)
-	}
-}
+			defer cancel()
 
-// handleConnection processes messages from a single connection
-func (t *UnixTransport) handleConnection(conn net.Conn) {
-	scanner := bufio.NewScanner(conn)
+			stream := newStreamTransport("unix")
+			stream.handler = t.handler
+			stream.serve(ctx, c, c)
 
-	for {
-		select {
-		case <-t.stopCh:
-			return
-		default:
-			if !scanner.Scan() {
-				// Check for error or EOF
-				if err := scanner.Err(); err != nil {
-					logging.Error("Scanner error", "error", err)
-				} else {
-					logging.Debug("Client disconnected from UNIX socket")
-				}
-				return
-			}
-
-			line := scanner.Bytes()
-			if len(line) == 0 {
-				continue
-			}
-
-			// Handle the message
-			response := t.handler.HandleMessage(line)
-
-			// Write response back to the client
-			if response != nil {
-				if _, err := conn.Write(append(response, '\n')); err != nil {
-					logging.Error("Error writing response", "error", err)
-					return
-				}
-			}
-		}
+			logging.Debug("Client disconnected from UNIX socket")
+		}(conn, ctx, cancel)
 	}
 }

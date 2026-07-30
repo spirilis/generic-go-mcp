@@ -1,8 +1,22 @@
-# HTTP/SSE Transport Guide
+# Streamable HTTP Transport Guide
 
 ## Overview
 
-The HTTP/SSE transport enables MCP servers to communicate via HTTP with Server-Sent Events (SSE) for response streaming. This allows the server to run as a web service accessible over the network.
+The Streamable HTTP transport (MCP protocol version 2026-07-28) lets an MCP server run as a network
+service. As of this protocol revision, MCP is **stateless**: there is no session, no handshake, and no
+standalone SSE channel. The server exposes exactly one endpoint — `POST /mcp` — and every request is
+self-contained.
+
+* Each JSON-RPC request is its own HTTP POST.
+* The server answers with either a single JSON object, or (only if the handler emits at least one
+  notification — progress, or a change notification on a `subscriptions/listen` stream) a
+  request-scoped `text/event-stream`.
+* There is no `Mcp-Session-Id`, no `GET`/`DELETE` on `/mcp`, and no persistent connection to manage.
+  `GET` and `DELETE` return `405 Method Not Allowed`.
+
+See [GOLANG-MCP-CONVERT-TO-2026-07-28.md](GOLANG-MCP-CONVERT-TO-2026-07-28.md) for the full protocol
+background and a worked example spanning discovery, a plain tool call, Multi Round-Trip Requests, and
+subscriptions.
 
 ## Configuration
 
@@ -12,8 +26,9 @@ Create a configuration file (e.g., `config-http.yaml`):
 server:
   mode: "http"
   http:
-    host: "0.0.0.0"  # Listen on all interfaces (default)
-    port: 8080        # Port number (default: 8080)
+    host: "0.0.0.0"        # Listen on all interfaces (default)
+    port: 8080              # Port number (default: 8080)
+    allowed_origins: []     # Optional Origin allow-list; see "Origin Validation" below
 ```
 
 ## Starting the Server
@@ -22,174 +37,148 @@ server:
 ./go-mcp -config config-http.yaml
 ```
 
-The server will start and listen on the configured host and port:
 ```
-Starting HTTP server on 0.0.0.0:8080
-```
-
-## Client Communication Flow
-
-### 1. Establish SSE Connection
-
-Open a Server-Sent Events connection to receive responses:
-
-```bash
-curl -N http://localhost:8080/sse
+time=... level=INFO msg="Starting MCP server in HTTP mode" host=0.0.0.0 port=8080
+time=... level=INFO msg="HTTP server listening" addr=0.0.0.0:8080 transport="Streamable HTTP"
 ```
 
-The server immediately sends an `endpoint` event containing your session ID:
+## Required Headers
 
+Every POST to `/mcp` (other than a legacy `initialize` request — see below) **must** carry:
+
+| Header | Value | Required for |
+| --- | --- | --- |
+| `MCP-Protocol-Version` | Must match `params._meta["io.modelcontextprotocol/protocolVersion"]` in the body | every request |
+| `Mcp-Method` | Must match the body's `method` | every request |
+| `Mcp-Name` | Must match `params.name` or `params.uri` | `tools/call`, `resources/read`, `prompts/get` |
+
+A missing or mismatched header is rejected with `400 Bad Request` and a JSON-RPC error, code `-32020`
+(`HeaderMismatch`) — the request never reaches the tool/resource handler. If `Mcp-Name`'s value isn't
+plain ASCII (or happens to collide with the encoding's own sentinel pattern), encode it with the
+base64 sentinel format: `Mcp-Name: =?base64?<base64>?=`.
+
+Every request body must also carry, inside `params._meta`:
+
+```json
+{
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientCapabilities": {}
+}
 ```
-event: endpoint
-data: {"uri":"/message","sessionId":"444f4924-2dbf-4f03-a405-42576147ea10"}
-```
 
-**Important**: Save the `sessionId` value - you'll need it for sending requests.
-
-### 2. Send JSON-RPC Requests
-
-Send JSON-RPC 2.0 requests to the `/message` endpoint with your session ID:
-
-```bash
-curl -X POST http://localhost:8080/message \
-  -H "Content-Type: application/json" \
-  -H "Mcp-Session-Id: YOUR_SESSION_ID" \
-  -d '{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "tools/list",
-    "params": {}
-  }'
-```
-
-The endpoint returns `202 Accepted` immediately.
-
-### 3. Receive Responses via SSE
-
-Responses appear as `message` events in your SSE stream:
-
-```
-event: message
-data: {"jsonrpc":"2.0","id":1,"result":{"tools":[...]}}
-```
+`io.modelcontextprotocol/clientInfo` is optional but recommended. A request missing a required `_meta`
+field is rejected with JSON-RPC error `-32602` (`Invalid params`).
 
 ## Example Session
 
-### Terminal 1: Open SSE Connection
-```bash
-curl -N http://localhost:8080/sse
-# Note the sessionId from the endpoint event
-```
+No handshake — call whatever you need directly. `server/discover` is the closest analogue to the old
+`initialize`, useful for learning the server's capabilities up front, but it's optional.
 
-### Terminal 2: Send Requests
-
-List available tools:
 ```bash
-curl -X POST http://localhost:8080/message \
+curl -X POST http://localhost:8080/mcp \
   -H "Content-Type: application/json" \
-  -H "Mcp-Session-Id: YOUR_SESSION_ID" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-```
-
-Call the date tool:
-```bash
-curl -X POST http://localhost:8080/message \
-  -H "Content-Type: application/json" \
-  -H "Mcp-Session-Id: YOUR_SESSION_ID" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
   -d '{
-    "jsonrpc": "2.0",
-    "id": 2,
-    "method": "tools/call",
+    "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+    "params": {"_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }}
+  }'
+```
+
+```bash
+curl -X POST http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/call" \
+  -H "Mcp-Name: date" \
+  -d '{
+    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
     "params": {
-      "name": "date",
-      "arguments": {
-        "timezone": "America/New_York"
+      "name": "date", "arguments": {"timezone": "America/New_York"},
+      "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {}
       }
     }
   }'
 ```
 
-Watch Terminal 1 for the responses in the SSE stream.
+Both return a single JSON object immediately — no SSE connection to open first, no session ID to
+capture.
 
-## API Reference
+Run `./test-http.sh` for a scripted version of this session, including the header-validation and
+legacy-`initialize`-diagnostic error cases.
 
-### GET /sse
+## When the Response Is an SSE Stream
 
-Establishes a Server-Sent Events connection for receiving responses.
+The server responds with `Content-Type: text/event-stream` only when the request needs to carry
+notifications before its final result:
 
-**Response Headers:**
-- `Content-Type: text/event-stream`
-- `Cache-Control: no-cache`
-- `Connection: keep-alive`
+* A tool call that reports `notifications/progress` while it runs.
+* `subscriptions/listen`, which never sends a single result at all — its response stream stays open
+  and delivers `notifications/tools/list_changed`, `notifications/resources/list_changed`, and
+  `notifications/resources/updated` (whichever the request opted into) until the client disconnects.
 
-**Events:**
-- `endpoint`: Initial event containing session info
-  ```
-  event: endpoint
-  data: {"uri":"/message","sessionId":"<uuid>"}
-  ```
+Every event is a `data: <JSON-RPC message>` line. There is no event `id` and no `Last-Event-ID`
+resumability — this protocol revision does not support resuming a broken stream; re-issue the request
+instead. Long-lived streams periodically emit a `:` keep-alive comment line, which conforming clients
+must ignore.
 
-- `message`: JSON-RPC response events
-  ```
-  event: message
-  data: <JSON-RPC response>
-  ```
+## Notifications (Client → Server)
 
-### POST /message
+A JSON-RPC message with no `id` is a notification. The server responds `202 Accepted` with an empty
+body. In practice this protocol revision defines no client-to-server notification carried over
+Streamable HTTP — request cancellation, in particular, is signaled by closing the request's own
+response stream, not by sending `notifications/cancelled` (that notification is stdio/UNIX-only).
 
-Sends a JSON-RPC 2.0 request to the server.
+## Origin Validation
 
-**Headers:**
-- `Content-Type: application/json` (required)
-- `Mcp-Session-Id: <session-id>` (required)
+Per the transport's DNS-rebinding protection, the server validates the `Origin` header on every
+request that includes one (requests without an `Origin` — i.e. not from a browser — are always
+allowed):
 
-**Body:** JSON-RPC 2.0 request
+* If `http.HTTPConfig.allowed_origins` is unset, only `http(s)://localhost` and `http(s)://127.0.0.1`
+  are accepted.
+* Set `allowed_origins: ["https://your-app.example.com"]` to allow specific origins, or `["*"]` to
+  allow any (e.g. behind a trusted reverse proxy that already restricts access).
 
-**Response:** `202 Accepted`
-
-The actual response is delivered asynchronously via the SSE connection.
+A disallowed `Origin` gets `403 Forbidden`.
 
 ## Error Handling
 
-- Missing `Mcp-Session-Id` header: `400 Bad Request`
-- Invalid session ID: `400 Bad Request`
-- Invalid HTTP method: `405 Method Not Allowed`
-
-## Keep-Alive
-
-The server sends periodic ping comments (`: ping\n\n`) every 30 seconds to keep the SSE connection alive.
+| Condition | HTTP status | JSON-RPC error code |
+| --- | --- | --- |
+| Disallowed `Origin` | 403 | — |
+| `GET` or `DELETE` on `/mcp` | 405 | `-32601` |
+| Missing/mismatched required header | 400 | `-32020` (`HeaderMismatch`) |
+| Missing/invalid `_meta` field | 400 | `-32602` (`InvalidParams`) |
+| Unsupported protocol version | 400 | `-32022` (`UnsupportedProtocolVersion`), `data.supported` lists what this server accepts |
+| Missing client capability needed for MRTR | 400 | `-32021` (`MissingRequiredClientCapability`) |
+| Legacy `initialize` request | 404 | `-32601`, `data.supported` names the versions this server speaks |
+| Unknown method | 404 | `-32601` |
+| Unknown tool/resource name | 200 | `-32602` (never the retired `-32002`) |
+| Tool execution failure | 200 | not a JSON-RPC error — `isError: true` in the result, so the model can see and self-correct |
 
 ## Testing
-
-Use the provided test script:
 
 ```bash
 chmod +x test-http.sh
 ./test-http.sh
 ```
 
-This automated test verifies:
-1. SSE connection establishment
-2. Session ID generation
-3. Request/response flow
-4. Tool invocation
+This exercises `server/discover`, `tools/list`, `tools/call`, a request missing required headers
+(expect `400`/`-32020`), and a legacy `initialize` request (expect `404`/`-32601`).
 
-## Security Notes
+## Differences from stdio/UNIX Transport
 
-This initial implementation has **no authentication**. For production use:
-
-1. Add authentication middleware (OAuth, API keys, etc.)
-2. Use HTTPS/TLS encryption
-3. Implement rate limiting
-4. Validate and sanitize inputs
-5. Configure CORS appropriately for your use case
-
-## Differences from stdio Transport
-
-| Feature | stdio | HTTP/SSE |
-|---------|-------|----------|
-| Communication | stdin/stdout | HTTP endpoints |
-| Response delivery | Synchronous | Asynchronous (SSE) |
-| Multiple clients | Single process | Multiple sessions |
+| Feature | stdio / UNIX | Streamable HTTP |
+| --- | --- | --- |
+| Framing | Newline-delimited JSON-RPC over a shared stream | One HTTP POST per JSON-RPC message |
+| Response delivery | Same shared stream, demultiplexed by JSON-RPC id / `subscriptionId` | Per-request: a JSON object, or a request-scoped SSE stream |
+| Multiple clients | One connection at a time (UNIX) / one process (stdio) | Any number of concurrent HTTP requests |
 | Network access | Local only | Network accessible |
-| Authentication | Process-level | Application-level |
+| Authentication | Environment/process-level | `Authorization: Bearer` (OAuth), validated per request |
+| Cancellation | `notifications/cancelled` naming the request id | Closing the request's response stream |

@@ -3,13 +3,17 @@
 echo "=== Testing Logging Levels ==="
 echo ""
 
-# Function to make a test request
+# Function to make a test request. MCP protocol version 2026-07-28 is stateless — no
+# initialize handshake — so this calls server/discover with the required headers and
+# per-request _meta instead.
 make_request() {
     sleep 2
     curl -s -X POST http://localhost:8080/mcp \
       -H "Content-Type: application/json" \
       -H "Authorization: Bearer test-secret-token" \
-      -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}},"id":1}' \
+      -H "MCP-Protocol-Version: 2026-07-28" \
+      -H "Mcp-Method: server/discover" \
+      -d '{"jsonrpc":"2.0","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}},"id":1}' \
       > /dev/null
     sleep 1
 }

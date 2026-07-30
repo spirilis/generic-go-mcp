@@ -1,6 +1,15 @@
 # generic-go-mcp
 
-A reusable Go framework for building Model Context Protocol (MCP) servers with support for both stdio and HTTP/SSE transports.
+A reusable Go framework for building Model Context Protocol (MCP) servers with support for both stdio and Streamable HTTP transports.
+
+This library implements MCP protocol version **2026-07-28**. That revision made MCP stateless: there is
+no `initialize` handshake and no `Mcp-Session-Id` — every request carries its own protocol version,
+capabilities, and identity in `params._meta`, and a legacy client's `initialize` request gets a
+diagnostic error naming the versions this server supports rather than a session. See
+[GOLANG-MCP-CONVERT-TO-2026-07-28.md](GOLANG-MCP-CONVERT-TO-2026-07-28.md) for the full design
+rationale, the hard-cutover decisions this library makes, and a worked wire-to-Go-types example.
+Roots, Sampling, and MCP's own Logging utility are deprecated upstream in this revision and are not
+implemented here; Prompts are not yet implemented (see that document's "Out of scope" section).
 
 ## Build Commands
 
@@ -72,13 +81,28 @@ func main() {
 The framework follows a layered architecture pattern:
 
 ### Transport Layer (`transport/`)
-Abstracts communication mechanisms (stdio vs HTTP/SSE) behind a common interface. Allows MCP servers to run in different environments without protocol-specific code changes.
+Abstracts communication mechanisms (stdio, UNIX domain sockets, Streamable HTTP) behind a common
+interface. Allows MCP servers to run in different environments without protocol-specific code changes.
+Because the protocol is stateless, a transport may have several requests in flight concurrently on
+the same connection (e.g. a long-lived `subscriptions/listen` alongside an ordinary `tools/call`), so
+`HandleMessage` takes a `context.Context` (cancelled when the request should stop) and a
+`ResponseWriter` (through which notifications and the final response are written), rather than
+returning a single buffered response.
 
-**Key Interface:**
+**Key Interfaces:**
 ```go
 type Transport interface {
     Start(handler MessageHandler) error
     Stop() error
+}
+
+type MessageHandler interface {
+    HandleMessage(ctx context.Context, data []byte, w ResponseWriter)
+}
+
+type ResponseWriter interface {
+    WriteNotification(method string, params interface{}) error
+    WriteMessage(data []byte) error
 }
 ```
 
@@ -121,17 +145,29 @@ Structured logging with multiple levels and formats.
 ## Key Patterns
 
 ### Transport Interface Pattern
-Enables MCP servers to support both stdio and HTTP/SSE without duplicating protocol logic. Implementations:
-- `StdioTransport` - reads from stdin, writes to stdout
-- `SSETransport` - handles HTTP SSE streaming
+Enables MCP servers to support stdio, UNIX domain sockets, and Streamable HTTP without duplicating
+protocol logic. Implementations:
+- `StdioTransport` / `UnixTransport` - newline-delimited JSON-RPC over stdin/stdout or a UNIX socket,
+  sharing a common framing (`transport/stream.go`) that dispatches each message concurrently
+- `HTTPTransport` - a single POST-only `/mcp` endpoint; responds with a plain JSON object, or
+  upgrades to a request-scoped `text/event-stream` the moment a handler emits a notification
+  (progress, or a `subscriptions/listen` change notification)
 
 ### JSON-RPC 2.0 Protocol Handling
-All MCP messages follow JSON-RPC 2.0 specification:
+All MCP messages follow JSON-RPC 2.0 specification. Every request also carries its protocol version,
+capabilities, and (optionally) identity in `params._meta` — there is no separate handshake:
 ```json
 {
   "jsonrpc": "2.0",
   "method": "tools/call",
-  "params": {...},
+  "params": {
+    "name": "my_tool",
+    "arguments": {},
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    }
+  },
   "id": 1
 }
 ```
@@ -166,7 +202,8 @@ func AuthMiddleware(next http.Handler) http.Handler {
 
 ## Reference Tools
 
-The framework includes two reference tool implementations demonstrating best practices:
+The framework includes reference tool implementations demonstrating best practices. For brevity, the
+`_meta` field required on every real request (see above) is omitted from the example bodies below.
 
 ### `date(timezone)`
 Returns the current date/time for a specified timezone.
@@ -205,6 +242,43 @@ Executes the local `fortune` CLI command and returns output.
 
 **Note:** Demonstrates safe CLI execution patterns with proper error handling and output capture.
 
+### `confirm_delete(count)`
+Reference implementation of **Multi Round-Trip Requests (MRTR)** — the pattern that replaced
+server-initiated requests (sampling, elicitation, roots) in protocol version 2026-07-28. Servers can
+no longer send their own JSON-RPC requests to the client; instead they return `resultType:
+"input_required"` and the client retries the same call with the answer attached.
+
+**First call** (no confirmation yet) returns an `input_required` result:
+```json
+{
+  "resultType": "input_required",
+  "inputRequests": {
+    "confirm": {
+      "method": "elicitation/create",
+      "params": {"mode": "form", "message": "Delete 12 record(s)?", "requestedSchema": {"...": "..."}}
+    }
+  },
+  "requestState": "<HMAC-signed opaque blob>"
+}
+```
+
+**Retry** (new JSON-RPC `id`, same tool name/arguments, plus the client's answer and the echoed
+`requestState`) completes the call:
+```json
+{
+  "method": "tools/call",
+  "params": {
+    "name": "confirm_delete",
+    "arguments": {"count": 12},
+    "inputResponses": {"confirm": {"action": "accept", "content": {"confirm": true}}},
+    "requestState": "<the exact blob from the previous response>"
+  }
+}
+```
+
+See `mcp.ToolRequest.NeedInput` / `ElicitResponse` (`mcp/tools.go`, `mcp/mrtr.go`) and
+`examples/tools/confirm.go` for the Go side of this exchange.
+
 ## Project Structure
 
 ```
@@ -216,7 +290,7 @@ generic-go-mcp/
 ├── mcp/                  # PUBLIC: MCP protocol implementation
 ├── examples/             # Example implementations
 │   ├── go-mcp/           # Example MCP server application
-│   └── tools/            # Reference tool implementations (date, fortune)
+│   └── tools/            # Reference tool implementations (date, fortune, confirm_delete/MRTR)
 ├── CLAUDE.md             # This file
 └── go.mod                # Go module definition
 ```

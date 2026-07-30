@@ -10,6 +10,16 @@ A reusable Go framework for building [Model Context Protocol](https://spec.model
 
 The Model Context Protocol enables AI assistants like Claude to interact with external tools and data sources. This library makes it easy to create custom MCP servers that expose your own functionality to AI models.
 
+### Protocol version
+
+This library implements MCP protocol version **2026-07-28**, which made the protocol stateless: there
+is no `initialize` handshake and no session — every request carries its own protocol version and
+capabilities, and long-running server-to-client interactions (elicitation, sampling) travel as
+[Multi Round-Trip Requests](GOLANG-MCP-CONVERT-TO-2026-07-28.md#4-worked-example-one-client-session-start-to-finish)
+rather than server-initiated JSON-RPC requests. See
+[GOLANG-MCP-CONVERT-TO-2026-07-28.md](GOLANG-MCP-CONVERT-TO-2026-07-28.md) for the full design
+rationale and a worked example.
+
 ## Features
 
 - **Dual Transport Support** - Run in stdio mode (for desktop integration) or Streaming HTTP mode (for web services)
@@ -25,12 +35,14 @@ The Model Context Protocol enables AI assistants like Claude to interact with ex
 package main
 
 import (
+    "context"
     "encoding/json"
+    "time"
+
     "github.com/spirilis/generic-go-mcp/config"
     "github.com/spirilis/generic-go-mcp/logging"
     "github.com/spirilis/generic-go-mcp/mcp"
     "github.com/spirilis/generic-go-mcp/transport"
-    "time"
 )
 
 func main() {
@@ -38,32 +50,35 @@ func main() {
     cfg, _ := config.Load("config.yaml")
     logging.Initialize(cfg.Logging)
 
-    // Create tool registry
+    // Create a tool registry
     registry := mcp.NewToolRegistry()
 
     // Define a simple tool
     timeTool := mcp.Tool{
         Name:        "current_time",
         Description: "Returns the current UTC time",
-        InputSchema: json.RawMessage(`{"type": "object", "properties": {}}`),
+        InputSchema: json.RawMessage(`{"type": "object", "additionalProperties": false}`),
     }
 
-    // Register tool with implementation
-    registry.Register(timeTool, func(args json.RawMessage) (interface{}, error) {
-        return mcp.ToolCallResult{
-            Content: []mcp.ToolContent{
-                {Type: "text", Text: time.Now().UTC().String()},
-            },
+    // Register the tool with its implementation. ToolFunction takes a context (for
+    // cancellation) and a *ToolRequest (arguments, parsed _meta, and — for tools that
+    // need mid-call user input — Multi Round-Trip Requests helpers).
+    registry.Register(timeTool, func(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
+        return &mcp.ToolCallResult{
+            Content: []mcp.Content{mcp.Text(time.Now().UTC().String())},
         }, nil
     })
 
-    // Create MCP server
-    server := mcp.NewServer(registry, &mcp.ServerConfig{
+    // A resource registry is required even if you register no resources.
+    resources := mcp.NewResourceRegistry()
+
+    // Create the MCP server
+    server := mcp.NewServer(registry, resources, &mcp.ServerConfig{
         Name:    "my-mcp-server",
         Version: "1.0.0",
     })
 
-    // Start stdio transport
+    // Start the stdio transport
     trans := transport.NewStdioTransport()
     trans.Start(server)
 }
@@ -162,9 +177,10 @@ See [examples/](examples/) for more configuration samples.
 
 The [examples/](examples/) directory contains:
 
-- **go-mcp/** - A complete MCP server demonstrating stdio/HTTP mode, auth integration, and graceful shutdown
-- **tools/date.go** - Example tool with arguments (timezone parameter)
+- **go-mcp/** - A complete MCP server demonstrating stdio/HTTP/UNIX-socket mode, auth integration, and graceful shutdown
+- **tools/date.go** - Example tool with arguments, an `outputSchema`, and `structuredContent`
 - **tools/fortune.go** - Example tool without arguments (executes fortune command)
+- **tools/confirm.go** - Reference implementation of Multi Round-Trip Requests (elicitation)
 
 To build and run the example:
 
@@ -181,14 +197,19 @@ Abstracts communication mechanisms behind a common interface:
 - **HTTPTransport** - HTTP streaming (for web services, remote access)
 
 ### Tool Registry
-Simple API for registering and invoking tools:
+Simple API for registering and listing tools (invocation is handled internally by the server, which
+also enforces Multi Round-Trip Requests and `_meta` validation before your function runs):
 
 ```go
 registry := mcp.NewToolRegistry()
 registry.Register(toolDefinition, toolFunction)
-registry.List()  // Returns all registered tools
-registry.Call(name, arguments)  // Invokes a tool
+registry.List()          // Returns all registered tools, in a stable order
+registry.HasTools()      // Whether any tool is registered
 ```
+
+Registering (or, via `mcp.NewResourceRegistry()`, unregistering) at runtime after the server has
+started automatically emits a `notifications/tools/list_changed` (or `resources/list_changed`) to
+any client with an open `subscriptions/listen` stream.
 
 ### JSON-RPC 2.0 Protocol
 All MCP communication follows JSON-RPC 2.0 specification with automatic message parsing, validation, and error handling.

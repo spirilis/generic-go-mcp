@@ -46,10 +46,12 @@ Detailed operational logging for development/troubleshooting:
 
 Example:
 ```
-time=2026-01-23T09:22:57.807-05:00 level=DEBUG msg="Session created" session_id=ac1357d5-019f-4a9e-96ee-795f30a503b4
-time=2026-01-23T09:22:57.808-05:00 level=DEBUG msg="JSON-RPC request" method=initialize id=1
-time=2026-01-23T09:22:57.808-05:00 level=DEBUG msg="HTTP request completed" method=POST path=/mcp status=200 size=151 duration_ms=0 remote_addr=[::1]:46466
+time=2026-07-30T09:22:57.808-05:00 level=DEBUG msg="JSON-RPC request" method=server/discover id=1
+time=2026-07-30T09:22:57.808-05:00 level=DEBUG msg="HTTP request completed" method=POST path=/mcp status=200 size=151 duration_ms=0 remote_addr=[::1]:46466
 ```
+
+Note: MCP protocol version 2026-07-28 is stateless — there is no `initialize` handshake and no
+session, so no session-lifecycle logging exists to show here.
 
 ### trace
 Extremely verbose logging for deep debugging:
@@ -60,10 +62,10 @@ Extremely verbose logging for deep debugging:
 
 Example:
 ```
-time=2026-01-23T09:22:57.807-05:00 level=TRACE msg="HTTP request received" method=POST path=/mcp remote_addr=[::1]:46466 headers="map[Accept:*/* Authorization:[REDACTED] Content-Length:106 Content-Type:application/json User-Agent:curl/8.5.0]"
-time=2026-01-23T09:22:57.807-05:00 level=TRACE msg="HTTP POST request body" body="{\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{}},\"id\":1}"
-time=2026-01-23T09:22:57.808-05:00 level=TRACE msg="JSON-RPC params" method=initialize params="{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{}}"
-time=2026-01-23T09:22:57.808-05:00 level=TRACE msg="JSON-RPC response" method=initialize result="{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"generic-go-mcp\",\"version\":\"0.1.0\"}}"
+time=2026-07-30T09:22:57.807-05:00 level=TRACE msg="HTTP request received" method=POST path=/mcp remote_addr=[::1]:46466 headers="map[Accept:*/* Authorization:[REDACTED] Content-Length:186 Content-Type:application/json MCP-Protocol-Version:2026-07-28 Mcp-Method:server/discover User-Agent:curl/8.5.0]"
+time=2026-07-30T09:22:57.807-05:00 level=TRACE msg="HTTP POST request body" body="{\"jsonrpc\":\"2.0\",\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}},\"id\":1}"
+time=2026-07-30T09:22:57.808-05:00 level=TRACE msg="JSON-RPC params" method=server/discover params="{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}"
+time=2026-07-30T09:22:57.808-05:00 level=TRACE msg="JSON-RPC response" method=server/discover result="{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"generic-go-mcp\",\"version\":\"0.1.0\"}},\"ttlMs\":300000,\"cacheScope\":\"public\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"tools\":{\"listChanged\":true}}}"
 ```
 
 ## Output Formats
@@ -91,34 +93,34 @@ This ensures that secrets never appear in logs, even at trace level.
 
 ## Implementation Details
 
-### Files Modified
+### Relevant Files
 
-1. **internal/config/config.go**
-   - Added `LoggingConfig` struct with `Level` and `Format` fields
-   - Added defaults (level="info", format="text")
+1. **config/config.go**
+   - `LoggingConfig` struct with `Level` and `Format` fields
+   - Defaults (level="info", format="text")
 
-2. **internal/logging/logging.go** (new file)
+2. **logging/logging.go**
    - Custom `LevelTrace` constant for trace logging
    - `Initialize()` function to configure slog
    - Helper functions: `Trace()`, `Debug()`, `Info()`, `Warn()`, `Error()`
    - `IsTraceEnabled()`, `IsDebugEnabled()` for conditional logging
    - `SanitizeHeaders()` for redacting sensitive values
 
-3. **internal/transport/http.go**
+3. **transport/http.go**
    - `responseRecorder` wrapper to capture status/size/body
    - Request timing and logging in `handleMCP()`
-   - Session lifecycle logging in `handlePost()`, `handleDelete()`
-   - SSE connection logging in `handleGet()`
+   - Header-validation failure logging in `handlePost()` (there is no session lifecycle to
+     log — MCP protocol version 2026-07-28 is stateless)
 
-4. **internal/auth/middleware.go**
+4. **auth/middleware.go**
    - Authentication attempt logging (success/failure with reasons)
    - User information logging on successful auth
 
-5. **internal/mcp/server.go**
+5. **mcp/server.go**
    - JSON-RPC method call logging
    - Full parameter and response logging at trace level
 
-6. **cmd/go-mcp/main.go**
+6. **examples/go-mcp/main.go**
    - Early logger initialization after config load
    - Replaced fmt.Fprintf calls with logging functions
 
@@ -133,7 +135,7 @@ Example config files are provided:
 Test the logging:
 ```bash
 # Build the server
-go build -o go-mcp ./cmd/go-mcp
+go build -o go-mcp ./examples/go-mcp
 
 # Test info level (minimal output)
 ./go-mcp -config config-logging-info.yaml
