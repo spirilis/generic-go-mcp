@@ -106,6 +106,7 @@ func NewServer(registry *ToolRegistry, resourceRegistry *ResourceRegistry, confi
 	broker := newBroker()
 	registry.onChange = broker.notifyToolsListChanged
 	resourceRegistry.onChange = broker.notifyResourcesListChanged
+	resourceRegistry.onUpdate = broker.notifyResourceUpdated
 
 	return &Server{
 		registry:         registry,

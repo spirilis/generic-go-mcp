@@ -135,10 +135,81 @@ Like tools, `ResourceRegistry.Register` after the server has started fires
 `notifications/resources/list_changed` to subscribed clients automatically — you don't need to do
 anything extra for dynamic resource sets.
 
-## subscriptions/listen (list-changed notifications)
+### Removing and replacing entries
 
-If a client wants to be notified when your tool or resource catalog changes, it calls
-`subscriptions/listen` with a `NotificationFilter` (`ToolsListChanged`, `ResourcesListChanged`,
-etc.). This is handled entirely inside `mcp.Server` — you don't write any code for it beyond
-registering tools/resources normally; `Server.NewServer` wires the registries' `onChange` hooks to
-the internal broker automatically.
+`Unregister` is the counterpart, keyed by URI on resources and by name on tools. It returns whether
+there was anything to remove, and fires `list_changed` only when it actually removed something:
+
+```go
+resources.Unregister("config://server-name") // true
+resources.Unregister("config://server-name") // false — already gone, notifies nobody
+registry.Unregister("my_tool")               // same contract on ToolRegistry
+```
+
+Re-registering a URI or name that already exists **replaces** the entry and moves it to the end of
+the list rather than adding a duplicate, so `resources/list` can never disagree with what
+`resources/read` will actually run. Removing the last resource also withdraws the `resources`
+capability from `server/discover`, since capabilities are derived from what is registered.
+
+The protocol has no "unregister" method — this is purely server-side. Don't confuse it with the
+`resources/subscribe`/`resources/unsubscribe` methods, which 2026-07-28 deleted outright; those
+were about a *client* subscribing to updates on a resource, and their replacement is
+`subscriptions/listen`.
+
+### Announcing that a resource's content changed
+
+`list_changed` covers the *catalog*: something was added, replaced, or removed. It says nothing
+about the bytes behind a URI that has been registered all along. That is a separate notification,
+`notifications/resources/updated`, and you have to fire it yourself:
+
+```go
+// Your code just rewrote whatever this resource reads from.
+resources.NotifyUpdated("config://server-name") // true — the URI is registered
+resources.NotifyUpdated("config://typo")        // false — no-op, notifies nobody
+```
+
+It cannot be automatic. A `ResourceFunction` is called on demand and returns whatever it likes; the
+library never sees the underlying data and has no way to know it changed. Only your code does.
+
+Two rules to keep in mind:
+
+- **URIs are matched exactly.** The spec allows a server to announce a sub-resource of a URI the
+  client subscribed to; this library does not, because a `ResourceRegistry` is a flat map with no
+  URI hierarchy to derive one from. A client hears about the URIs it literally named.
+- **Re-registering a URI fires `resources/updated` too**, on top of `list_changed`, because
+  `Register` replaces the `ResourceFunction` as well as the metadata and Go can't compare func
+  values — the registry can't tell a `Description` fix from a content swap, so it announces both.
+  A first-time `Register` of a URI fires `list_changed` only.
+
+## subscriptions/listen (change notifications)
+
+A client that wants to hear about changes calls `subscriptions/listen` once and leaves the request
+open. Its `notifications` param is a `NotificationFilter` naming what it wants:
+
+```json
+{
+  "jsonrpc": "2.0", "id": 4, "method": "subscriptions/listen",
+  "params": {
+    "notifications": {
+      "toolsListChanged": true,
+      "resourcesListChanged": true,
+      "resourceSubscriptions": ["config://server-name"]
+    },
+    "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+               "io.modelcontextprotocol/clientCapabilities": {} }
+  }
+}
+```
+
+The three list-changed flags need no code from you: `mcp.NewServer` wires each registry's internal
+`onChange` hook to the server's broker, so ordinary `Register`/`Unregister` calls emit them.
+
+`resourceSubscriptions` is the one that does need code. It opts into
+`notifications/resources/updated` for the named URIs, and nothing will ever fire unless your server
+calls `resources.NotifyUpdated(uri)` (see above). The two are independent filters — a client
+subscribed only to `resourcesListChanged` hears nothing from `NotifyUpdated`, and vice versa.
+
+Every message on the stream carries `_meta.io.modelcontextprotocol/subscriptionId` set to the
+listen request's own JSON-RPC id, so a client running several subscriptions over one stdio or UNIX
+connection can demultiplex them. The first message is always
+`notifications/subscriptions/acknowledged`, echoing the filter the server actually registered.

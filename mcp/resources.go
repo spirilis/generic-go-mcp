@@ -41,6 +41,7 @@ type ResourceRegistry struct {
 	resources []Resource
 	functions map[string]ResourceFunction // keyed by URI
 	onChange  func()
+	onUpdate  func(string)
 }
 
 // NewResourceRegistry creates a new resource registry
@@ -51,18 +52,85 @@ func NewResourceRegistry() *ResourceRegistry {
 	}
 }
 
-// Register adds a resource and its function to the registry. If the registry is already
-// attached to a running Server, this fires a notifications/resources/list_changed to any
-// subscribed clients.
+// Register adds a resource and its function to the registry. Registering a URI that is
+// already present replaces it and moves it to the end of the list, rather than adding a
+// second entry — the list and the URI-keyed function map must not be allowed to disagree.
+// If the registry is already attached to a running Server, this fires a
+// notifications/resources/list_changed to any subscribed clients.
+//
+// A replacement additionally fires notifications/resources/updated for that URI, while a
+// first-time registration does not: replacing an entry swaps both its metadata and its
+// ResourceFunction, and since Go cannot compare func values the registry has no way to tell
+// a metadata edit from a content swap. Announcing the update is the safe side of that
+// ambiguity. A brand-new URI is a catalog addition, which list_changed already covers.
 func (r *ResourceRegistry) Register(res Resource, fn ResourceFunction) {
 	r.mu.Lock()
+	replaced := r.removeLocked(res.URI)
 	r.resources = append(r.resources, res)
 	r.functions[res.URI] = fn
-	notify := r.onChange
+	notify, update := r.onChange, r.onUpdate
 	r.mu.Unlock()
 	if notify != nil {
 		notify()
 	}
+	if replaced && update != nil {
+		update(res.URI)
+	}
+}
+
+// Unregister removes the resource registered under uri, reporting whether one was found.
+// If the registry is attached to a running Server and something was actually removed, this
+// fires a notifications/resources/list_changed to any subscribed clients; unregistering an
+// absent URI is a no-op and notifies nobody.
+//
+// Note for paginating clients: resources/list cursors are opaque offsets, so a removal
+// between two page fetches shifts later entries and can cause one to be skipped. That is
+// what list_changed is for — a client that sees it should restart pagination.
+func (r *ResourceRegistry) Unregister(uri string) bool {
+	r.mu.Lock()
+	removed := r.removeLocked(uri)
+	notify := r.onChange
+	r.mu.Unlock()
+	if removed && notify != nil {
+		notify()
+	}
+	return removed
+}
+
+// NotifyUpdated announces that the content behind uri changed, delivering a
+// notifications/resources/updated to every subscriptions/listen stream watching that URI.
+// It reports whether the URI is registered; announcing an unregistered URI is a no-op that
+// notifies nobody, mirroring Unregister's contract.
+//
+// Unlike list_changed, the library cannot detect this on its own: a ResourceFunction is
+// called on demand and its output is opaque to the registry, so only the consumer knows when
+// the underlying thing changed. This is that explicit signal.
+func (r *ResourceRegistry) NotifyUpdated(uri string) bool {
+	r.mu.Lock()
+	_, known := r.functions[uri]
+	update := r.onUpdate
+	r.mu.Unlock()
+	if known && update != nil {
+		update(uri)
+	}
+	return known
+}
+
+// removeLocked drops any entry for uri, reporting whether one existed. Callers must hold
+// r.mu. It deliberately does not fire onChange: notifications are sent by the exported
+// caller after releasing the lock, since Broker.broadcast takes a lock of its own.
+func (r *ResourceRegistry) removeLocked(uri string) bool {
+	if _, ok := r.functions[uri]; !ok {
+		return false
+	}
+	delete(r.functions, uri)
+	for i, res := range r.resources {
+		if res.URI == uri {
+			r.resources = append(r.resources[:i], r.resources[i+1:]...)
+			break
+		}
+	}
+	return true
 }
 
 // List returns all registered resources

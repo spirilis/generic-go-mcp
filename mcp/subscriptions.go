@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"sync"
 
 	"github.com/spirilis/generic-go-mcp/transport"
@@ -79,6 +80,22 @@ func (b *Broker) notifyToolsListChanged() {
 
 func (b *Broker) notifyResourcesListChanged() {
 	b.broadcast(func(f NotificationFilter) bool { return f.ResourcesListChanged }, "notifications/resources/list_changed", nil)
+}
+
+// notifyResourceUpdated announces a content change on uri to every listener that named that
+// exact URI in its resourceSubscriptions. Matching is exact: the spec permits a server to
+// announce a sub-resource of a subscribed URI, but this registry has no URI hierarchy to
+// derive one from.
+//
+// Unlike the two list_changed broadcasts, this carries params. The map is shared across every
+// matching subscriber, which is safe because withSubscriptionMeta copies into a fresh map per
+// delivery rather than mutating what it is handed.
+func (b *Broker) notifyResourceUpdated(uri string) {
+	b.broadcast(
+		func(f NotificationFilter) bool { return slices.Contains(f.ResourceSubscriptions, uri) },
+		"notifications/resources/updated",
+		map[string]interface{}{"uri": uri},
+	)
 }
 
 // metaWithSubscriptionID builds the _meta object every message on a subscriptions/listen

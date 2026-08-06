@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -134,10 +135,14 @@ func NewToolRegistry() *ToolRegistry {
 	}
 }
 
-// Register adds a tool to the registry. If the registry is already attached to a running
-// Server, this fires a notifications/tools/list_changed to any subscribed clients.
+// Register adds a tool to the registry. Registering a name that is already present
+// replaces it and moves it to the end of the list, rather than adding a second entry — the
+// list and the name-keyed function map must not be allowed to disagree. If the registry is
+// already attached to a running Server, this fires a notifications/tools/list_changed to
+// any subscribed clients.
 func (r *ToolRegistry) Register(tool Tool, fn ToolFunction) {
 	r.mu.Lock()
+	r.removeLocked(tool.Name)
 	r.tools = append(r.tools, tool)
 	r.functions[tool.Name] = fn
 	notify := r.onChange
@@ -145,6 +150,42 @@ func (r *ToolRegistry) Register(tool Tool, fn ToolFunction) {
 	if notify != nil {
 		notify()
 	}
+}
+
+// Unregister removes the tool registered under name, reporting whether one was found. If
+// the registry is attached to a running Server and something was actually removed, this
+// fires a notifications/tools/list_changed to any subscribed clients; unregistering an
+// absent name is a no-op and notifies nobody.
+//
+// Note for paginating clients: tools/list cursors are opaque offsets, so a removal between
+// two page fetches shifts later entries and can cause one to be skipped. That is what
+// list_changed is for — a client that sees it should restart pagination.
+func (r *ToolRegistry) Unregister(name string) bool {
+	r.mu.Lock()
+	removed := r.removeLocked(name)
+	notify := r.onChange
+	r.mu.Unlock()
+	if removed && notify != nil {
+		notify()
+	}
+	return removed
+}
+
+// removeLocked drops any entry for name, reporting whether one existed. Callers must hold
+// r.mu. It deliberately does not fire onChange: notifications are sent by the exported
+// caller after releasing the lock, since Broker.broadcast takes a lock of its own.
+func (r *ToolRegistry) removeLocked(name string) bool {
+	if _, ok := r.functions[name]; !ok {
+		return false
+	}
+	delete(r.functions, name)
+	for i, t := range r.tools {
+		if t.Name == name {
+			r.tools = append(r.tools[:i], r.tools[i+1:]...)
+			break
+		}
+	}
+	return true
 }
 
 // List returns all registered tools, in registration order (a stable, deterministic
@@ -177,10 +218,17 @@ func (r *ToolRegistry) HasTools() bool {
 	return len(r.tools) > 0
 }
 
+// errToolNotFound is returned by call when the tool disappeared between the handler's
+// Get and the call itself — now possible, since Unregister can land in that window.
+var errToolNotFound = errors.New("tool not found")
+
 func (r *ToolRegistry) call(ctx context.Context, req *ToolRequest) (Result, error) {
 	r.mu.RLock()
-	fn := r.functions[req.Name]
+	fn, ok := r.functions[req.Name]
 	r.mu.RUnlock()
+	if !ok {
+		return nil, errToolNotFound
+	}
 	return fn(ctx, req)
 }
 
@@ -258,6 +306,11 @@ func (s *Server) handleToolsCall(ctx context.Context, meta *RequestMeta, params 
 	if err != nil {
 		if mc, ok := err.(*MissingCapabilityError); ok {
 			return nil, missingClientCapabilityErr(mc.Capabilities...)
+		}
+		if errors.Is(err, errToolNotFound) {
+			// Unregistered concurrently, after the lookup above succeeded. Report it the
+			// same way as a name that was never registered.
+			return nil, invalidParamsErr("Unknown tool: %s", p.Name)
 		}
 		return nil, internalErr(err)
 	}

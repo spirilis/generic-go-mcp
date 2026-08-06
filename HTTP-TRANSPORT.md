@@ -122,6 +122,14 @@ notifications before its final result:
   and delivers `notifications/tools/list_changed`, `notifications/resources/list_changed`, and
   `notifications/resources/updated` (whichever the request opted into) until the client disconnects.
 
+The two `list_changed` notifications are emitted automatically whenever a registry is mutated at
+runtime. `notifications/resources/updated` — opted into by naming URIs in the request's
+`notifications.resourceSubscriptions` array, and carrying `{"uri": "..."}` — cannot be automatic: a
+resource's content is produced on demand by server code that the library cannot inspect. The server
+announces it explicitly with `ResourceRegistry.NotifyUpdated(uri)`. URIs are matched exactly, so a
+client hears only about the URIs it actually named. Re-registering an existing URI also fires it,
+since the replacement may have swapped the content function.
+
 Every event is a `data: <JSON-RPC message>` line. There is no event `id` and no `Last-Event-ID`
 resumability — this protocol revision does not support resuming a broken stream; re-issue the request
 instead. Long-lived streams periodically emit a `:` keep-alive comment line, which conforming clients

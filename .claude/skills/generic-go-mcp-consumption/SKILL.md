@@ -137,6 +137,7 @@ curl recipes for exercising a running server by hand.
 | Define a tool's schema, handler signature, content/error conventions | `references/tool-authoring.md` |
 | Choose stdio vs UNIX socket vs Streamable HTTP; wire optional GitHub OAuth | `references/transports-and-auth.md` |
 | Build a confirm-before-act tool (delete, send, pay) or a readable resource | `references/mrtr-and-resources.md` |
+| Mutate the tool/resource catalog at runtime, or push change notifications to clients | `references/mrtr-and-resources.md` |
 | Debug a client that can't complete its first request; header/error reference | `references/protocol-essentials.md` |
 
 ## Accuracy note for future edits to this skill
