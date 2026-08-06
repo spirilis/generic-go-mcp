@@ -60,15 +60,15 @@ type BoltStorage struct {
 
 // Bucket names
 const (
-	BucketAuthCodes     = "auth_codes"
-	BucketAccessTokens  = "access_tokens"
-	BucketRefreshTokens = "refresh_tokens"
-	BucketClients       = "clients"
-	BucketUsers         = "users"
-	BucketUsersByGitHub = "users_by_github"
-	BucketSessions      = "sessions"
+	BucketAuthCodes       = "auth_codes"
+	BucketAccessTokens    = "access_tokens"
+	BucketRefreshTokens   = "refresh_tokens"
+	BucketClients         = "clients"
+	BucketUsers           = "users"
+	BucketUsersByGitHub   = "users_by_github"
+	BucketSessions        = "sessions"
 	BucketSessionsByToken = "sessions_by_token"
-	BucketAuthRequests  = "auth_requests"
+	BucketAuthRequests    = "auth_requests"
 )
 
 // NewBoltStorage creates a new BoltDB storage

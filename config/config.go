@@ -47,12 +47,12 @@ type LoggingConfig struct {
 
 // AuthConfig represents OAuth authentication configuration
 type AuthConfig struct {
-	Enabled   bool              `yaml:"enabled"`           // Enable/disable auth (default: false)
-	Issuer    string            `yaml:"issuer"`            // OAuth issuer URL (e.g., https://mcp.example.com)
-	GitHub    GitHubConfig      `yaml:"github"`            // GitHub OAuth provider config
-	Storage   StorageConfig     `yaml:"storage"`           // Token/session/client storage config
-	Allowlist AllowlistConfig   `yaml:"allowlist"`         // Authorization allowlist
-	Clients   []StaticClient    `yaml:"clients,omitempty"` // Pre-configured static clients
+	Enabled   bool            `yaml:"enabled"`           // Enable/disable auth (default: false)
+	Issuer    string          `yaml:"issuer"`            // OAuth issuer URL (e.g., https://mcp.example.com)
+	GitHub    GitHubConfig    `yaml:"github"`            // GitHub OAuth provider config
+	Storage   StorageConfig   `yaml:"storage"`           // Token/session/client storage config
+	Allowlist AllowlistConfig `yaml:"allowlist"`         // Authorization allowlist
+	Clients   []StaticClient  `yaml:"clients,omitempty"` // Pre-configured static clients
 }
 
 // GitHubConfig represents GitHub OAuth provider configuration
