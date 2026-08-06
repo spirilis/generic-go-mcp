@@ -108,11 +108,26 @@ purely as a UI signal; the actual safety mechanism for a destructive action is M
 ```go
 registry := mcp.NewToolRegistry()
 registry.Register(GetDateToolDefinition(), DateTool)
+registry.Unregister("date") // bool: whether a tool by that name was there to remove
 ```
 
-`ToolRegistry` is safe for concurrent registration and lookup, including registering a new tool
-*after* the server has started — doing so fires `notifications/tools/list_changed` to any client
-listening via `subscriptions/listen`.
+`ToolRegistry` is safe for concurrent registration, mutation, and lookup, including *after* the
+server has started. Registering the first tool is what makes the server advertise a `tools`
+capability from `server/discover`; unregistering the last one withdraws it.
+
+Three things to know before you mutate a live catalog:
+
+- **Registering an existing name replaces that tool** and moves it to the end of the list rather
+  than adding a second entry, so `tools/list` can never disagree with what `tools/call` will run.
+- **A tool can vanish mid-call.** If `Unregister` lands between a caller's `tools/list` and its
+  `tools/call` — or between the router's lookup and the call itself — the caller gets the same
+  "Unknown tool" error a never-registered name produces, not a crash.
+- **Any mutation that actually changes the catalog fires
+  `notifications/tools/list_changed`** to clients listening via `subscriptions/listen`;
+  `Unregister` on an absent name returns `false` and notifies nobody.
+
+See `notifications-and-registries.md` for the full picture, including the delivery contract for
+those notifications (they can be dropped — don't treat them as an event log).
 
 ## x-mcp-header (advanced, HTTP-only)
 

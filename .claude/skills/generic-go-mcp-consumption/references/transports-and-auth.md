@@ -53,9 +53,11 @@ trans := transport.NewHTTPTransport(transport.HTTPTransportConfig{
 ```
 
 A single POST-only `/mcp` endpoint. GET and DELETE return 405 — there's no session lifecycle to
-manage in this revision. A response upgrades to `text/event-stream` automatically the moment a
-handler emits a notification (progress, or a `subscriptions/listen` change) instead of a plain JSON
-body.
+manage in this revision. A response is a plain JSON body until a handler emits a notification, at
+which point it upgrades to `text/event-stream` for the rest of that request. Today
+`subscriptions/listen` is the only handler that does so, and it always does (its acknowledgment is
+itself a notification); `notifications/progress` is parsed off incoming `_meta` but no tool-facing
+API emits it yet, so a normal `tools/call` always answers with plain JSON.
 
 **Every POST to `/mcp` must carry, in addition to `params._meta` (see the top-level SKILL.md):**
 
@@ -134,5 +136,32 @@ another, set `mcp.ServerConfig.PrincipalFromContext` to a `func(ctx context.Cont
 extracts an ID from the same context — e.g. `func(ctx context.Context) string { u :=
 auth.GetUserFromContext(ctx); if u == nil { return "" }; return u.ID }`.
 
+With auth on, also set `mcp.ServerConfig.DefaultCacheScope = "private"` if the catalog or resource
+content varies per user. It defaults to `"public"`, which tells intermediaries one user's
+`tools/list` is safe to reuse for another.
+
 See `config-oauth-example.yaml` in this repo for a full YAML config including allowlists
 (by user, GitHub org, or org/team) and static OAuth clients.
+
+## Deploying HTTP: set `RequestStateKey`
+
+`mcp.ServerConfig.RequestStateKey` signs the MRTR `requestState` blob. Leave it empty and
+`NewServer` generates a random 32-byte key at startup — fine for stdio, where the process and the
+client live and die together, and quietly broken anywhere else:
+
+- **After a restart**, any `requestState` a client is holding fails verification. The user sees
+  their confirmation rejected with no indication why.
+- **Behind a load balancer with more than one replica**, an MRTR retry only succeeds if it happens
+  to land on the pod that issued it — so confirm-before-act tools fail intermittently, which is the
+  worst version of this bug to debug.
+
+```go
+server := mcp.NewServer(registry, resources, &mcp.ServerConfig{
+	Name:            "my-mcp-server",
+	Version:         "1.0.0",
+	RequestStateKey: []byte(os.Getenv("MCP_REQUEST_STATE_KEY")), // stable across restarts and replicas
+})
+```
+
+Any stable secret ≥32 bytes works; treat it like a signing key (mounted secret or env var, not
+checked in, rotatable). If your server registers no MRTR tools, this doesn't apply.

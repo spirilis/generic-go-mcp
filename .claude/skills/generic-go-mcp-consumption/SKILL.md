@@ -7,11 +7,16 @@ description: |
   and resources, choosing a transport (stdio / UNIX socket / Streamable
   HTTP), the AuthProvider interface for optional GitHub OAuth on HTTP,
   Multi Round-Trip Requests (MRTR) for elicitation-style confirm-before-act
-  tools, and the biggest first-contact gotcha — every client request must
-  carry params._meta with a protocol version and capabilities, or it fails.
+  tools, mutating the tool/resource catalog at runtime and pushing change
+  notifications to clients (subscriptions/listen, list_changed,
+  resources/updated), and the biggest first-contact gotcha — every client
+  request must carry params._meta with a protocol version and capabilities,
+  or it fails.
   Use this skill when: starting a new Go MCP server from scratch, adding a
   tool or resource to an existing generic-go-mcp server, picking a
-  transport, wiring OAuth, debugging "missing required _meta field" or
+  transport, wiring OAuth, registering or unregistering tools/resources
+  while the server is running, notifying clients that a tool list or a
+  resource's content changed, debugging "missing required _meta field" or
   "missing required header" errors, or a client that can't get past its
   first request against this server.
 ---
@@ -67,6 +72,9 @@ func main() {
 	server := mcp.NewServer(registry, resources, &mcp.ServerConfig{
 		Name:    "my-mcp-server",
 		Version: "0.1.0",
+		// Optional prose returned from server/discover, for the model rather than
+		// the client author: when to reach for this server, conventions it expects.
+		Instructions: "Use the echo tool to verify connectivity.",
 	})
 
 	trans := transport.NewStdioTransport()
@@ -98,6 +106,24 @@ func echoToolDef() mcp.Tool {
 For a complete real example (three tools, all three transports, optional OAuth, config file/flag
 handling), read `examples/go-mcp/main.go` in this repo — it's the actual reference implementation,
 not a toy.
+
+## `ServerConfig` in full
+
+Every field is optional; the defaults are correct for a local stdio server, and two of them are not
+correct for a deployed HTTP one.
+
+| Field | Default | What it's for |
+|---|---|---|
+| `Name` / `Version` | `"generic-go-mcp"` / `"0.1.0"` | Server identity in `server/discover` |
+| `Instructions` | none | Prose guidance for the *model* — when to use this server, conventions it expects |
+| `RequestStateKey` | **random per process** | Signs MRTR `requestState`. Set it explicitly on HTTP, or retries break across restarts and replicas — see `references/transports-and-auth.md` |
+| `PrincipalFromContext` | empty principal | Binds `requestState` to the caller so one user's confirmation can't be replayed by another — see `references/mrtr-and-resources.md` |
+| `DefaultCacheScope` | `"public"` | Set `"private"` when the catalog or resource content varies per user (i.e. whenever auth is on) |
+| `ListTTLMs` | `300000` (5 min) | `ttlMs` cache hint on `server/discover`, `tools/list`, `resources/list` |
+| `ReadTTLMs` | `0` (always refetch) | `ttlMs` cache hint on `resources/read` |
+
+`ListTTLMs`/`ReadTTLMs` are `*int64`, so `0` and "unset" are distinguishable — take the address of a
+variable to set them.
 
 ## The first-contact gotcha: `params._meta`
 
@@ -137,11 +163,16 @@ curl recipes for exercising a running server by hand.
 | Define a tool's schema, handler signature, content/error conventions | `references/tool-authoring.md` |
 | Choose stdio vs UNIX socket vs Streamable HTTP; wire optional GitHub OAuth | `references/transports-and-auth.md` |
 | Build a confirm-before-act tool (delete, send, pay) or a readable resource | `references/mrtr-and-resources.md` |
-| Mutate the tool/resource catalog at runtime, or push change notifications to clients | `references/mrtr-and-resources.md` |
+| Mutate the tool/resource catalog at runtime, or push change notifications to clients | `references/notifications-and-registries.md` |
 | Debug a client that can't complete its first request; header/error reference | `references/protocol-essentials.md` |
 
 ## Accuracy note for future edits to this skill
 
 Every snippet here was checked against the real source (`mcp/`, `transport/`, `auth/`,
-`examples/`) as of `v0.2.0`, not written from memory of "what an MCP library usually looks like."
+`examples/`), not written from memory of "what an MCP library usually looks like." Last verified
+against `903dd2c` (registry `Unregister` + `notifications/resources/updated`); the example above
+was compiled verbatim against the working tree.
+
 If you extend this skill, do the same — read the actual `.go` files before writing new examples.
+`README.md` is kept in sync with this material too, so a claim here that contradicts it means one
+of the two is stale.
