@@ -153,6 +153,17 @@ protocol logic. Implementations:
   upgrades to a request-scoped `text/event-stream` the moment a handler emits a notification
   (progress, or a `subscriptions/listen` change notification)
 
+`transport` has no dependency on `auth`: `HTTPTransportConfig.AuthService` is typed as the small
+`transport.AuthProvider` interface (`RegisterRoutes`, `RegisterAdminRoutes`, `Middleware`,
+`UserFromContext`), not `*auth.AuthService`. `auth.AuthService` satisfies it (see the compile-time
+assertion in `auth/middleware.go`), so passing one just works, but `transport` — and therefore
+`mcp`, which depends on `transport` — never pulls in `auth`'s BoltDB dependency. A consumer
+importing only `mcp` + `transport` (stdio, or unauthenticated HTTP) gets a pure-stdlib dependency
+graph. When wiring this up, only assign `AuthService` when auth is actually enabled: an
+unconditionally-assigned nil `*auth.AuthService` is a typed nil that reads as non-nil through the
+interface (`NewHTTPTransport` also guards against this defensively, but callers should get it
+right rather than lean on that).
+
 ### JSON-RPC 2.0 Protocol Handling
 All MCP messages follow JSON-RPC 2.0 specification. Every request also carries its protocol version,
 capabilities, and (optionally) identity in `params._meta` — there is no separate handshake:

@@ -28,6 +28,19 @@ rationale and a worked example.
 - **Structured Logging** - Multi-level logging (trace/debug/info/warn/error) with JSON and text formats
 - **Simple Tool API** - Register tools with JSON schema definitions and type-safe handlers
 - **Production Ready** - BoltDB token storage, session management, graceful shutdown
+- **Dependency-Free Core** - `mcp` and `transport` import nothing beyond the Go standard library
+  (and each other); `auth` (BoltDB) and `config` (YAML) are opt-in, pulled in only if you import them
+
+## Using this library from another project
+
+```bash
+go get github.com/spirilis/generic-go-mcp@v0.2.0
+```
+
+If you're using an AI coding agent to build on top of this library, point it at
+[`.claude/skills/generic-go-mcp-consumption/SKILL.md`](.claude/skills/generic-go-mcp-consumption/SKILL.md)
+in this repo — it covers tool/resource authoring, transport and auth setup, and the Multi
+Round-Trip Requests pattern, with every example checked against the real API.
 
 ## Quick Start
 

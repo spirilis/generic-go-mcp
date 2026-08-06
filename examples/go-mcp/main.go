@@ -179,7 +179,7 @@ func main() {
 	}
 
 	// Initialize logger early
-	logging.Initialize(cfg.Logging)
+	logging.Initialize(cfg.Logging.Level, cfg.Logging.Format)
 
 	// Create tool registry and register tools
 	registry := mcp.NewToolRegistry()
@@ -215,12 +215,19 @@ func main() {
 		trans = transport.NewStdioTransport()
 		logging.Info("Starting MCP server in stdio mode")
 	case "http":
-		trans = transport.NewHTTPTransport(transport.HTTPTransportConfig{
+		httpCfg := transport.HTTPTransportConfig{
 			Host:           cfg.Server.HTTP.Host,
 			Port:           cfg.Server.HTTP.Port,
-			AuthService:    authService,
 			AllowedOrigins: cfg.Server.HTTP.AllowedOrigins,
-		})
+		}
+		// Only set AuthService when auth is actually enabled: assigning a nil
+		// *auth.AuthService unconditionally would store a typed nil in the
+		// AuthProvider interface field, which is non-nil from the interface's
+		// perspective and would make HTTPTransport treat auth as enabled.
+		if authService != nil {
+			httpCfg.AuthService = authService
+		}
+		trans = transport.NewHTTPTransport(httpCfg)
 		logging.Info("Starting MCP server in HTTP mode", "host", cfg.Server.HTTP.Host, "port", cfg.Server.HTTP.Port)
 	case "unix":
 		// Register /name resource. Bare "/name" is not a valid absolute URI (no scheme);

@@ -5,8 +5,6 @@ import (
 	"log/slog"
 	"os"
 	"strings"
-
-	"github.com/spirilis/generic-go-mcp/config"
 )
 
 // Custom log level for TRACE (below DEBUG)
@@ -17,10 +15,16 @@ var (
 	level  slog.Level
 )
 
-// Initialize configures the global logger based on the provided config
-func Initialize(cfg *config.LoggingConfig) {
+// Initialize configures the global logger. levelStr is one of trace/debug/info/warn/error
+// (case-insensitive, default info); formatStr is "json" or anything else for text.
+//
+// This takes plain strings rather than *config.LoggingConfig so that logging — and
+// everything that depends on it, including transport and mcp — stays free of the config
+// package (and its yaml.v3 dependency). A stdio-only consumer that never touches this
+// library's config or auth layers ends up with a pure-stdlib dependency graph.
+func Initialize(levelStr, formatStr string) {
 	// Parse log level
-	level = parseLevel(cfg.Level)
+	level = parseLevel(levelStr)
 
 	// Create handler options
 	opts := &slog.HandlerOptions{
@@ -39,7 +43,7 @@ func Initialize(cfg *config.LoggingConfig) {
 
 	// Create handler based on format
 	var handler slog.Handler
-	if cfg.Format == "json" {
+	if formatStr == "json" {
 		handler = slog.NewJSONHandler(os.Stderr, opts)
 	} else {
 		handler = slog.NewTextHandler(os.Stderr, opts)

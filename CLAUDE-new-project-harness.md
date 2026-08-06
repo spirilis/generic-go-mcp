@@ -461,12 +461,21 @@ if cfg.Auth != nil && cfg.Auth.Enabled {
     defer authService.Close()
 }
 
-// Pass authService to HTTP transport:
-trans = transport.NewHTTPTransport(transport.HTTPTransportConfig{
-    Host:        cfg.Server.HTTP.Host,
-    Port:        cfg.Server.HTTP.Port,
-    AuthService: authService,
-})
+// Pass authService to HTTP transport. AuthService is typed as the small
+// transport.AuthProvider interface (which *auth.AuthService satisfies), not
+// *auth.AuthService directly, so transport itself never depends on the auth
+// package. Only set it when auth is actually enabled: assigning a nil
+// *auth.AuthService unconditionally would store a typed nil in the interface
+// field, which is non-nil from the interface's point of view and would make
+// the transport treat auth as enabled.
+httpCfg := transport.HTTPTransportConfig{
+    Host: cfg.Server.HTTP.Host,
+    Port: cfg.Server.HTTP.Port,
+}
+if authService != nil {
+    httpCfg.AuthService = authService
+}
+trans = transport.NewHTTPTransport(httpCfg)
 ```
 
 ### Configuration Sources

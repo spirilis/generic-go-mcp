@@ -7,7 +7,12 @@ import (
 	"strings"
 
 	"github.com/spirilis/generic-go-mcp/logging"
+	"github.com/spirilis/generic-go-mcp/transport"
 )
+
+// Compile-time assertion that AuthService satisfies transport.AuthProvider, the
+// interface HTTPTransport uses to stay independent of this package.
+var _ transport.AuthProvider = (*AuthService)(nil)
 
 // Context keys
 type contextKey string
@@ -103,6 +108,16 @@ func GetUserFromContext(ctx context.Context) *User {
 		return nil
 	}
 	return user
+}
+
+// UserFromContext implements transport.AuthProvider, adapting GetUserFromContext to
+// the (id, login, ok) shape the transport package uses so it need not import auth.
+func (svc *AuthService) UserFromContext(ctx context.Context) (id, login string, ok bool) {
+	user := GetUserFromContext(ctx)
+	if user == nil {
+		return "", "", false
+	}
+	return user.ID, user.GitHubLogin, true
 }
 
 // GetAccessTokenFromContext retrieves the access token from the request context

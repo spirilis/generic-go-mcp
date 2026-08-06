@@ -2,18 +2,48 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/spirilis/generic-go-mcp/auth"
 	"github.com/spirilis/generic-go-mcp/logging"
 )
+
+// AuthProvider is the subset of an authentication service that HTTPTransport needs to
+// register OAuth routes and gate /mcp behind a token check. Declaring it here — rather
+// than importing the auth package — keeps transport dependency-free (pure stdlib) for
+// consumers who only need stdio or unauthenticated HTTP. auth.AuthService satisfies it;
+// see auth/middleware.go's compile-time assertion.
+type AuthProvider interface {
+	RegisterRoutes(mux *http.ServeMux)
+	RegisterAdminRoutes(mux *http.ServeMux)
+	Middleware(next http.Handler) http.Handler
+	// UserFromContext returns the authenticated user's id and login for the given
+	// request context, and ok=false if the context carries no authenticated user.
+	UserFromContext(ctx context.Context) (id, login string, ok bool)
+}
+
+// isNilAuthProvider reports whether v is a typed nil (e.g. a nil *auth.AuthService
+// stored in the AuthProvider interface). A plain `v != nil` check is not enough here:
+// an interface holding a nil pointer is itself non-nil, which would otherwise cause
+// HTTPTransport to treat auth as enabled and panic when it calls through to the nil
+// receiver. This mirrors the mistake a struct literal like
+// HTTPTransportConfig{AuthService: authService} makes when authService is a nil
+// *auth.AuthService assigned unconditionally.
+func isNilAuthProvider(v AuthProvider) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
+}
 
 // responseRecorder wraps http.ResponseWriter to capture response details for logging.
 type responseRecorder struct {
@@ -61,7 +91,7 @@ func (r *responseRecorder) Flush() {
 type HTTPTransportConfig struct {
 	Host        string
 	Port        int
-	AuthService *auth.AuthService // Optional auth service
+	AuthService AuthProvider // Optional auth provider (e.g. *auth.AuthService)
 
 	// AllowedOrigins is the allow-list checked against a request's Origin header, per the
 	// Streamable HTTP requirement to validate Origin and prevent DNS rebinding. A request
@@ -80,7 +110,7 @@ type HTTPTransport struct {
 	server      *http.Server
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
-	authService *auth.AuthService
+	authService AuthProvider
 }
 
 // NewHTTPTransport creates a new HTTP transport
@@ -93,10 +123,17 @@ func NewHTTPTransport(config HTTPTransportConfig) *HTTPTransport {
 		config.Port = 8080
 	}
 
+	authService := config.AuthService
+	if isNilAuthProvider(authService) {
+		// Guard against a typed-nil AuthProvider (e.g. a caller assigning a nil
+		// *auth.AuthService unconditionally) — treat it the same as auth disabled.
+		authService = nil
+	}
+
 	return &HTTPTransport{
 		config:      config,
 		stopCh:      make(chan struct{}),
-		authService: config.AuthService,
+		authService: authService,
 	}
 }
 
@@ -211,8 +248,10 @@ func (t *HTTPTransport) handleMCP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Add user info if available
-		if user := auth.GetUserFromContext(r.Context()); user != nil {
-			logArgs = append(logArgs, "user_id", user.ID, "github_login", user.GitHubLogin)
+		if t.authService != nil {
+			if id, login, ok := t.authService.UserFromContext(r.Context()); ok {
+				logArgs = append(logArgs, "user_id", id, "github_login", login)
+			}
 		}
 
 		logging.Debug("HTTP request completed", logArgs...)
