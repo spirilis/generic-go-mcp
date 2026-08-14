@@ -149,6 +149,7 @@ package main
 import (
     "context"
     "encoding/json"
+    "os"
     "time"
 
     "github.com/spirilis/generic-go-mcp/config"
@@ -160,7 +161,7 @@ import (
 func main() {
     // Load configuration
     cfg, _ := config.Load("config.yaml")
-    logging.Initialize(cfg.Logging.Level, cfg.Logging.Format)
+    logging.Initialize(cfg.Logging.Level, cfg.Logging.Format, os.Stderr)
 
     // Create a tool registry
     registry := mcp.NewToolRegistry()

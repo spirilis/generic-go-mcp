@@ -101,7 +101,8 @@ This ensures that secrets never appear in logs, even at trace level.
 
 2. **logging/logging.go**
    - Custom `LevelTrace` constant for trace logging
-   - `Initialize()` function to configure slog
+   - `Initialize(levelStr, formatStr string, out io.Writer)` function to configure slog —
+     `out` may be `nil` to default to `os.Stderr`
    - Helper functions: `Trace()`, `Debug()`, `Info()`, `Warn()`, `Error()`
    - `IsTraceEnabled()`, `IsDebugEnabled()` for conditional logging
    - `SanitizeHeaders()` for redacting sensitive values

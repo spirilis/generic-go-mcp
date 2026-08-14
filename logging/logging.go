@@ -2,6 +2,7 @@ package logging
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -16,13 +17,18 @@ var (
 )
 
 // Initialize configures the global logger. levelStr is one of trace/debug/info/warn/error
-// (case-insensitive, default info); formatStr is "json" or anything else for text.
+// (case-insensitive, default info); formatStr is "json" or anything else for text; out is
+// where log lines are written — pass nil to default to os.Stderr.
 //
 // This takes plain strings rather than *config.LoggingConfig so that logging — and
 // everything that depends on it, including transport and mcp — stays free of the config
 // package (and its yaml.v3 dependency). A stdio-only consumer that never touches this
 // library's config or auth layers ends up with a pure-stdlib dependency graph.
-func Initialize(levelStr, formatStr string) {
+func Initialize(levelStr, formatStr string, out io.Writer) {
+	if out == nil {
+		out = os.Stderr
+	}
+
 	// Parse log level
 	level = parseLevel(levelStr)
 
@@ -44,9 +50,9 @@ func Initialize(levelStr, formatStr string) {
 	// Create handler based on format
 	var handler slog.Handler
 	if formatStr == "json" {
-		handler = slog.NewJSONHandler(os.Stderr, opts)
+		handler = slog.NewJSONHandler(out, opts)
 	} else {
-		handler = slog.NewTextHandler(os.Stderr, opts)
+		handler = slog.NewTextHandler(out, opts)
 	}
 
 	logger = slog.New(handler)

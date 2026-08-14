@@ -179,7 +179,7 @@ func main() {
 	}
 
 	// Initialize logger early
-	logging.Initialize(cfg.Logging.Level, cfg.Logging.Format)
+	logging.Initialize(cfg.Logging.Level, cfg.Logging.Format, os.Stderr)
 
 	// Create tool registry and register tools
 	registry := mcp.NewToolRegistry()
