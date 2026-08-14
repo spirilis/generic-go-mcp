@@ -19,14 +19,32 @@ func internalErr(err error) *transport.RPCError {
 	return &transport.RPCError{Code: transport.InternalError, Message: err.Error()}
 }
 
-// unsupportedProtocolVersionErr builds the -32022 error a request gets when it declares a
-// protocol version this server does not implement.
-func unsupportedProtocolVersionErr(requested string) *transport.RPCError {
+// buildUnsupportedProtocolVersionErr builds the -32022 error a request gets when it
+// declares a protocol version this server does not implement, listing advertised as the
+// alternatives a client can retry with.
+func buildUnsupportedProtocolVersionErr(requested string, advertised []string) *transport.RPCError {
 	return &transport.RPCError{
 		Code:    transport.UnsupportedProtocolVersion,
 		Message: "Unsupported protocol version",
-		Data:    map[string]interface{}{"supported": SupportedVersions, "requested": requested},
+		Data:    map[string]interface{}{"supported": advertised, "requested": requested},
 	}
+}
+
+// unsupportedProtocolVersionErr is used by ParseRequestMeta, which has no access to a
+// particular Server and so always validates strictly against the modern-only
+// SupportedVersions — a request declaring a legacy version inside the modern _meta
+// envelope is nonsense regardless of what any compatibility layer additionally serves.
+func unsupportedProtocolVersionErr(requested string) *transport.RPCError {
+	return buildUnsupportedProtocolVersionErr(requested, SupportedVersions)
+}
+
+// unsupportedProtocolVersionErrFor reports the wider ServerConfig.AdvertisedVersions list
+// as alternatives, once ParseRequestMeta has already determined (against the strict,
+// modern-only list) that the request's declared version is unsupported. Used by
+// Server.HandleMessage so this error, server/discover, and the initialize diagnostic never
+// tell a client three different stories about what the server speaks.
+func (s *Server) unsupportedProtocolVersionErrFor(requested string) *transport.RPCError {
+	return buildUnsupportedProtocolVersionErr(requested, s.advertisedVersions())
 }
 
 // missingClientCapabilityErr builds the -32021 error returned when a request needs a
@@ -48,15 +66,15 @@ func headerMismatchErr(format string, args ...interface{}) *transport.RPCError {
 
 // legacyInitializeError is what this server returns to an "initialize" request: this
 // revision has no handshake, so the method simply doesn't exist, but the error names the
-// versions this server does support since that message may be the only diagnostic a
-// legacy-only client can surface to its user.
-func legacyInitializeError() *transport.RPCError {
+// versions this server does support (ServerConfig.AdvertisedVersions) since that message
+// may be the only diagnostic a legacy-only client can surface to its user.
+func (s *Server) legacyInitializeError() *transport.RPCError {
 	return &transport.RPCError{
 		Code: transport.MethodNotFound,
 		Message: "Method not found: \"initialize\" is not implemented. This server speaks " +
 			"MCP protocol version 2026-07-28, which has no initialize handshake — every " +
 			"request carries its own protocol version and capabilities.",
-		Data: map[string]interface{}{"supported": SupportedVersions},
+		Data: map[string]interface{}{"supported": s.advertisedVersions()},
 	}
 }
 

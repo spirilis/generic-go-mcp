@@ -21,7 +21,7 @@ type DiscoverResult struct {
 func (s *Server) handleDiscover(ctx context.Context, meta *RequestMeta) (Result, *transport.RPCError) {
 	return &DiscoverResult{
 		CacheableResult:   NewCacheableResult(s.listTTLMs, s.cacheScope()),
-		SupportedVersions: SupportedVersions,
+		SupportedVersions: s.advertisedVersions(),
 		Capabilities:      s.capabilities(),
 		Instructions:      s.config.Instructions,
 	}, nil

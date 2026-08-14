@@ -46,6 +46,23 @@ type ServerConfig struct {
 	// ReadTTLMs is the ttlMs hint on resources/read results. Defaults to 0 (always
 	// stale) if nil.
 	ReadTTLMs *int64
+
+	// AdvertisedVersions is the protocol version list reported in three places that must
+	// never disagree: server/discover's supportedVersions, the legacy "initialize"
+	// diagnostic's data.supported, and -32022 (UnsupportedProtocolVersion)'s
+	// data.supported. Defaults to SupportedVersions (just "2026-07-28") if unset.
+	//
+	// This is purely advisory — what a request declaring a version this server doesn't
+	// actually run gets told is available as an alternative. It does NOT widen what
+	// ParseRequestMeta accepts: a request's params._meta protocol version is still
+	// validated against the modern-only SupportedVersions regardless of this field,
+	// because a request naming e.g. "2025-11-25" inside the modern _meta envelope is
+	// nonsense and must not be routed through the modern dispatch.
+	//
+	// A legacy-compatibility layer sets this to SupportedVersions plus every legacy
+	// revision it serves, so a client told "unsupported" always sees one consistent,
+	// truthful story about what the server (overlay included) actually speaks.
+	AdvertisedVersions []string
 }
 
 // Server implements the MCP protocol (2026-07-28): a stateless request router over a
@@ -81,6 +98,10 @@ func NewServer(registry *ToolRegistry, resourceRegistry *ResourceRegistry, confi
 		cfg.DefaultCacheScope = config.DefaultCacheScope
 		cfg.ListTTLMs = config.ListTTLMs
 		cfg.ReadTTLMs = config.ReadTTLMs
+		cfg.AdvertisedVersions = config.AdvertisedVersions
+	}
+	if len(cfg.AdvertisedVersions) == 0 {
+		cfg.AdvertisedVersions = SupportedVersions
 	}
 	if len(cfg.RequestStateKey) == 0 {
 		key := make([]byte, 32)
@@ -124,6 +145,13 @@ func (s *Server) serverInfo() *Implementation {
 
 func (s *Server) cacheScope() string {
 	return s.config.DefaultCacheScope
+}
+
+// advertisedVersions is the version list this server reports as available whenever it
+// tells a client "here's what I speak" — server/discover, the legacy initialize
+// diagnostic, and -32022's alternatives. See ServerConfig.AdvertisedVersions.
+func (s *Server) advertisedVersions() []string {
+	return s.config.AdvertisedVersions
 }
 
 // capabilities reports which of tools/resources/prompts this server actually serves: a
@@ -170,12 +198,20 @@ func (s *Server) HandleMessage(ctx context.Context, data []byte, w transport.Res
 	// attempting to parse it, and answered with a diagnostic naming the versions this
 	// server does support instead.
 	if req.Method == "initialize" {
-		w.WriteMessage(transport.NewErrorResponse(req.ID, legacyInitializeError()))
+		w.WriteMessage(transport.NewErrorResponse(req.ID, s.legacyInitializeError()))
 		return
 	}
 
 	meta, rerr := ParseRequestMeta(req.Params)
 	if rerr != nil {
+		if rerr.Code == transport.UnsupportedProtocolVersion && meta != nil {
+			// ParseRequestMeta validates strictly against the modern-only
+			// SupportedVersions; widen the alternatives offered here to whatever this
+			// server actually advertises (SupportedVersions, plus any legacy revisions a
+			// compatibility layer serves), so this error tells the same story as
+			// server/discover and the initialize diagnostic.
+			rerr = s.unsupportedProtocolVersionErrFor(meta.ProtocolVersion)
+		}
 		w.WriteMessage(transport.NewErrorResponse(req.ID, rerr))
 		return
 	}

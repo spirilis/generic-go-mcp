@@ -9,7 +9,9 @@ diagnostic error naming the versions this server supports rather than a session.
 [GOLANG-MCP-CONVERT-TO-2026-07-28.md](GOLANG-MCP-CONVERT-TO-2026-07-28.md) for the full design
 rationale, the hard-cutover decisions this library makes, and a worked wire-to-Go-types example.
 Roots, Sampling, and MCP's own Logging utility are deprecated upstream in this revision and are not
-implemented here; Prompts are not yet implemented (see that document's "Out of scope" section).
+implemented here; Prompts are not yet implemented (see that document's "Out of scope" section). An
+optional `compat` package (off by default) can additionally serve clients still on 2025-11-25 or
+earlier alongside this native 2026-07-28 support — see [LEGACY-COMPAT.md](LEGACY-COMPAT.md).
 
 ## Build Commands
 
@@ -115,6 +117,20 @@ Handles JSON-RPC 2.0 message parsing, validation, and routing. Manages tool defi
 - Method routing
 - Error handling per MCP specification
 - Server name/version configuration
+
+### Legacy Compatibility Overlay (`compat/`)
+Optional: serves MCP protocol revisions 2025-11-25 and earlier (the connection-scoped, `initialize`
+handshake era) alongside this library's native 2026-07-28 support, for the duration of upstream's
+migration window. Off by default; wraps an `*mcp.Server` (or any `transport.MessageHandler`) rather
+than modifying it, so a server that never opts in is byte-for-byte the modern-only server described
+everywhere else in this file. See [LEGACY-COMPAT.md](LEGACY-COMPAT.md).
+
+**Responsibilities:**
+- Per-request era detection (`compat.Claims` / `transport.DeclaresModernProtocol`)
+- Legacy session lifecycle (handshake, TTL, teardown) — the modern stack has none
+- Translating a legacy request into the modern wire shape and forwarding it to the inner handler
+  unchanged, then downgrading the result back (stripping `resultType`/`ttlMs`/`cacheScope`/`_meta`)
+- Refusing MRTR (`input_required`) results visibly to legacy clients, which have no way to answer one
 
 ### Auth Layer (`auth/`)
 Implements authentication and authorization for HTTP/SSE mode.
@@ -299,6 +315,7 @@ generic-go-mcp/
 ├── auth/                 # PUBLIC: OAuth authentication (HTTP mode)
 ├── transport/            # PUBLIC: Transport abstractions (stdio, HTTP/SSE)
 ├── mcp/                  # PUBLIC: MCP protocol implementation
+├── compat/               # PUBLIC: Optional legacy (2025-11-25 and earlier) compatibility overlay
 ├── examples/             # Example implementations
 │   ├── go-mcp/           # Example MCP server application
 │   └── tools/            # Reference tool implementations (date, fortune, confirm_delete/MRTR)

@@ -170,6 +170,25 @@ A disallowed `Origin` gets `403 Forbidden`.
 | Unknown tool/resource name | 200 | `-32602` (never the retired `-32002`) |
 | Tool execution failure | 200 | not a JSON-RPC error — `isError: true` in the result, so the model can see and self-correct |
 
+## Legacy compatibility overlay
+
+Everything above describes this transport with `HTTPTransportConfig.LegacySessions` left unset (the
+default) — a client speaking 2025-11-25 or earlier cannot get past `initialize`. The optional `compat`
+package restores a legacy-compatible surface on this same `/mcp` endpoint when wired in; see
+[LEGACY-COMPAT.md](LEGACY-COMPAT.md) for the full story. In short:
+
+| | compat off (default) | compat on |
+| --- | --- | --- |
+| `POST /mcp` | 2026-07-28 only | both eras, selected per request |
+| `GET /mcp` | `405` | standalone SSE stream, scoped to a live session |
+| `DELETE /mcp` | `405` | session teardown → `204` |
+| `Mcp-Session-Id` | ignored, never echoed | validated on legacy requests; minted at a legacy handshake |
+| Header validation (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`) | every non-`initialize` request | modern requests only |
+| CORS | `Access-Control-Allow-Methods: POST, OPTIONS` | adds `GET, DELETE`, and exposes `Mcp-Session-Id` |
+
+With compat off, this binding is byte-for-byte what the rest of this document describes — that's a
+deliberate, tested property, not an incidental one.
+
 ## Testing
 
 ```bash

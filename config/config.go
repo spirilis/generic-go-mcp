@@ -19,6 +19,22 @@ type ServerConfig struct {
 	Mode string      `yaml:"mode"` // "stdio", "http", or "unix"
 	HTTP *HTTPConfig `yaml:"http,omitempty"`
 	Unix *UnixConfig `yaml:"unix,omitempty"`
+
+	// LegacyCompat enables the optional overlay (see the compat package) that serves MCP
+	// protocol revisions 2025-11-25 and earlier alongside this server's native
+	// 2026-07-28 support, for the duration of upstream's migration window. Off by
+	// default — a legacy-only client cannot connect to this server unless an embedder
+	// explicitly opts in here, or via -legacy-compat on the CLI (which overrides this).
+	LegacyCompat *LegacyCompatConfig `yaml:"legacy_compat,omitempty"`
+}
+
+// LegacyCompatConfig configures the legacy MCP compatibility overlay (compat.Overlay).
+type LegacyCompatConfig struct {
+	Enabled bool `yaml:"enabled"` // Default: false
+
+	// SessionTTL bounds how long an idle legacy session survives, as a Go duration
+	// string (e.g. "30m", "1h"). Empty uses compat.Overlay's 30-minute default.
+	SessionTTL string `yaml:"session_ttl,omitempty"`
 }
 
 // HTTPConfig represents HTTP server configuration

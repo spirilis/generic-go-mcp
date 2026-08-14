@@ -10,16 +10,21 @@ A reusable Go framework for building [Model Context Protocol](https://spec.model
 
 The Model Context Protocol enables AI assistants like Claude to interact with external tools and data sources. This library makes it easy to create custom MCP servers that expose your own functionality to AI models.
 
-## ⚠️ Hard requirement: the client MUST implement MCP protocol version 2026-07-28
+## ⚠️ By default, the client MUST implement MCP protocol version 2026-07-28
 
-This library implements MCP protocol version **2026-07-28 and nothing else**. This is a hard
-cutover, not a preference: `mcp.SupportedVersions` is a single-element list, there is no dual-stack
-mode, no compatibility shim, and no negotiation down to an earlier revision. A client that speaks
-2025-11-25 or earlier **cannot talk to a server built on this library at all** — not in degraded
-form, not for `tools/list`, not for anything.
+`mcp.Server` implements MCP protocol version **2026-07-28 and nothing else**. This is a hard
+cutover, not a preference: `mcp.SupportedVersions` is a single-element list, and `mcp.Server` on its
+own has no dual-stack mode, no compatibility shim, and no negotiation down to an earlier revision. A
+client that speaks 2025-11-25 or earlier **cannot talk to a bare `mcp.Server` at all** — not in
+degraded form, not for `tools/list`, not for anything.
 
-If you control only the server, this is the constraint you are accepting. If your client is an
-older MCP host, you need a different library or a translating proxy in front of this one.
+If every client you serve can move to 2026-07-28 together, this is the constraint you accept, and
+you should stop reading this section. If you have a mixed or client-you-don't-control population
+still on 2025-11-25 or earlier, wrap your server in the optional `compat` package instead of reaching
+for a separate library or a translating proxy — see
+[LEGACY-COMPAT.md](LEGACY-COMPAT.md). It is off by default (a plain `mcp.Server` is unaffected until
+you opt in) and additive: with the switch off, the server underneath is byte-for-byte what this
+section describes.
 
 ### What a conforming client must do
 
@@ -214,6 +219,7 @@ generic-go-mcp/
 ├── auth/                 # OAuth 2.0 authentication (GitHub)
 ├── transport/            # Transport abstractions (stdio, UNIX socket, Streamable HTTP)
 ├── mcp/                  # MCP protocol implementation (JSON-RPC 2.0)
+├── compat/               # Optional legacy (2025-11-25 and earlier) compatibility overlay
 ├── examples/
 │   ├── go-mcp/           # Complete example server application
 │   └── tools/            # Reference tools (date, fortune, confirm_delete/MRTR)
@@ -221,6 +227,7 @@ generic-go-mcp/
 ├── CLAUDE.md             # Architecture and design patterns
 ├── GOLANG-MCP-CONVERT-TO-2026-07-28.md  # Protocol revision design & rationale
 ├── HTTP-TRANSPORT.md     # HTTP transport documentation
+├── LEGACY-COMPAT.md      # Legacy protocol compatibility overlay documentation
 └── LOGGING.md            # Logging system documentation
 ```
 

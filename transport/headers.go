@@ -14,6 +14,10 @@ const (
 	// ParamHeaderPrefix is prepended to a tool's x-mcp-header name to form the header that
 	// carries that parameter's value, e.g. x-mcp-header "Region" -> "Mcp-Param-Region".
 	ParamHeaderPrefix = "Mcp-Param-"
+	// SessionIDHeader carries a legacy (2025-11-25 and earlier) session id. Unused by the
+	// modern (2026-07-28) binding, which has no sessions; restored only when a
+	// compatibility layer sets HTTPTransportConfig.LegacySessions.
+	SessionIDHeader = "Mcp-Session-Id"
 )
 
 const (

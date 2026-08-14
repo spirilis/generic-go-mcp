@@ -43,6 +43,72 @@ type ResponseWriter interface {
 	WriteMessage(data []byte) error
 }
 
+// HeaderSetter is implemented by a ResponseWriter over a transport that has response
+// headers (currently: Streamable HTTP, and the in-memory BufferedResponseWriter test
+// double). A legacy-compatibility layer uses it to mint Mcp-Session-Id at handshake time.
+// A header set after the first byte of the response body is written is silently dropped.
+//
+// It is deliberately NOT implemented on the stdio/UNIX stream ResponseWriter: a byte
+// stream has no headers, and that absence is itself the signal a compatibility layer uses
+// to decide whether to mint a per-connection session or fall back to stdio's one implicit
+// session.
+type HeaderSetter interface {
+	SetResponseHeader(name, value string)
+}
+
+// requestInfoKey is the context key under which RequestInfo is stored.
+type requestInfoKey struct{}
+
+// RequestInfo carries the subset of transport-level request state a legacy-compatibility
+// layer needs but the request body doesn't itself carry: the session id and protocol
+// version a legacy client sent as headers (Streamable HTTP) rather than in params._meta.
+type RequestInfo struct {
+	// SessionID is the Mcp-Session-Id request header. Legacy Streamable HTTP requests
+	// only; empty on stdio/UNIX and on modern requests.
+	SessionID string
+	// ProtocolVersion is the MCP-Protocol-Version request header, exactly as sent.
+	ProtocolVersion string
+}
+
+// WithRequestInfo attaches info to ctx.
+func WithRequestInfo(ctx context.Context, info *RequestInfo) context.Context {
+	return context.WithValue(ctx, requestInfoKey{}, info)
+}
+
+// RequestInfoFromContext retrieves RequestInfo previously attached with
+// WithRequestInfo. Returns nil when no RequestInfo was attached — notably, always nil on
+// stdio/UNIX, which has no header layer to populate it from.
+func RequestInfoFromContext(ctx context.Context) *RequestInfo {
+	info, _ := ctx.Value(requestInfoKey{}).(*RequestInfo)
+	return info
+}
+
+// LegacySessions is the session-management surface a legacy-compatibility layer exposes to
+// the Streamable HTTP binding, without the transport package needing to import the
+// protocol package that implements it (that would be a cycle: transport is a dependency of
+// both mcp and any compatibility layer built on it).
+//
+// Passed via HTTPTransportConfig.LegacySessions. A nil value means compatibility is off,
+// and drives the entire legacy HTTP surface (GET/DELETE on /mcp, Mcp-Session-Id handling)
+// being disabled — callers implementing this MUST return a genuinely nil interface value
+// when there is no legacy stack, not a non-nil interface holding a nil pointer.
+type LegacySessions interface {
+	// Known reports whether id names a live (not expired, not terminated) session.
+	Known(id string) bool
+	// Terminate ends the session named id, reporting whether it existed. Idempotent: a
+	// second call for the same id returns false without error.
+	Terminate(id string) bool
+	// Done returns a channel closed when the session named id ends (expiry, explicit
+	// Terminate, or replacement by a re-handshake on the same key), for a standalone GET
+	// stream to select on alongside the request's own context. ok is false if id does not
+	// name a live session.
+	Done(id string) (<-chan struct{}, bool)
+	// StreamNotifications relays change notifications for the session named id to w, in
+	// the legacy notification shape, until ctx is done or the session ends. Used to drive
+	// the standalone GET /mcp SSE stream.
+	StreamNotifications(ctx context.Context, id string, w ResponseWriter) error
+}
+
 // JSONRPCRequest represents a JSON-RPC 2.0 request or notification.
 //
 // ID is kept as json.RawMessage rather than a decoded interface{} so that request IDs
@@ -60,6 +126,37 @@ type JSONRPCRequest struct {
 // notification: the receiver MUST NOT send a response.
 func (r *JSONRPCRequest) IsNotification() bool {
 	return len(r.ID) == 0
+}
+
+// ModernProtocolMetaKey is the params._meta key whose presence marks a request as
+// speaking the modern (2026-07-28) protocol envelope. See DeclaresModernProtocol.
+const ModernProtocolMetaKey = "io.modelcontextprotocol/protocolVersion"
+
+// DeclaresModernProtocol reports whether params (a JSON-RPC request's params) carries
+// ModernProtocolMetaKey inside _meta — the only unambiguous marker of the 2026-07-28 wire
+// format. The connection-scoped MCP revisions (2025-11-25 and earlier) negotiate a
+// protocol version once, at a now-removed initialize handshake, and never name one in
+// _meta on any later request — so its presence means modern, and its absence means
+// legacy. Do not infer the era from the method name, the params shape, or HTTP headers.
+//
+// This lives here, rather than in a legacy-compatibility layer built on top of transport,
+// because this transport's own Streamable HTTP binding needs the same verdict before the
+// protocol layer is even entered (to decide whether to enforce modern headers and
+// validate a session id) — and two independent implementations of "is this legacy?" that
+// can disagree is a bug factory. A compatibility layer should call this function (or
+// re-export it) rather than reimplementing the check.
+func DeclaresModernProtocol(params json.RawMessage) bool {
+	if len(params) == 0 {
+		return false
+	}
+	var env struct {
+		Meta map[string]json.RawMessage `json:"_meta"`
+	}
+	if err := json.Unmarshal(params, &env); err != nil {
+		return false
+	}
+	_, ok := env.Meta[ModernProtocolMetaKey]
+	return ok
 }
 
 // JSONRPCResponse represents a JSON-RPC 2.0 response (result or error).

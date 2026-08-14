@@ -77,6 +77,39 @@ browser) is always allowed. With `AllowedOrigins` empty (the default), only
 loopback-bound server. Set `AllowedOrigins: []string{"*"}` to allow any origin, e.g. behind a
 reverse proxy that already restricts access; anything else in the slice is an exact origin match.
 
+## Optional: serving legacy (pre-2026-07-28) clients too — `compat` package
+
+Everything above assumes a client that speaks 2026-07-28. If you need to serve clients still on
+2025-11-25 or earlier (they can't get past `initialize` — that method doesn't exist on a bare
+`*mcp.Server`), wrap the server in `compat.Overlay` instead of passing it to `trans.Start` directly.
+Off unless you opt in; with it not wired in, behavior is unchanged from everything above.
+
+```go
+overlay := compat.New(server, compat.Config{
+	ServerInfo: mcp.Implementation{Name: "my-mcp-server", Version: "1.0.0"},
+})
+
+httpCfg := transport.HTTPTransportConfig{
+	Host: "0.0.0.0", Port: 8080,
+	LegacySessions: overlay.LegacySessions(), // restores GET/DELETE + Mcp-Session-Id for legacy clients
+}
+trans := transport.NewHTTPTransport(httpCfg)
+trans.Start(overlay) // pass overlay, not server
+```
+
+Also widen `mcp.ServerConfig.AdvertisedVersions` on the inner server so `server/discover`, the legacy
+`initialize` diagnostic, and `-32022` all report the same version list:
+`append([]string{mcp.ProtocolVersion}, compat.LegacyVersions...)`.
+
+On stdio/UNIX, `trans.Start(overlay)` is all you need — no `LegacySessions` wiring, since those
+transports have no GET/DELETE surface to gate. A tool's `req.ClientCapabilities`/`req.BindArguments`
+work identically regardless of which era the caller is on; the overlay translates in both directions
+around your tool code, which never needs to know. The one thing that doesn't translate: a tool that
+calls `req.NeedInput` (MRTR) gets a visible `isError: true` refusal on the legacy side instead of the
+`input_required` round-trip, since that revision has no way to answer one. See
+[LEGACY-COMPAT.md](../../../../LEGACY-COMPAT.md) in the repo root for the full design (session
+lifecycle, per-request era detection, result downgrading, known limitations).
+
 ## Optional GitHub OAuth (`auth` package, HTTP-only)
 
 Auth is optional and only meaningful for the HTTP transport. Importing `auth` pulls in

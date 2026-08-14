@@ -8,8 +8,10 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/spirilis/generic-go-mcp/auth"
+	"github.com/spirilis/generic-go-mcp/compat"
 	"github.com/spirilis/generic-go-mcp/config"
 	"github.com/spirilis/generic-go-mcp/examples/tools"
 	"github.com/spirilis/generic-go-mcp/logging"
@@ -27,6 +29,13 @@ type cliFlags struct {
 	httpPort     int
 	logLevel     string
 	logFormat    string
+
+	// legacyCompat and legacyCompatSet implement "CLI flag overrides config file, but
+	// only if the flag was actually passed" for a *bool flag: flag.Bool's own default
+	// (false) is indistinguishable from an explicit -legacy-compat=false without tracking
+	// whether flag.Visit saw it.
+	legacyCompat    bool
+	legacyCompatSet bool
 }
 
 // applyCLIOverrides applies command-line flags to the configuration
@@ -82,6 +91,16 @@ func applyCLIOverrides(cfg *config.Config, flags cliFlags) {
 			cfg.Logging = &config.LoggingConfig{}
 		}
 		cfg.Logging.Format = flags.logFormat
+	}
+
+	// Override legacy-compat, but only if -legacy-compat was actually passed: unlike
+	// every other flag here, false is legacyCompat's own zero value, so "not passed" and
+	// "explicitly disabled" are indistinguishable without legacyCompatSet.
+	if flags.legacyCompatSet {
+		if cfg.Server.LegacyCompat == nil {
+			cfg.Server.LegacyCompat = &config.LegacyCompatConfig{}
+		}
+		cfg.Server.LegacyCompat.Enabled = flags.legacyCompat
 	}
 }
 
@@ -142,7 +161,16 @@ func main() {
 	httpPort := flag.Int("http-port", 0, "HTTP port")
 	logLevel := flag.String("log-level", "", "Logging level")
 	logFormat := flag.String("log-format", "", "Logging format")
+	legacyCompat := flag.Bool("legacy-compat", false,
+		"Serve MCP protocol revisions 2025-11-25 and earlier alongside 2026-07-28 (see the compat package)")
 	flag.Parse()
+
+	legacyCompatSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "legacy-compat" {
+			legacyCompatSet = true
+		}
+	})
 
 	// Load configuration
 	var cfg *config.Config
@@ -162,14 +190,16 @@ func main() {
 
 	// Apply CLI overrides
 	applyCLIOverrides(cfg, cliFlags{
-		mode:         *mode,
-		unixSocket:   *unixSocket,
-		unixName:     *unixName,
-		unixFileMode: *unixFileMode,
-		httpHost:     *httpHost,
-		httpPort:     *httpPort,
-		logLevel:     *logLevel,
-		logFormat:    *logFormat,
+		mode:            *mode,
+		unixSocket:      *unixSocket,
+		unixName:        *unixName,
+		unixFileMode:    *unixFileMode,
+		httpHost:        *httpHost,
+		httpPort:        *httpPort,
+		logLevel:        *logLevel,
+		logFormat:       *logFormat,
+		legacyCompat:    *legacyCompat,
+		legacyCompatSet: legacyCompatSet,
 	})
 
 	// Validate configuration
@@ -190,11 +220,52 @@ func main() {
 	// Create resource registry
 	resourceRegistry := mcp.NewResourceRegistry()
 
+	const serverName, serverVersion = "go-mcp-example", "0.1.0"
+
+	legacyCompatEnabled := cfg.Server.LegacyCompat != nil && cfg.Server.LegacyCompat.Enabled
+
+	// Feed server/discover, the legacy initialize diagnostic, and -32022 from one list,
+	// so a client is never told three different stories about what this server (overlay
+	// included) actually speaks.
+	advertisedVersions := []string{mcp.ProtocolVersion}
+	if legacyCompatEnabled {
+		advertisedVersions = append(advertisedVersions, compat.LegacyVersions...)
+	}
+
 	// Create MCP server
 	server := mcp.NewServer(registry, resourceRegistry, &mcp.ServerConfig{
-		Name:    "go-mcp-example",
-		Version: "0.1.0",
+		Name:               serverName,
+		Version:            serverVersion,
+		AdvertisedVersions: advertisedVersions,
 	})
+
+	// Wrap in the legacy-compatibility overlay if enabled. handler is what actually gets
+	// passed to the transport; legacySessions (nil unless compat is enabled) is what
+	// drives the Streamable HTTP binding's legacy GET/DELETE surface.
+	var handler transport.MessageHandler = server
+	var legacySessions transport.LegacySessions
+	if legacyCompatEnabled {
+		sessionTTL := time.Duration(0) // compat.Overlay applies its own 30-minute default
+		if cfg.Server.LegacyCompat.SessionTTL != "" {
+			var err error
+			sessionTTL, err = time.ParseDuration(cfg.Server.LegacyCompat.SessionTTL)
+			if err != nil {
+				logging.Error("Invalid server.legacy_compat.session_ttl", "value", cfg.Server.LegacyCompat.SessionTTL, "error", err)
+				os.Exit(1)
+			}
+		}
+		overlay := compat.New(server, compat.Config{
+			SessionTTL: sessionTTL,
+			ServerInfo: mcp.Implementation{Name: serverName, Version: serverVersion},
+		})
+		handler = overlay
+		legacySessions = overlay.LegacySessions()
+	}
+
+	logging.Info("MCP protocol support",
+		"modern", mcp.ProtocolVersion,
+		"legacy_compat", legacyCompatEnabled,
+		"advertised_versions", advertisedVersions)
 
 	// Initialize auth service if enabled
 	var authService *auth.AuthService
@@ -219,6 +290,12 @@ func main() {
 			Host:           cfg.Server.HTTP.Host,
 			Port:           cfg.Server.HTTP.Port,
 			AllowedOrigins: cfg.Server.HTTP.AllowedOrigins,
+			// nil (the default, when legacyCompatEnabled is false) means the legacy
+			// GET/DELETE surface stays off — compat.Overlay.LegacySessions() already
+			// guards against returning a typed nil, so this is always a genuinely nil
+			// interface in that case, not the typed-nil trap AuthService below works
+			// around.
+			LegacySessions: legacySessions,
 		}
 		// Only set AuthService when auth is actually enabled: assigning a nil
 		// *auth.AuthService unconditionally would store a typed nil in the
@@ -263,7 +340,7 @@ func main() {
 	}
 
 	// Start the transport
-	if err := trans.Start(server); err != nil {
+	if err := trans.Start(handler); err != nil {
 		logging.Error("Error starting transport", "error", err)
 		os.Exit(1)
 	}

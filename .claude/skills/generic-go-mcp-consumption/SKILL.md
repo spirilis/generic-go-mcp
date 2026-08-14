@@ -9,9 +9,10 @@ description: |
   Multi Round-Trip Requests (MRTR) for elicitation-style confirm-before-act
   tools, mutating the tool/resource catalog at runtime and pushing change
   notifications to clients (subscriptions/listen, list_changed,
-  resources/updated), and the biggest first-contact gotcha — every client
-  request must carry params._meta with a protocol version and capabilities,
-  or it fails.
+  resources/updated), the optional compat.Overlay for serving legacy
+  (2025-11-25 and earlier) clients alongside 2026-07-28, and the biggest
+  first-contact gotcha — every client request must carry params._meta with a
+  protocol version and capabilities, or it fails.
   Use this skill when: starting a new Go MCP server from scratch, adding a
   tool or resource to an existing generic-go-mcp server, picking a
   transport, wiring OAuth, registering or unregistering tools/resources
@@ -161,7 +162,7 @@ curl recipes for exercising a running server by hand.
 | Task | Read |
 |---|---|
 | Define a tool's schema, handler signature, content/error conventions | `references/tool-authoring.md` |
-| Choose stdio vs UNIX socket vs Streamable HTTP; wire optional GitHub OAuth | `references/transports-and-auth.md` |
+| Choose stdio vs UNIX socket vs Streamable HTTP; wire optional GitHub OAuth; serve legacy (pre-2026-07-28) clients via `compat.Overlay` | `references/transports-and-auth.md` |
 | Build a confirm-before-act tool (delete, send, pay) or a readable resource | `references/mrtr-and-resources.md` |
 | Mutate the tool/resource catalog at runtime, or push change notifications to clients | `references/notifications-and-registries.md` |
 | Debug a client that can't complete its first request; header/error reference | `references/protocol-essentials.md` |

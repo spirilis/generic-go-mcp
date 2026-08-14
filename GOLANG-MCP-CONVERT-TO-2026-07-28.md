@@ -4,6 +4,14 @@ Status: implemented on `main`. This document was written before the code changes
 is kept up to date as the reference for anyone embedding this library — every code sample below is
 the real, shipped implementation, not illustrative pseudocode.
 
+**Update:** §2's hard-cutover decisions ("there is no dual-era support and no compatibility shim")
+describe `mcp.Server` and the transports as they ship — that remains true, and `mcp.Server` itself
+still implements only 2026-07-28. What has since been added is the optional `compat` package, which
+sits *beside* this design rather than inside it: it wraps a `transport.MessageHandler` from the
+outside, translating a legacy request into the shape described below and forwarding it unchanged, so
+every "does not exist" in §2 still reads correctly as "does not exist on the modern stack." See
+[LEGACY-COMPAT.md](LEGACY-COMPAT.md).
+
 ## 1. Why this is a v2, not a patch
 
 Every previous MCP revision (2024-11-05 through 2025-11-25) was connection-scoped: a client opens

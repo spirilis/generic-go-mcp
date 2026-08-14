@@ -100,17 +100,40 @@ type HTTPTransportConfig struct {
 	// port) — appropriate for a server bound to loopback. Set to []string{"*"} to allow
 	// any origin (e.g. behind a trusted reverse proxy that already restricts access).
 	AllowedOrigins []string
+
+	// LegacySessions, if non-nil, enables the legacy (2025-11-25 and earlier) Streamable
+	// HTTP surface: GET /mcp opens a standalone SSE stream for the named session, DELETE
+	// /mcp tears one down, and unknown-session handling and header-validation exemptions
+	// apply to legacy requests. Nil (the default) means compatibility is off — GET and
+	// DELETE both answer 405, exactly as this transport did before this field existed.
+	// Typically supplied by a compatibility layer wrapping the MessageHandler passed to
+	// Start (e.g. compat.Overlay.LegacySessions()).
+	LegacySessions LegacySessions
 }
 
 // HTTPTransport implements Transport using the stateless Streamable HTTP binding
-// (2026-07-28): a single POST-only /mcp endpoint, no protocol-level sessions, no GET/DELETE.
+// (2026-07-28): a single POST-only /mcp endpoint, no protocol-level sessions, no GET/DELETE
+// — unless HTTPTransportConfig.LegacySessions is set, which restores GET/DELETE for the
+// legacy requests a compatibility layer claims.
 type HTTPTransport struct {
-	config      HTTPTransportConfig
-	handler     MessageHandler
-	server      *http.Server
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
-	authService AuthProvider
+	config         HTTPTransportConfig
+	handler        MessageHandler
+	server         *http.Server
+	stopCh         chan struct{}
+	wg             sync.WaitGroup
+	authService    AuthProvider
+	legacySessions LegacySessions
+}
+
+// isNilLegacySessions reports whether v is a typed nil, the same class of bug
+// isNilAuthProvider guards against: a caller assigning a nil concrete pointer to this
+// interface field unconditionally must not be treated as "compatibility enabled."
+func isNilLegacySessions(v LegacySessions) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
 }
 
 // NewHTTPTransport creates a new HTTP transport
@@ -130,10 +153,16 @@ func NewHTTPTransport(config HTTPTransportConfig) *HTTPTransport {
 		authService = nil
 	}
 
+	legacySessions := config.LegacySessions
+	if isNilLegacySessions(legacySessions) {
+		legacySessions = nil
+	}
+
 	return &HTTPTransport{
-		config:      config,
-		stopCh:      make(chan struct{}),
-		authService: authService,
+		config:         config,
+		stopCh:         make(chan struct{}),
+		authService:    authService,
+		legacySessions: legacySessions,
 	}
 }
 
@@ -190,7 +219,9 @@ func (t *HTTPTransport) Stop() error {
 // handleMCP handles the /mcp endpoint for Streamable HTTP transport. Only POST is a
 // defined operation in this protocol revision; GET and DELETE (session lifecycle from
 // earlier revisions) are rejected with 405, per the 2026-07-28 backward-compatibility
-// guidance for a server that supports only this revision.
+// guidance for a server that supports only this revision — unless legacySessions is set,
+// in which case GET opens a standalone SSE stream and DELETE tears a legacy session down,
+// for the legacy clients the compatibility layer serves.
 func (t *HTTPTransport) handleMCP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
@@ -226,12 +257,20 @@ func (t *HTTPTransport) handleMCP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		t.handlePost(recorder, r)
+	case http.MethodGet:
+		if t.legacySessions == nil {
+			t.methodNotAllowed(recorder)
+		} else {
+			t.handleGet(recorder, r)
+		}
+	case http.MethodDelete:
+		if t.legacySessions == nil {
+			t.methodNotAllowed(recorder)
+		} else {
+			t.handleDelete(recorder, r)
+		}
 	default:
-		// GET, DELETE, and anything else: no such operation in this revision (no
-		// sessions, no standalone SSE stream, no session teardown).
-		recorder.Header().Set("Content-Type", "application/json")
-		recorder.WriteHeader(http.StatusMethodNotAllowed)
-		recorder.Write(NewErrorResponse(nil, &RPCError{Code: MethodNotFound, Message: "Method not allowed: only POST is supported"}))
+		t.methodNotAllowed(recorder)
 	}
 
 	// Log request completion
@@ -261,6 +300,68 @@ func (t *HTTPTransport) handleMCP(w http.ResponseWriter, r *http.Request) {
 	if logging.IsTraceEnabled() && recorder.body.Len() > 0 {
 		logging.Trace("HTTP response body", "body", recorder.body.String())
 	}
+}
+
+// methodNotAllowed answers a request for an HTTP method this transport does not define an
+// operation for on /mcp — always true for anything but POST/GET/DELETE, and true for
+// GET/DELETE too when legacySessions is nil (compatibility off).
+func (t *HTTPTransport) methodNotAllowed(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusMethodNotAllowed)
+	w.Write(NewErrorResponse(nil, &RPCError{Code: MethodNotFound, Message: "Method not allowed"}))
+}
+
+// handleGet implements the legacy standalone SSE stream: GET /mcp, scoped to the session
+// named by the Mcp-Session-Id header. Only reachable when t.legacySessions is non-nil.
+// The stream stays open — emitting change notifications as they occur, plus the
+// httpResponseWriter's periodic keep-alive comment — until the client disconnects or the
+// session ends (TTL expiry, explicit DELETE, or a re-handshake replacing it); both exits
+// are honored by selecting on the request's own context and the session's Done channel.
+func (t *HTTPTransport) handleGet(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.Header.Get(SessionIDHeader)
+	if sessionID == "" || !t.legacySessions.Known(sessionID) {
+		writeHTTPError(w, http.StatusNotFound, nil, InvalidRequest, "Session not found")
+		return
+	}
+
+	done, ok := t.legacySessions.Done(sessionID)
+	if !ok {
+		// Ended between the Known check above and here — treat as never found.
+		writeHTTPError(w, http.StatusNotFound, nil, InvalidRequest, "Session not found")
+		return
+	}
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	go func() {
+		select {
+		case <-done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	rw := newHTTPResponseWriter(w)
+	defer rw.closeDone()
+	// A standalone GET stream opens text/event-stream immediately — there is no final
+	// JSON-RPC message to wait for, unlike a request-scoped notification stream that only
+	// upgrades lazily on its first WriteNotification.
+	rw.startSSE()
+
+	if err := t.legacySessions.StreamNotifications(ctx, sessionID, rw); err != nil {
+		logging.Debug("legacy SSE stream ended", "session", sessionID, "error", err)
+	}
+}
+
+// handleDelete implements legacy session teardown: DELETE /mcp, scoped to the session
+// named by the Mcp-Session-Id header. Only reachable when t.legacySessions is non-nil.
+func (t *HTTPTransport) handleDelete(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.Header.Get(SessionIDHeader)
+	if sessionID == "" || !t.legacySessions.Terminate(sessionID) {
+		writeHTTPError(w, http.StatusNotFound, nil, InvalidRequest, "Session not found")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // originAllowed implements the Origin validation the Streamable HTTP binding requires to
@@ -301,12 +402,20 @@ func (t *HTTPTransport) setCORSHeaders(w http.ResponseWriter, r *http.Request, o
 	} else if len(t.config.AllowedOrigins) == 1 && t.config.AllowedOrigins[0] == "*" {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 	}
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	if t.legacySessions != nil {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
+		// A browser client cannot read the Mcp-Session-Id header the legacy handshake
+		// mints unless it is explicitly exposed — merely allowing it in the request
+		// direction is not enough, and every later request would then fail.
+		w.Header().Set("Access-Control-Expose-Headers", SessionIDHeader)
+	} else {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	}
 	if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
 		w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
 	} else {
 		w.Header().Set("Access-Control-Allow-Headers",
-			"Content-Type, Accept, Authorization, "+ProtocolVersionHeader+", "+MethodHeader+", "+NameHeader)
+			"Content-Type, Accept, Authorization, "+ProtocolVersionHeader+", "+MethodHeader+", "+NameHeader+", "+SessionIDHeader)
 	}
 }
 
@@ -321,9 +430,11 @@ type reqParamsPeek struct {
 
 // validateHeaders enforces the Streamable HTTP requirement that MCP-Protocol-Version,
 // Mcp-Method, and (for tools/call, resources/read, prompts/get) Mcp-Name are present and
-// match the request body. Callers MUST NOT invoke this for "initialize" requests: legacy
-// clients don't send these headers at all, and the caller is expected to let those
-// through to the handler's own diagnostic instead of rejecting them here.
+// match the request body. Callers MUST NOT invoke this for "initialize" requests, nor
+// (when a compatibility layer is enabled) for any other request a legacy client sent:
+// those revisions predate these headers entirely, and the caller is expected to let such
+// requests through to the handler's own diagnostic (or the compatibility layer) instead
+// of rejecting them here.
 func (t *HTTPTransport) validateHeaders(r *http.Request, req JSONRPCRequest) error {
 	pv := r.Header.Get(ProtocolVersionHeader)
 	if pv == "" {
@@ -366,6 +477,15 @@ func (t *HTTPTransport) validateHeaders(r *http.Request, req JSONRPCRequest) err
 	}
 
 	return nil
+}
+
+// isLegacyRequest reports whether req should be routed to a legacy-compatibility layer
+// rather than validated as a modern (2026-07-28) request: either it's the legacy
+// handshake method itself, or it lacks the modern protocol-version _meta key that every
+// genuine 2026-07-28 request carries. See DeclaresModernProtocol for why this predicate,
+// and no other, is the right one.
+func isLegacyRequest(req JSONRPCRequest) bool {
+	return req.Method == "initialize" || !DeclaresModernProtocol(req.Params)
 }
 
 func requiresNameHeader(method string) bool {
@@ -441,11 +561,30 @@ func (t *HTTPTransport) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// "initialize" gets no header enforcement: a legacy client sending it has no idea
-	// these headers exist. Let it reach the handler, which returns a diagnostic
-	// UnsupportedProtocolVersion/MethodNotFound naming the versions we do support; that
-	// error's code maps to the correct HTTP status via HTTPStatusForRPCError below.
-	if req.Method != "initialize" {
+	// legacy is only ever true when a compatibility layer is actually enabled — with
+	// t.legacySessions nil, every request is treated as modern except "initialize"
+	// itself, unchanged from this transport's original modern-only behavior.
+	legacy := t.legacySessions != nil && isLegacyRequest(req)
+	sessionID := r.Header.Get(SessionIDHeader)
+
+	// Rule 1: an unknown session is a 404, so the client knows to re-handshake — but only
+	// for a legacy request that isn't "initialize". A modern request carrying a leftover
+	// session header must have it ignored, per the stateless binding; "initialize" is
+	// exempt because establishing a new session is exactly what it's for, and the client
+	// will still be holding the dead id when it retries.
+	if legacy && req.Method != "initialize" && sessionID != "" && !t.legacySessions.Known(sessionID) {
+		writeHTTPError(w, http.StatusNotFound, req.ID, InvalidRequest, "Session not found")
+		return
+	}
+
+	// Rule 2: the 2026-07-28 header requirements (MCP-Protocol-Version, Mcp-Method,
+	// Mcp-Name) bind modern requests only. "initialize" is always exempt (a legacy client
+	// sending it has no idea these headers exist, and the modern-only diagnostic needs to
+	// see it unvalidated); every other legacy request is exempt only once a compatibility
+	// layer is actually claiming it, since demanding these headers of a client speaking a
+	// revision where they don't exist would reject every legacy call before the
+	// compatibility layer ever saw it.
+	if req.Method != "initialize" && !legacy {
 		if verr := t.validateHeaders(r, req); verr != nil {
 			logging.Debug("HTTP header validation failed", "error", verr, "remote_addr", r.RemoteAddr)
 			writeHTTPError(w, http.StatusBadRequest, req.ID, HeaderMismatch, verr.Error())
@@ -454,6 +593,7 @@ func (t *HTTPTransport) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := WithRequestHeaders(r.Context(), collectHeaders(r))
+	ctx = WithRequestInfo(ctx, &RequestInfo{SessionID: sessionID, ProtocolVersion: r.Header.Get(ProtocolVersionHeader)})
 
 	if req.IsNotification() {
 		t.handler.HandleMessage(ctx, body, discardResponseWriter{})
@@ -486,6 +626,17 @@ func newHTTPResponseWriter(w http.ResponseWriter) *httpResponseWriter {
 
 func (rw *httpResponseWriter) closeDone() {
 	rw.once.Do(func() { close(rw.done) })
+}
+
+// startSSE forces the immediate upgrade to text/event-stream, for a standalone GET stream
+// that has no final JSON-RPC response to wait for and so cannot rely on the lazy
+// first-WriteNotification upgrade every other response on this writer uses.
+func (rw *httpResponseWriter) startSSE() {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	if !rw.started {
+		rw.upgradeToSSELocked()
+	}
 }
 
 func (rw *httpResponseWriter) upgradeToSSELocked() {
@@ -576,6 +727,21 @@ func rpcErrorCode(data []byte) (int, bool) {
 	}
 	return env.Error.Code, true
 }
+
+// SetResponseHeader implements HeaderSetter: a legacy-compatibility layer uses it to mint
+// Mcp-Session-Id on a successful "initialize". Per the interface contract, a header set
+// after the first byte of the response is written is silently dropped — the handshake
+// must set it before returning its result.
+func (rw *httpResponseWriter) SetResponseHeader(name, value string) {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	if rw.started {
+		return
+	}
+	rw.w.Header().Set(name, value)
+}
+
+var _ HeaderSetter = (*httpResponseWriter)(nil)
 
 func (rw *httpResponseWriter) writeSSEEventLocked(data []byte) error {
 	if _, err := fmt.Fprintf(rw.w, "data: %s\n\n", data); err != nil {

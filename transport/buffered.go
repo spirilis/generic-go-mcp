@@ -22,6 +22,7 @@ type BufferedResponseWriter struct {
 	mu            sync.Mutex
 	notifications []BufferedNotification
 	message       []byte
+	headers       map[string]string
 }
 
 // NewBufferedResponseWriter creates an empty BufferedResponseWriter.
@@ -62,3 +63,32 @@ func (w *BufferedResponseWriter) Message() []byte {
 	defer w.mu.Unlock()
 	return w.message
 }
+
+// SetResponseHeader implements HeaderSetter, so tests exercising a legacy-compatibility
+// layer directly (bypassing a live HTTP connection) can observe headers such as a minted
+// Mcp-Session-Id. Like a real HTTP response, a header set after WriteMessage has already
+// been called is silently dropped.
+func (w *BufferedResponseWriter) SetResponseHeader(name, value string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.message != nil {
+		return
+	}
+	if w.headers == nil {
+		w.headers = make(map[string]string)
+	}
+	w.headers[name] = value
+}
+
+// ResponseHeaders returns a snapshot of every header set so far via SetResponseHeader.
+func (w *BufferedResponseWriter) ResponseHeaders() map[string]string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make(map[string]string, len(w.headers))
+	for k, v := range w.headers {
+		out[k] = v
+	}
+	return out
+}
+
+var _ HeaderSetter = (*BufferedResponseWriter)(nil)
