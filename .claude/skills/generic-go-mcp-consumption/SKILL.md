@@ -169,10 +169,11 @@ curl recipes for exercising a running server by hand.
 
 ## Accuracy note for future edits to this skill
 
-Every snippet here was checked against the real source (`mcp/`, `transport/`, `auth/`,
+Every snippet here was checked against the real source (`mcp/`, `transport/`, `auth/`, `compat/`,
 `examples/`), not written from memory of "what an MCP library usually looks like." Last verified
-against `903dd2c` (registry `Unregister` + `notifications/resources/updated`); the example above
-was compiled verbatim against the working tree.
+against `bd514b5` (the `compat` package — cross-checked from a downstream consumer's `go get` of
+the tagged `v0.5.0` module, not just this checkout, since a checkout can run ahead of what `go get`
+resolves); the example above was compiled verbatim against the working tree.
 
 If you extend this skill, do the same — read the actual `.go` files before writing new examples.
 `README.md` is kept in sync with this material too, so a claim here that contradicts it means one
