@@ -345,17 +345,43 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Wait for interrupt signal
+	// Wait for either an interrupt signal or the transport's own run ending. Only stdio has
+	// the latter: its input reaching EOF means the client that launched us is done, which is
+	// the portable shutdown signal for a stdio server. For http/unix the assertion fails,
+	// transDone stays nil, and a receive on a nil channel blocks forever — so this select
+	// degrades to waiting on the signal alone, exactly as before.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	<-sigCh
 
-	logging.Info("Shutting down gracefully")
+	var transDone <-chan struct{}
+	if d, ok := trans.(transport.DoneNotifier); ok {
+		transDone = d.Done()
+	}
+
+	select {
+	case <-sigCh:
+		logging.Info("Shutting down gracefully", "reason", "signal")
+	case <-transDone:
+		logging.Info("Shutting down gracefully", "reason", "input closed")
+	}
 
 	// Graceful shutdown
 	if err := trans.Stop(); err != nil {
 		logging.Error("Error stopping transport", "error", err)
 		os.Exit(1)
+	}
+
+	// A stdio run that ended because reading its input failed is not a clean exit; report it
+	// as one and a supervising client has no way to tell a crash from a normal disconnect.
+	if stdio, ok := trans.(*transport.StdioTransport); ok {
+		select {
+		case <-stdio.Done():
+			if err := stdio.Err(); err != nil {
+				logging.Error("stdio input failed", "error", err)
+				os.Exit(1)
+			}
+		default:
+		}
 	}
 
 	logging.Info("Shutdown complete")

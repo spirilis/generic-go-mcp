@@ -46,7 +46,11 @@ func newStreamTransport(name string) *streamTransport {
 // serve runs the read loop against r, writing responses/notifications to w, until r
 // returns EOF/error or ctx is cancelled. It blocks until all in-flight handlers have
 // returned. Safe to call once per connection.
-func (s *streamTransport) serve(ctx context.Context, r io.Reader, w io.Writer) {
+//
+// It returns nil when the read loop ended for an ordinary reason — a clean EOF on r, or ctx
+// being cancelled — and the read error otherwise. A deliberate shutdown is not a failure, so
+// callers can treat a non-nil return as a genuine fault (see StdioTransport.Err).
+func (s *streamTransport) serve(ctx context.Context, r io.Reader, w io.Writer) error {
 	s.out = w
 
 	scanner := bufio.NewScanner(r)
@@ -66,7 +70,7 @@ func (s *streamTransport) serve(ctx context.Context, r io.Reader, w io.Writer) {
 		select {
 		case <-ctx.Done():
 			s.wg.Wait()
-			return
+			return nil
 		default:
 		}
 
@@ -107,10 +111,18 @@ func (s *streamTransport) serve(ctx context.Context, r io.Reader, w io.Writer) {
 		}()
 	}
 
-	if err := scanner.Err(); err != nil {
+	err := scanner.Err()
+	if err != nil {
 		logging.Debug("stream scanner error", "transport", s.name, "error", err)
 	}
 	s.wg.Wait()
+
+	// A read that failed because we were being shut down is not a fault to report: on a
+	// UNIX socket, Stop force-closes the connection precisely to break the blocked read.
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
 }
 
 // handleCancelled cancels the in-flight request named by the notification's params.requestId.

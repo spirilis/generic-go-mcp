@@ -196,9 +196,14 @@ func main() {
         Version: "1.0.0",
     })
 
-    // Start the stdio transport
+    // Start the stdio transport, then wait for the client to close stdin
     trans := transport.NewStdioTransport()
-    trans.Start(server)
+    if err := trans.Start(server); err != nil {
+        logging.Error("starting transport", "error", err)
+        os.Exit(1)
+    }
+    <-trans.Done()
+    trans.Stop()
 }
 ```
 
@@ -347,7 +352,10 @@ go build -o go-mcp ./examples/go-mcp
 
 ### Transport Layer
 Abstracts communication mechanisms behind a common interface:
-- **StdioTransport** - Reads from stdin, writes to stdout (for Claude Code, desktop apps)
+- **StdioTransport** - Reads from stdin, writes to stdout (for Claude Code, desktop apps).
+  Serves arbitrary streams via `NewStdioTransportWithStreams(in, out)` — useful for tests. Alone
+  among the transports its run has a natural end, so it also offers `Done()` (closed when the input
+  reaches EOF) and `Err()` (nil for a clean EOF, non-nil if the read failed)
 - **UnixTransport** - Newline-delimited JSON-RPC over a UNIX domain socket (local IPC)
 - **HTTPTransport** - POST-only `/mcp` Streamable HTTP endpoint (web services, remote access)
 

@@ -5,7 +5,7 @@ All three transports implement the same `transport.Transport` interface:
 ```go
 type Transport interface {
 	Start(handler MessageHandler) error // non-blocking: launches its own goroutine(s) and returns
-	Stop() error                        // blocks until shutdown is complete
+	Stop() error                        // initiates shutdown; see each transport for what it waits on
 }
 ```
 
@@ -13,19 +13,56 @@ type Transport interface {
 `trans.Start(server)`. Pick the transport based on how the server will be reached; nothing about
 tool/resource code changes between them.
 
+A transport whose run can end on its own additionally implements `transport.DoneNotifier`:
+
+```go
+type DoneNotifier interface {
+	Done() <-chan struct{} // closed when the transport's run has ended
+}
+```
+
+Only `StdioTransport` does — stdin reaching EOF is a real ending. HTTP and UNIX transports end only
+when you call `Stop()`, so they deliberately don't implement it.
+
 ## stdio — `transport.NewStdioTransport()`
 
 ```go
 trans := transport.NewStdioTransport()
-trans.Start(server)
+if err := trans.Start(server); err != nil {
+	// ...
+}
+
+<-trans.Done()   // the client closed stdin; we're done
+trans.Stop()     // cancel anything still in flight
+if err := trans.Err(); err != nil {
+	os.Exit(1)   // the read failed; this was not a clean disconnect
+}
 ```
 
 Newline-delimited JSON-RPC over stdin/stdout. This is what a desktop MCP client (Claude Desktop,
-etc.) launches as a subprocess. No config struct — nothing to set.
+etc.) launches as a subprocess. No config struct — the only thing you can vary is which streams it
+serves, via `NewStdioTransportWithStreams(in io.Reader, out io.Writer)`. Pass `nil` for either to
+get the process default; pass a pair of `io.Pipe`s to drive the whole server from a test.
 
-**Shutdown caveat:** `Stop()` cancels in-flight request contexts but can't interrupt a blocked
-stdin read. The portable shutdown signal for a stdio server is the client closing stdin; if you
-need a hard deadline, race `Stop()` against your own timeout.
+**Shutdown:** the portable shutdown signal for a stdio server is the client closing stdin, and
+`Done()` is how you observe it — select on it alongside your `signal.Notify` channel so the process
+exits when *either* fires:
+
+```go
+select {
+case <-sigCh:
+case <-trans.Done():
+}
+```
+
+`Stop()` cancels in-flight request contexts and **returns immediately**; it does not wait for the
+read loop, which is parked in a blocking read that nothing portable can interrupt. If you want to
+wait for the loop to unwind, write `trans.Stop(); <-trans.Done()`, and if you want a hard deadline,
+select `Done()` against your own `time.After`. `Err()` is valid once `Done()` is closed and tells
+you whether the run ended on a clean EOF (nil) or a read failure (non-nil) — that's your exit code.
+
+Note this changed in **v0.6.0**: `Stop()` used to block until the read loop exited, which in
+practice meant it hung forever whenever it was called while stdin was still open.
 
 ## UNIX socket — `transport.NewUnixTransport(config)`
 

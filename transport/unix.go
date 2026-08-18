@@ -144,7 +144,11 @@ func (t *UnixTransport) acceptLoop() {
 
 			stream := newStreamTransport("unix")
 			stream.handler = t.handler
-			stream.serve(ctx, c, c)
+			// serve's read error is already logged inside serve, and a UNIX connection
+			// ending is routine here — the next Accept takes over, and Stop deliberately
+			// force-closes the connection to break the blocked read — so there is nothing
+			// further to surface at this call site.
+			_ = stream.serve(ctx, c, c)
 
 			logging.Debug("Client disconnected from UNIX socket")
 		}(conn, ctx, cancel)

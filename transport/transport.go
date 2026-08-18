@@ -6,10 +6,38 @@ import (
 	"net/http"
 )
 
-// Transport defines the interface for different communication mechanisms
+// Transport defines the interface for different communication mechanisms.
+//
+// Start is non-blocking: it launches the transport's own goroutine(s) and returns. Stop
+// initiates shutdown; whether it waits for anything is the individual transport's business
+// (StdioTransport's, notably, returns immediately — see its documentation). A transport
+// whose run can end on its own additionally implements DoneNotifier.
 type Transport interface {
 	Start(handler MessageHandler) error
 	Stop() error
+}
+
+// DoneNotifier is implemented by a Transport whose run has a natural end, so that
+// transport-agnostic startup code can wait for it without knowing which transport it holds:
+//
+//	var transDone <-chan struct{}
+//	if d, ok := trans.(transport.DoneNotifier); ok {
+//		transDone = d.Done()
+//	}
+//	select {
+//	case <-sigCh:
+//	case <-transDone: // nil for a transport that never ends on its own; blocks forever
+//	}
+//
+// Currently only StdioTransport: its run ends when its input reaches EOF, which is the
+// portable shutdown signal for a stdio server. It is deliberately NOT implemented by
+// HTTPTransport or UnixTransport — those end only when Stop is called, so a Done there would
+// report "somebody stopped me", not "my peer went away", and inviting a caller to exit on it
+// would be inviting a bug.
+type DoneNotifier interface {
+	// Done returns a channel closed once the transport's run has ended. It is valid to call
+	// at any point in the transport's life, including before Start.
+	Done() <-chan struct{}
 }
 
 // MessageHandler processes incoming JSON-RPC messages. Implementations MUST be safe for

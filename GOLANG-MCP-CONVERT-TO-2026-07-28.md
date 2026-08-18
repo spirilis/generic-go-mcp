@@ -412,6 +412,18 @@ ordinary request/response traffic) sharing one stream.
 - If you were relying on `Mcp-Session-Id` to correlate state across calls, mint your own opaque
   handle from a tool and have the model pass it back as an argument (§"Stateful Tools" in the
   spec) — there is no protocol-level session to lean on anymore.
+- `transport.StdioTransport` gained `Done()` and `Err()` (and the optional `transport.DoneNotifier`
+  interface they satisfy). A stdio server's run ends when its stdin reaches EOF, which is the only
+  portable shutdown signal a client has; `Done()` closes then, and `Err()` distinguishes a clean EOF
+  from a read failure so an embedder can pick an exit code. Select `Done()` alongside your
+  `signal.Notify` channel instead of waiting on the signal alone, or the process outlives the client
+  that launched it. Relatedly, `Stop()` no longer blocks until the read loop exits — it cancels
+  in-flight requests and returns, since the read loop is parked in a blocking read that nothing
+  portable can interrupt. Embedders that relied on the old blocking behaviour write
+  `trans.Stop(); <-trans.Done()`.
+- `transport.NewStdioTransportWithStreams(in, out)` serves an arbitrary reader/writer pair instead of
+  the process's stdin/stdout (a nil either side means the process default). This is what makes the
+  stdio path testable with `io.Pipe`, and lets a host serve streams it has already wrapped.
 - Prompts (`prompts/list`/`prompts/get`), `resources/templates/list`, completion, the Tasks/Apps
   extensions, and MRTR support on `resources/read`/`prompts/get` (only `tools/call` is wired up this
   round) remain out of scope; see §6 below.

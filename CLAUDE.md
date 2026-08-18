@@ -72,9 +72,11 @@ func main() {
         Version: "1.0.0",
     })
 
-    // Create and start transport
+    // Create and start transport, then wait for the client to close stdin
     trans := transport.NewStdioTransport()
     trans.Start(server)
+    <-trans.Done()
+    trans.Stop()
 }
 ```
 
@@ -91,11 +93,22 @@ the same connection (e.g. a long-lived `subscriptions/listen` alongside an ordin
 `ResponseWriter` (through which notifications and the final response are written), rather than
 returning a single buffered response.
 
+`Start` is non-blocking; `Stop` initiates shutdown, and what it waits for is each transport's own
+business. A transport whose run can end on its own — currently only `StdioTransport`, whose input
+reaching EOF is a real ending — additionally implements the optional `DoneNotifier` interface, so
+transport-agnostic startup code can wait on it with a type assertion (the same optional-interface
+pattern as `HeaderSetter`). `HTTPTransport` and `UnixTransport` deliberately do not: they end only
+when `Stop` is called.
+
 **Key Interfaces:**
 ```go
 type Transport interface {
     Start(handler MessageHandler) error
     Stop() error
+}
+
+type DoneNotifier interface {
+    Done() <-chan struct{} // closed when the transport's run has ended
 }
 
 type MessageHandler interface {
@@ -164,7 +177,13 @@ Structured logging with multiple levels and formats.
 Enables MCP servers to support stdio, UNIX domain sockets, and Streamable HTTP without duplicating
 protocol logic. Implementations:
 - `StdioTransport` / `UnixTransport` - newline-delimited JSON-RPC over stdin/stdout or a UNIX socket,
-  sharing a common framing (`transport/stream.go`) that dispatches each message concurrently
+  sharing a common framing (`transport/stream.go`) that dispatches each message concurrently.
+  `StdioTransport` serves arbitrary streams via `NewStdioTransportWithStreams(in, out)` (nil means
+  the process default), which is what makes the stdio path testable with `io.Pipe`; its `Done()`
+  closes when the input reaches EOF and `Err()` then says whether that was clean. Its `Stop()`
+  cancels in-flight requests and returns immediately — it does not wait for the read loop, which is
+  parked in a blocking read nothing portable can interrupt, so `Stop(); <-Done()` is the spelling
+  for "wait for it to unwind"
 - `HTTPTransport` - a single POST-only `/mcp` endpoint; responds with a plain JSON object, or
   upgrades to a request-scoped `text/event-stream` the moment a handler emits a notification
   (progress, or a `subscriptions/listen` change notification)

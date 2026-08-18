@@ -37,7 +37,7 @@ one thing from this file, remember that — it's the failure mode you'll hit fir
 ## Get the module
 
 ```bash
-go get github.com/spirilis/generic-go-mcp@v0.2.0
+go get github.com/spirilis/generic-go-mcp@v0.6.0
 ```
 
 Import weight depends on what you use:
@@ -48,7 +48,7 @@ Import weight depends on what you use:
 
 ## Minimal stdio server
 
-This compiles as-is against `v0.2.0`. It's the shape every server starts from: a `ToolRegistry`, a
+This compiles as-is against `v0.6.0`. It's the shape every server starts from: a `ToolRegistry`, a
 `ResourceRegistry` (even if empty — `NewServer` requires both), wrapped in a `Server`, driven by a
 `Transport`.
 
@@ -82,9 +82,14 @@ func main() {
 	if err := trans.Start(server); err != nil {
 		os.Exit(1)
 	}
-	// trans.Start launches the read loop in a goroutine and returns immediately;
-	// block on your own shutdown signal, then call trans.Stop().
-	select {} // replace with a real signal.Notify + <-sigCh in a real server
+	// trans.Start launches the read loop in a goroutine and returns immediately.
+	// Done() closes when the client closes stdin — the portable shutdown signal for
+	// a stdio server. In a real server, select this against a signal.Notify channel.
+	<-trans.Done()
+	trans.Stop()
+	if err := trans.Err(); err != nil {
+		os.Exit(1) // the read failed; not a clean disconnect
+	}
 }
 
 func echoTool(ctx context.Context, req *mcp.ToolRequest) (mcp.Result, error) {
@@ -171,9 +176,14 @@ curl recipes for exercising a running server by hand.
 
 Every snippet here was checked against the real source (`mcp/`, `transport/`, `auth/`, `compat/`,
 `examples/`), not written from memory of "what an MCP library usually looks like." Last verified
-against `bd514b5` (the `compat` package — cross-checked from a downstream consumer's `go get` of
-the tagged `v0.5.0` module, not just this checkout, since a checkout can run ahead of what `go get`
-resolves); the example above was compiled verbatim against the working tree.
+against the `StdioTransport` `Done()`/`Err()`/`NewStdioTransportWithStreams` work released as
+`v0.6.0` — cross-checked from a downstream consumer's `go get` of the tagged module, not just this
+checkout, since a checkout can run ahead of what `go get` resolves; the example above was compiled
+verbatim against the working tree.
+
+Note that `v0.6.0` changed `StdioTransport.Stop()` from blocking until the read loop exited to
+returning immediately. Snippets written against an earlier tag that relied on `Stop()` blocking
+need `trans.Stop(); <-trans.Done()`.
 
 If you extend this skill, do the same — read the actual `.go` files before writing new examples.
 `README.md` is kept in sync with this material too, so a claim here that contradicts it means one
