@@ -98,7 +98,8 @@ compat off restores the strict answer.
 | `initialize` naming `2026-07-28` | The same `-32601` diagnostic a bare `mcp.Server` gives a modern client calling `initialize` — pointing at `server/discover` — and mints **no** session. Never quietly downgrades a modern client into a legacy one. |
 | `notifications/initialized` | Swallowed; extends the session's idle TTL. No response, as required for a notification. |
 | `ping` | `{}`. Mandatory in these revisions, unlike the modern stack (which doesn't route it at all). |
-| `tools/list`, `tools/call`, `resources/list`, `resources/read` | Translated to the modern shape using the calling session's declared capabilities, forwarded to the inner handler unchanged, and downgraded back. |
+| `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `completion/complete` | Translated to the modern shape using the calling session's declared capabilities, forwarded to the inner handler unchanged, and downgraded back. |
+| `resources/templates/list` / `completion/complete` specifics | Both predate 2026-07-28 and share an identical params object across eras, so forwarding is all that is needed. A server with no `CompletionProvider` registered answers `completion/complete` with the inner stack's `-32601`, which passes straight through — the same "unsupported" signal a legacy client probes for. |
 | everything else (including `resources/subscribe`/`unsubscribe`) | `-32601` — the correct answer for a capability the handshake never declared. |
 
 A call with no live session — the handshake was skipped, or the session id was dropped or expired —
@@ -109,8 +110,12 @@ refused.
 
 Legacy result shapes are the modern ones minus the envelope: `tools/list` becomes
 `{tools, nextCursor?}`, `tools/call` becomes `{content, isError?}`, `resources/read` becomes
-`{contents}`. `resultType`, `ttlMs`, `cacheScope`, and `_meta` are stripped rather than translated —
-they're inventions of the 2026-07-28 envelope with no legacy equivalent.
+`{contents}`, `resources/templates/list` becomes `{resourceTemplates, nextCursor?}`. `resultType`,
+`ttlMs`, `cacheScope`, and `_meta` are stripped rather than translated — they're inventions of the
+2026-07-28 envelope with no legacy equivalent.
+
+Downgrading is generic key-stripping on the raw JSON result, not a per-method translation, which is
+why a new result type needs no new downgrade code.
 
 **MRTR (`input_required`) cannot be downgraded.** A client on a revision without it has no way to
 answer and retry — that mechanism requires a bidirectional request channel these transports no longer
@@ -163,6 +168,12 @@ minted.
 4. **Modern content types** (`resource_link`, audio) **can reach a client on a revision that predates
    them.** Tool authors targeting a mixed client population should keep that in mind.
 5. Sessions don't survive a restart (see "Sessions" above).
+6. **Resource-not-found reaches a legacy client as `-32602`, not the legacy `-32002`.** Earlier
+   revisions used `-32002` for this, but 2026-07-28 retired that code and this library never emits
+   it anywhere (`transport/transport.go`). The overlay does not translate error codes at all — a
+   JSON-RPC error object carries no modern-only envelope fields to strip — so the modern code passes
+   through unchanged. Clients on those revisions are expected to accept `-32602` as well; this
+   applies to reads of both concrete resources and resource-template members.
 
 **Nothing about the tools changes between eras.** Same registry, same schemas, same data, same auth.
 Only the envelope differs — "legacy mode" is not a degraded mode.
@@ -177,8 +188,10 @@ in already proves for every pre-existing test in this repository.
 ## Testing
 
 - `compat/compat_test.go` — the protocol-level conformance suite: handshake negotiation, session
-  lifecycle, capability propagation, result downgrading, MRTR refusal, and advertised-version
-  consistency.
+  lifecycle, capability propagation, result downgrading, MRTR refusal, advertised-version
+  consistency, and the resource-template surface (`resources/templates/list` and template reads
+  downgraded correctly, `completion/complete` with and without a provider, the `-32602` note above,
+  and a templates-only registry still declaring `resources` at handshake).
 - `transport/http_compat_test.go` — the HTTP binding: header-validation exemptions, unknown-session
   handling, the standalone GET stream's two exit conditions, DELETE teardown, and CORS.
 - `mcp/conformance_test.go` and the pre-existing `transport/http_test.go` passing **unchanged** is

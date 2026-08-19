@@ -16,10 +16,19 @@ notification channel.
 | `HasTools()` / `HasResources()` | ✓ | ✓ | Drives the advertised capability |
 | `Read(ctx, uri)` | — | `(ResourceContentResult, error)` | Runs the `ResourceFunction` |
 | `NotifyUpdated(uri) bool` | — | ✓ | Announce a content change; see below |
+| `RegisterTemplate(tmpl, fn) error` | — | ✓ | Resource templates; **returns an error** (the URI template is compiled up front) |
+| `UnregisterTemplate(uriTemplate) bool` | — | ✓ | Exact `uriTemplate` string match |
+| `ListTemplates()` / `HasTemplates()` | — | ✓ | `HasTemplates` also drives the `resources` capability |
+| `MatchTemplate(uri)` | — | ✓ | First registered match wins; returns the bindings too |
+| `SetTemplateCompleter(uriTemplate, p) error` | — | ✓ | Opt into `completion/complete`; drives the `completions` capability |
 
 Registering the *first* tool or resource is what makes the server advertise that capability from
 `server/discover`, and unregistering the *last* one withdraws it — capabilities are derived from what
-is actually registered, not declared up front (`mcp/server.go`, `Server.capabilities`).
+is actually registered, not declared up front (`mcp/server.go`, `Server.capabilities`). Templates
+count as resources for this purpose: a registry holding only templates still advertises `resources`.
+Template registration and removal fire the same `notifications/resources/list_changed` as concrete
+resources — the spec has no template-specific notification. See `mrtr-and-resources.md` for what
+templates are and when to reach for one.
 
 ## Removing and replacing entries
 
@@ -60,6 +69,14 @@ the bytes behind a URI that has been registered all along. That is a separate no
 // Your code just rewrote whatever this resource reads from.
 resources.NotifyUpdated("config://server-name") // true — the URI is registered
 resources.NotifyUpdated("config://typo")        // false — no-op, notifies nobody
+```
+
+A URI that matches a registered **resource template** also counts as known, even though it was never
+registered individually — which is the point when you're watching an upstream that adds and removes
+members on its own:
+
+```go
+resources.NotifyUpdated("mcp+kubectl://prod/pod/default/web-7") // true if a template matches it
 ```
 
 It cannot be automatic. A `ResourceFunction` is called on demand and returns whatever it likes; the

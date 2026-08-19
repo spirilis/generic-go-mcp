@@ -43,7 +43,8 @@ That message exists purely so a legacy-only client has something intelligible to
 
 **2. Put `_meta` on every single request.** There is no session to remember who you are, so each
 request re-states it. Two fields are **mandatory on every request** (`server/discover`,
-`tools/list`, `tools/call`, `resources/list`, `resources/read`, `subscriptions/listen`):
+`tools/list`, `tools/call`, `resources/list`, `resources/templates/list`, `resources/read`,
+`completion/complete`, `subscriptions/listen`):
 
 | `params._meta` key | Required | Notes |
 |---|---|---|
@@ -108,7 +109,9 @@ same call (new JSON-RPC `id`, same `name`/`arguments`) with `inputResponses` and
 ### Not implemented in this revision
 
 Roots, Sampling, and MCP's own Logging utility are deprecated upstream in 2026-07-28 and are not
-implemented here. Prompts are not implemented yet (the HTTP layer already reserves `prompts/get`
+implemented here. Resource templates and `completion/complete` **are** implemented (see
+[Resource Templates](#resource-templates)), but completion is only offered for resource template
+variables — `ref/prompt` is rejected, since prompts are not implemented yet (the HTTP layer already reserves `prompts/get`
 for the `Mcp-Name` header rule, and a `subscriptions/listen` filter may set `promptsListChanged`,
 but nothing will ever fire it).
 
@@ -131,6 +134,9 @@ rationale, the hard-cutover decisions, and a worked wire-to-Go-types example.
 - **Simple Tool API** - Register tools with JSON schema definitions and type-safe handlers
 - **Live Change Notifications** - Runtime-mutable tool and resource catalogs; clients subscribe once
   via `subscriptions/listen` and receive `list_changed` and per-resource `updated` notifications
+- **Parameterized Resources** - RFC 6570 resource templates (`resources/templates/list`) for
+  unbounded keyspaces no `resources/list` could enumerate, with optional `completion/complete`
+  to help clients narrow a template variable
 - **Production Ready** - BoltDB token storage, HMAC-signed MRTR request state, graceful shutdown
 - **Dependency-Free Core** - `mcp` and `transport` import nothing beyond the Go standard library
   (and each other); `auth` (BoltDB) and `config` (YAML) are opt-in, pulled in only if you import them
@@ -384,7 +390,8 @@ registry.HasTools()            // Whether any tool is registered
 
 `mcp.NewResourceRegistry()` mirrors this for resources (`Register`, `Unregister` keyed by URI,
 `List`, `Get`, `Read`, `HasResources`) and is a required argument to `mcp.NewServer` even when you
-register no resources. It adds one method with no tool equivalent:
+register no resources. It additionally carries the resource *template* API described in
+[Resource Templates](#resource-templates). It adds one method with no tool equivalent:
 
 ```go
 resources.NotifyUpdated("config://server-name") // announce a content change; bool = URI is registered
@@ -413,6 +420,91 @@ Three behaviors worth knowing:
 Because list cursors are opaque offsets, unregistering between a client's page fetches can shift
 later entries and cause one to be skipped — that is what `list_changed` is for; a client that sees
 it should restart pagination.
+
+### Resource Templates
+
+Some resource families cannot be listed. Every pod in a cluster, every row in a table, every
+environment variable — the keyspace is unbounded, so `resources/list` is the wrong shape for it.
+The protocol's answer is an **RFC 6570 URI template**: the server advertises the *shape* through
+`resources/templates/list`, the client expands it locally, and the read arrives on the ordinary
+`resources/read` method carrying a concrete URI.
+
+```go
+resources.RegisterTemplate(mcp.ResourceTemplate{
+    URITemplate: "mcp+kubectl://{context}/pod/{namespace}/{name}",
+    Name:        "Pod",
+    Description: "One pod, as JSON",
+    MimeType:    "application/json",
+}, func(ctx context.Context, req *mcp.ResourceReadRequest) (mcp.ResourceContentResult, error) {
+    pod, err := lookupPod(ctx, req.Vars["context"], req.Vars["namespace"], req.Vars["name"])
+    if errors.Is(err, errNoSuchPod) {
+        // -32602 "Unknown resource", not -32603: absent is not a server fault.
+        return mcp.ResourceContentResult{}, fmt.Errorf("pod %q: %w", req.Vars["name"], mcp.ErrResourceNotFound)
+    }
+    if err != nil {
+        return mcp.ResourceContentResult{}, err
+    }
+    return mcp.ResourceContentResult{Text: pod}, nil
+})
+```
+
+`RegisterTemplate` returns an `error` — unlike `Register`, which cannot fail — because the template
+is compiled into a matcher up front, so a malformed one is caught at startup instead of silently
+never matching. The registry API mirrors the concrete one: `UnregisterTemplate`, `ListTemplates`,
+`HasTemplates`, `MatchTemplate`.
+
+**Supported template syntax.** Reverse matching (URI → variable bindings) is not part of RFC 6570 —
+the RFC only defines expansion — so this library implements it, and deliberately implements a small,
+predictable subset. Anything else is a registration error naming the offending expression:
+
+| Form | Matches | Notes |
+|---|---|---|
+| `{var}` | one path segment (never `/`) | RFC 6570 Level 1, which is all many clients implement |
+| `{+var}` | one or more characters, `/` included | Reserved expansion; allowed only as the **final** expression |
+
+Rejected: `{#frag}`, `{?query}`, `{&param}`, `{/path}`, `{.ext}`, `{;param}`, multi-variable `{a,b}`,
+and the `{var:3}` / `{var*}` modifiers.
+
+Things worth knowing:
+
+- **A concrete resource always beats a template.** An exactly-registered URI is a deliberate claim
+  about that one URI; a template that also matches it is the more general one.
+- **Templates match in registration order, first match wins.** Register the more specific template
+  first, or `scheme://x/{a}` will shadow `scheme://x/{a}/detail`.
+- **Variables arrive percent-decoded** in `req.Vars`. `contents[0].uri` in the response is always the
+  concrete URI the client asked for, never the template.
+- **A template family counts as resources** for capability purposes: a registry holding only
+  templates still advertises `resources` in `server/discover`, and `RegisterTemplate` /
+  `UnregisterTemplate` fire `resources/list_changed` like any other catalog change. There is no
+  separate template-changed notification.
+- **`NotifyUpdated` works on template URIs.** A URI matching a registered template is announceable
+  even though it was never registered individually — which is the point when you are watching an
+  upstream that adds and removes members on its own.
+
+There is deliberately no "templates supported" capability flag; the spec has none. Clients probe
+`resources/templates/list` and treat `-32601` as unsupported. This server always answers it,
+returning an empty array when nothing is registered.
+
+#### Completion (optional)
+
+A template describes a shape, not its contents, so `completion/complete` is the only protocol
+mechanism for exploring a large variable domain. It is entirely opt-in: attach a provider and the
+server declares the `completions` capability; attach none and `completion/complete` returns `-32601`,
+which is exactly the probe clients use.
+
+```go
+resources.SetTemplateCompleter("mcp+kubectl://{context}/pod/{namespace}/{name}",
+    mcp.CompletionFunc(func(ctx context.Context, req *mcp.CompletionRequest) (mcp.CompletionResult, error) {
+        // req.Argument is the variable being completed, req.Value the partial input, and
+        // req.Context the variables the client already resolved — use it to narrow the query.
+        names, total := searchPodNames(ctx, req.Context["namespace"], req.Value)
+        return mcp.CompletionResult{Values: names, Total: &total}, nil
+    }))
+```
+
+Back it with a prefix index or a paged upstream query; never materialize the keyspace, since not
+fitting in memory is why the template exists. The server truncates `Values` to the spec's 100-value
+ceiling and sets `hasMore` if it had to.
 
 ### Change Notifications
 
@@ -531,9 +623,13 @@ Either way the server writes **no final JSON-RPC response** for the listen reque
 
 ### Result Caching Hints
 Every result carries a `resultType`, and list/read results carry `ttlMs` and `cacheScope` hints.
-Defaults are 5 minutes for catalogs and 0 (always refetch) for resource reads; override via
-`ServerConfig.ListTTLMs`, `ReadTTLMs`, and `DefaultCacheScope` (set `"private"` for per-user
-catalogs behind auth).
+`ListTTLMs` covers `server/discover`, `tools/list`, `resources/list`, and
+`resources/templates/list`; `ReadTTLMs` covers `resources/read`. Defaults are 5 minutes for
+catalogs and 0 (always refetch) for resource reads; override via `ServerConfig.ListTTLMs`,
+`ReadTTLMs`, and `DefaultCacheScope` (set `"private"` for per-user catalogs behind auth).
+
+`completion/complete` deliberately carries neither: the spec does not list it among the cacheable
+operations, and a completion list is the last thing a client should be holding on to.
 
 ### JSON-RPC 2.0 Protocol
 All MCP communication follows JSON-RPC 2.0 specification with automatic message parsing, validation, and error handling.

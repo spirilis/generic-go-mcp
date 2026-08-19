@@ -9,7 +9,10 @@ diagnostic error naming the versions this server supports rather than a session.
 [GOLANG-MCP-CONVERT-TO-2026-07-28.md](GOLANG-MCP-CONVERT-TO-2026-07-28.md) for the full design
 rationale, the hard-cutover decisions this library makes, and a worked wire-to-Go-types example.
 Roots, Sampling, and MCP's own Logging utility are deprecated upstream in this revision and are not
-implemented here; Prompts are not yet implemented (see that document's "Out of scope" section). An
+implemented here; Prompts are not yet implemented (see that document's "Out of scope" section).
+Parameterized resources **are** implemented: RFC 6570 resource templates via
+`resources/templates/list`, matched back to a concrete URI on `resources/read`, plus an opt-in
+`completion/complete` provider for narrowing a template variable — see "Resource Templates" below. An
 optional `compat` package (off by default) can additionally serve clients still on 2025-11-25 or
 earlier alongside this native 2026-07-28 support — see [LEGACY-COMPAT.md](LEGACY-COMPAT.md).
 
@@ -130,6 +133,9 @@ Handles JSON-RPC 2.0 message parsing, validation, and routing. Manages tool defi
 - Method routing
 - Error handling per MCP specification
 - Server name/version configuration
+- Resource templates: RFC 6570 compilation and URI-to-variable matching (`mcp/templates.go`), which
+  is hand-rolled rather than taken from a library so `mcp` stays pure standard library
+- Optional completion provider plumbing (`mcp/completion.go`)
 
 ### Legacy Compatibility Overlay (`compat/`)
 Optional: serves MCP protocol revisions 2025-11-25 and earlier (the connection-scoped, `initialize`
@@ -142,7 +148,9 @@ everywhere else in this file. See [LEGACY-COMPAT.md](LEGACY-COMPAT.md).
 - Per-request era detection (`compat.Claims` / `transport.DeclaresModernProtocol`)
 - Legacy session lifecycle (handshake, TTL, teardown) — the modern stack has none
 - Translating a legacy request into the modern wire shape and forwarding it to the inner handler
-  unchanged, then downgrading the result back (stripping `resultType`/`ttlMs`/`cacheScope`/`_meta`)
+  unchanged, then downgrading the result back (stripping `resultType`/`ttlMs`/`cacheScope`/`_meta`).
+  Resource templates and `completion/complete` predate 2026-07-28 and share an identical params
+  object across eras, so they are forwarded like any other method
 - Refusing MRTR (`input_required`) results visibly to legacy clients, which have no way to answer one
 
 ### Auth Layer (`auth/`)
@@ -324,6 +332,33 @@ no longer send their own JSON-RPC requests to the client; instead they return `r
 
 See `mcp.ToolRequest.NeedInput` / `ElicitResponse` (`mcp/tools.go`, `mcp/mrtr.go`) and
 `examples/tools/confirm.go` for the Go side of this exchange.
+
+### Resource Templates
+
+`examples/go-mcp/main.go`'s UNIX-socket mode registers `mcp+unix:///env/{name}` as a resource
+*template*: the environment is an unbounded keyspace, so the server advertises the shape through
+`resources/templates/list` and the client expands it locally, then reads a concrete
+`mcp+unix:///env/PATH`. It also attaches a `mcp.CompletionFunc` over `os.Environ()`, which is what
+makes that server declare the `completions` capability at all.
+
+Only two RFC 6570 forms are supported, and anything else is a `RegisterTemplate` error naming the
+offending expression:
+
+| Form | Matches |
+|---|---|
+| `{var}` | one path segment, never `/` |
+| `{+var}` | one or more characters including `/`; **final expression only** |
+
+Key behaviors: a concrete `Resource` always beats a template; templates match in registration order
+(first match wins, so register the specific one first); `req.Vars` arrives percent-decoded;
+`contents[0].uri` is always the concrete URI, never the template; template registration fires the
+ordinary `notifications/resources/list_changed`; and a registry holding only templates still
+advertises the `resources` capability. A handler returning `mcp.ErrResourceNotFound` (or wrapping it)
+produces `-32602 "Unknown resource"` rather than `-32603` — absent is not a server fault, and empty
+content is never the right way to say "not found".
+
+See `mcp/templates.go`, `mcp/completion.go`, and the template API on `ResourceRegistry` in
+`mcp/resources.go`.
 
 ## Project Structure
 

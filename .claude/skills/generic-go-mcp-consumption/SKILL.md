@@ -7,19 +7,24 @@ description: |
   and resources, choosing a transport (stdio / UNIX socket / Streamable
   HTTP), the AuthProvider interface for optional GitHub OAuth on HTTP,
   Multi Round-Trip Requests (MRTR) for elicitation-style confirm-before-act
-  tools, mutating the tool/resource catalog at runtime and pushing change
+  tools, RFC 6570 resource templates (resources/templates/list) for
+  parameterized resources over unbounded keyspaces plus the optional
+  completion/complete provider for narrowing a template variable,
+  mutating the tool/resource catalog at runtime and pushing change
   notifications to clients (subscriptions/listen, list_changed,
   resources/updated), the optional compat.Overlay for serving legacy
   (2025-11-25 and earlier) clients alongside 2026-07-28, and the biggest
   first-contact gotcha — every client request must carry params._meta with a
   protocol version and capabilities, or it fails.
   Use this skill when: starting a new Go MCP server from scratch, adding a
-  tool or resource to an existing generic-go-mcp server, picking a
-  transport, wiring OAuth, registering or unregistering tools/resources
-  while the server is running, notifying clients that a tool list or a
-  resource's content changed, debugging "missing required _meta field" or
-  "missing required header" errors, or a client that can't get past its
-  first request against this server.
+  tool or resource to an existing generic-go-mcp server, exposing a
+  parameterized/templated resource family (URIs with variables, e.g. one
+  pod or one row per URI), adding autocompletion for a resource template
+  variable, picking a transport, wiring OAuth, registering or unregistering
+  tools/resources while the server is running, notifying clients that a tool
+  list or a resource's content changed, debugging "missing required _meta
+  field" or "missing required header" errors, or a client that can't get
+  past its first request against this server.
 ---
 
 # Building an MCP server on generic-go-mcp
@@ -37,7 +42,7 @@ one thing from this file, remember that — it's the failure mode you'll hit fir
 ## Get the module
 
 ```bash
-go get github.com/spirilis/generic-go-mcp@v0.6.0
+go get github.com/spirilis/generic-go-mcp@v0.7.0
 ```
 
 Import weight depends on what you use:
@@ -125,7 +130,7 @@ correct for a deployed HTTP one.
 | `RequestStateKey` | **random per process** | Signs MRTR `requestState`. Set it explicitly on HTTP, or retries break across restarts and replicas — see `references/transports-and-auth.md` |
 | `PrincipalFromContext` | empty principal | Binds `requestState` to the caller so one user's confirmation can't be replayed by another — see `references/mrtr-and-resources.md` |
 | `DefaultCacheScope` | `"public"` | Set `"private"` when the catalog or resource content varies per user (i.e. whenever auth is on) |
-| `ListTTLMs` | `300000` (5 min) | `ttlMs` cache hint on `server/discover`, `tools/list`, `resources/list` |
+| `ListTTLMs` | `300000` (5 min) | `ttlMs` cache hint on `server/discover`, `tools/list`, `resources/list`, `resources/templates/list` |
 | `ReadTTLMs` | `0` (always refetch) | `ttlMs` cache hint on `resources/read` |
 
 `ListTTLMs`/`ReadTTLMs` are `*int64`, so `0` and "unset" are distinguishable — take the address of a
@@ -168,7 +173,7 @@ curl recipes for exercising a running server by hand.
 |---|---|
 | Define a tool's schema, handler signature, content/error conventions | `references/tool-authoring.md` |
 | Choose stdio vs UNIX socket vs Streamable HTTP; wire optional GitHub OAuth; serve legacy (pre-2026-07-28) clients via `compat.Overlay` | `references/transports-and-auth.md` |
-| Build a confirm-before-act tool (delete, send, pay) or a readable resource | `references/mrtr-and-resources.md` |
+| Build a confirm-before-act tool (delete, send, pay), a readable resource, or a parameterized resource family (RFC 6570 templates + optional completion) | `references/mrtr-and-resources.md` |
 | Mutate the tool/resource catalog at runtime, or push change notifications to clients | `references/notifications-and-registries.md` |
 | Debug a client that can't complete its first request; header/error reference | `references/protocol-essentials.md` |
 
@@ -176,10 +181,14 @@ curl recipes for exercising a running server by hand.
 
 Every snippet here was checked against the real source (`mcp/`, `transport/`, `auth/`, `compat/`,
 `examples/`), not written from memory of "what an MCP library usually looks like." Last verified
-against the `StdioTransport` `Done()`/`Err()`/`NewStdioTransportWithStreams` work released as
-`v0.6.0` — cross-checked from a downstream consumer's `go get` of the tagged module, not just this
-checkout, since a checkout can run ahead of what `go get` resolves; the example above was compiled
+against the resource-templates work released as `v0.7.0` (`mcp/templates.go`, `mcp/completion.go`,
+and the template API on `ResourceRegistry` in `mcp/resources.go`); the example above was compiled
 verbatim against the working tree.
+
+**Pending re-verification against the tag:** this skill's `go get` line was updated to `v0.7.0` when
+the work landed, but the standing rule is to cross-check from a downstream consumer's `go get` of the
+*tagged* module rather than this checkout, since a checkout can run ahead of what `go get` resolves.
+Do that once `v0.7.0` is pushed.
 
 Note that `v0.6.0` changed `StdioTransport.Stop()` from blocking until the read loop exited to
 returning immediately. Snippets written against an earlier tag that relied on `Stop()` blocking

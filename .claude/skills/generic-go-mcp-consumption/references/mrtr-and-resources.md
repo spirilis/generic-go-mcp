@@ -145,3 +145,104 @@ Everything else about mutating a live catalog — `Unregister`, what happens whe
 existing URI, announcing that a resource's *content* changed (`NotifyUpdated`), and how a client
 subscribes to any of it via `subscriptions/listen` — is in
 `notifications-and-registries.md`.
+
+### Saying "no such resource"
+
+Return `mcp.ErrResourceNotFound` (or wrap it with `%w`) and the client gets `-32602
+"Unknown resource: <uri>"` — the same answer an unregistered URI gets. Any other error is `-32603`,
+which tells the client the *server* is broken, so don't use it for something merely absent:
+
+```go
+return mcp.ResourceContentResult{}, fmt.Errorf("pod %q: %w", name, mcp.ErrResourceNotFound)
+```
+
+Never return empty content to mean "not found" — it is indistinguishable from a resource that
+legitimately has none.
+
+## Resource templates (parameterized resources)
+
+Use a template when the keyspace can't be enumerated: every pod in a cluster, every row in a table,
+every environment variable. `resources/list` is the wrong shape for those, so the server advertises
+the *shape* via `resources/templates/list`, the client expands it locally, and the read arrives on
+ordinary `resources/read` carrying a concrete URI.
+
+```go
+err := resources.RegisterTemplate(
+	mcp.ResourceTemplate{
+		URITemplate: "mcp+kubectl://{context}/pod/{namespace}/{name}",
+		Name:        "Pod",
+		Description: "One pod, as JSON",
+		MimeType:    "application/json",
+	},
+	func(ctx context.Context, req *mcp.ResourceReadRequest) (mcp.ResourceContentResult, error) {
+		// req.URI is the concrete URI as sent; req.Vars holds the percent-decoded bindings.
+		pod, err := lookupPod(ctx, req.Vars["context"], req.Vars["namespace"], req.Vars["name"])
+		if errors.Is(err, errNoSuchPod) {
+			return mcp.ResourceContentResult{}, fmt.Errorf("pod %q: %w", req.Vars["name"], mcp.ErrResourceNotFound)
+		}
+		if err != nil {
+			return mcp.ResourceContentResult{}, err
+		}
+		return mcp.ResourceContentResult{Text: pod}, nil
+	},
+)
+if err != nil {
+	log.Fatalf("bad resource template: %v", err) // compiled at registration, so this is a startup bug
+}
+```
+
+`RegisterTemplate` returns an `error` where `Register` cannot fail: the template is compiled into a
+matcher up front, so a malformed one is caught at startup rather than silently never matching.
+
+**Only two RFC 6570 forms are supported.** Reverse matching (URI → bindings) isn't in the RFC at all,
+so this library implements a deliberately small subset:
+
+| Form | Matches | Notes |
+|---|---|---|
+| `{var}` | one path segment, never `/` | Level 1 — all many clients implement |
+| `{+var}` | one or more chars, `/` included | Reserved expansion; **final expression only** |
+
+`{#frag}`, `{?query}`, `{&param}`, `{/path}`, `{.ext}`, `{;param}`, `{a,b}`, `{var:3}`, `{var*}` are
+all registration errors naming the offending expression.
+
+Gotchas that will bite you:
+
+- **Concrete resources beat templates**, always.
+- **Templates match in registration order, first match wins** — register the specific one first, or
+  `scheme://x/{a}` shadows `scheme://x/{a}/detail`.
+- **`{var}` won't cross a `/`.** For multi-segment values use `{+var}`; `file:///{path}` only appears
+  to work because clients are lax about encoding.
+- Registering/unregistering a template fires `notifications/resources/list_changed` — there is no
+  separate template-changed notification.
+- A registry holding **only** templates still advertises the `resources` capability.
+- `NotifyUpdated` works for a URI that matches a template, even though it was never registered
+  individually.
+
+Sibling API: `UnregisterTemplate`, `ListTemplates`, `HasTemplates`, `MatchTemplate`.
+
+### Optional: completion for template variables
+
+A template describes shape, not contents, so `completion/complete` is the only protocol mechanism
+for exploring a large variable domain. It's opt-in — attach a provider and the server declares the
+`completions` capability; attach none and the method returns `-32601`, which is exactly the probe
+clients use to detect support.
+
+```go
+resources.SetTemplateCompleter("mcp+kubectl://{context}/pod/{namespace}/{name}",
+	mcp.CompletionFunc(func(ctx context.Context, req *mcp.CompletionRequest) (mcp.CompletionResult, error) {
+		// req.Argument = variable being completed, req.Value = partial input,
+		// req.Context = variables the client already resolved (use it to narrow the query).
+		names, total := searchPodNames(ctx, req.Context["namespace"], req.Value)
+		return mcp.CompletionResult{Values: names, Total: &total}, nil
+	}))
+```
+
+Back it with a prefix index or a paged upstream query — never materialize the keyspace, since not
+fitting in memory is the whole reason the template exists. The server truncates `Values` to the
+spec's 100-value ceiling and sets `hasMore` if it had to. `SetTemplateCompleter` errors if no
+template is registered under that exact `uriTemplate` string.
+
+Note that most hosts today will not exercise templates: resources are *application*-driven (the host
+decides how to surface them), while tools are *model*-driven. If the model needs to look something
+up mid-reasoning, give it a **tool** — implement templates for the linkable, citable surface, not as
+a replacement for a lookup tool.
