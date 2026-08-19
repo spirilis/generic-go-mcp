@@ -589,3 +589,185 @@ func TestNotificationsInitializedTouchesSession(t *testing.T) {
 		t.Error("expected notifications/initialized to have extended the session's idle TTL")
 	}
 }
+
+// --- resource templates and completion over the legacy overlay ---
+
+// registerTestTemplate adds a template family to an overlay's resource registry, plus a
+// completion provider for its one variable.
+func registerTestTemplate(t *testing.T, resources *mcp.ResourceRegistry) {
+	t.Helper()
+	if err := resources.RegisterTemplate(mcp.ResourceTemplate{
+		URITemplate: "test:///env/{name}",
+		Name:        "Environment variable",
+		Description: "One environment variable by name",
+		MimeType:    "text/plain",
+	}, func(ctx context.Context, req *mcp.ResourceReadRequest) (mcp.ResourceContentResult, error) {
+		return mcp.ResourceContentResult{Text: "value-of-" + req.Vars["name"]}, nil
+	}); err != nil {
+		t.Fatalf("register template: %v", err)
+	}
+	if err := resources.SetTemplateCompleter("test:///env/{name}", mcp.CompletionFunc(
+		func(ctx context.Context, req *mcp.CompletionRequest) (mcp.CompletionResult, error) {
+			return mcp.CompletionResult{Values: []string{"HOME", "PATH"}}, nil
+		})); err != nil {
+		t.Fatalf("SetTemplateCompleter: %v", err)
+	}
+}
+
+// legacySessionContext runs the legacy initialize handshake and returns a context carrying
+// the resulting session id, the way every legacy request after the handshake arrives.
+func legacySessionContext(t *testing.T, o *Overlay) context.Context {
+	t.Helper()
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(context.Background(),
+		mustMarshal(t, json.RawMessage("1"), "initialize", legacyInitParams("2025-11-25", map[string]interface{}{})), bw)
+	var initResult legacyInitializeResult
+	decodeResult(t, bw.Message(), &initResult)
+	return transport.WithRequestInfo(context.Background(),
+		&transport.RequestInfo{SessionID: bw.ResponseHeaders()[transport.SessionIDHeader]})
+}
+
+// assertDowngraded fails if a legacy result still carries any 2026-07-28 envelope field.
+func assertDowngraded(t *testing.T, data []byte) {
+	t.Helper()
+	var fields map[string]json.RawMessage
+	decodeResult(t, data, &fields)
+	for _, k := range []string{"resultType", "ttlMs", "cacheScope", "_meta"} {
+		if _, present := fields[k]; present {
+			t.Errorf("legacy result still carries modern envelope field %q: %s", k, data)
+		}
+	}
+}
+
+func TestLegacyResourcesTemplatesList(t *testing.T) {
+	o, _, resources := newTestOverlay(t, Config{})
+	registerTestTemplate(t, resources)
+	ctx := legacySessionContext(t, o)
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(ctx, mustMarshal(t, json.RawMessage("2"), "resources/templates/list", map[string]interface{}{}), bw)
+
+	var result struct {
+		ResourceTemplates []mcp.ResourceTemplate `json:"resourceTemplates"`
+	}
+	decodeResult(t, bw.Message(), &result)
+	if len(result.ResourceTemplates) != 1 {
+		t.Fatalf("got %d templates, want 1", len(result.ResourceTemplates))
+	}
+	if result.ResourceTemplates[0].URITemplate != "test:///env/{name}" {
+		t.Errorf("uriTemplate = %q, want test:///env/{name}", result.ResourceTemplates[0].URITemplate)
+	}
+	assertDowngraded(t, bw.Message())
+}
+
+// Templates are matched on the ordinary resources/read path, which the overlay already
+// forwards — so a legacy client reads a template member with no extra machinery.
+func TestLegacyResourcesReadThroughTemplate(t *testing.T) {
+	o, _, resources := newTestOverlay(t, Config{})
+	registerTestTemplate(t, resources)
+	ctx := legacySessionContext(t, o)
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(ctx, mustMarshal(t, json.RawMessage("2"), "resources/read",
+		map[string]interface{}{"uri": "test:///env/HOME"}), bw)
+
+	var result struct {
+		Contents []mcp.ResourceContent `json:"contents"`
+	}
+	decodeResult(t, bw.Message(), &result)
+	if len(result.Contents) != 1 || result.Contents[0].Text != "value-of-HOME" {
+		t.Fatalf("unexpected resources/read result: %+v", result)
+	}
+	if result.Contents[0].URI != "test:///env/HOME" {
+		t.Errorf("uri = %q, want the concrete request URI", result.Contents[0].URI)
+	}
+	assertDowngraded(t, bw.Message())
+}
+
+// The modern -32602 reaches the legacy client unchanged. Earlier revisions used -32002 for
+// this, but that code is retired library-wide and the overlay deliberately does not
+// translate error codes. See LEGACY-COMPAT.md's known limitations.
+func TestLegacyUnknownResourceKeepsModernErrorCode(t *testing.T) {
+	o, _, resources := newTestOverlay(t, Config{})
+	registerTestTemplate(t, resources)
+	ctx := legacySessionContext(t, o)
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(ctx, mustMarshal(t, json.RawMessage("2"), "resources/read",
+		map[string]interface{}{"uri": "test:///nothing/at/all"}), bw)
+
+	rerr := decodeError(t, bw.Message())
+	if rerr == nil || rerr.Code != transport.InvalidParams {
+		t.Errorf("got %+v, want -32602", rerr)
+	}
+}
+
+func TestLegacyCompletionComplete(t *testing.T) {
+	o, _, resources := newTestOverlay(t, Config{})
+	registerTestTemplate(t, resources)
+	ctx := legacySessionContext(t, o)
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(ctx, mustMarshal(t, json.RawMessage("2"), "completion/complete", map[string]interface{}{
+		"ref":      map[string]interface{}{"type": "ref/resource", "uri": "test:///env/{name}"},
+		"argument": map[string]interface{}{"name": "name", "value": ""},
+	}), bw)
+
+	var result struct {
+		Completion struct {
+			Values []string `json:"values"`
+		} `json:"completion"`
+	}
+	decodeResult(t, bw.Message(), &result)
+	if !slices.Equal(result.Completion.Values, []string{"HOME", "PATH"}) {
+		t.Errorf("values = %v, want [HOME PATH]", result.Completion.Values)
+	}
+	assertDowngraded(t, bw.Message())
+}
+
+// With no provider registered anywhere, the inner server's -32601 passes straight through —
+// the same "unsupported" signal a legacy client probes for.
+func TestLegacyCompletionUnsupportedWithoutProvider(t *testing.T) {
+	o, _, _ := newTestOverlay(t, Config{})
+	ctx := legacySessionContext(t, o)
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(ctx, mustMarshal(t, json.RawMessage("2"), "completion/complete", map[string]interface{}{
+		"ref":      map[string]interface{}{"type": "ref/resource", "uri": "test:///env/{name}"},
+		"argument": map[string]interface{}{"name": "name", "value": ""},
+	}), bw)
+
+	rerr := decodeError(t, bw.Message())
+	if rerr == nil || rerr.Code != transport.MethodNotFound {
+		t.Errorf("got %+v, want -32601", rerr)
+	}
+}
+
+// A registry holding only templates must still declare resources in the legacy handshake,
+// or a legacy client concludes the server serves no resources and never asks.
+func TestLegacyHandshakeDeclaresResourcesForTemplatesOnlyRegistry(t *testing.T) {
+	registry := mcp.NewToolRegistry()
+	resources := mcp.NewResourceRegistry()
+	if err := resources.RegisterTemplate(mcp.ResourceTemplate{URITemplate: "test:///{a}", Name: "x"},
+		func(ctx context.Context, req *mcp.ResourceReadRequest) (mcp.ResourceContentResult, error) {
+			return mcp.ResourceContentResult{Text: "x"}, nil
+		}); err != nil {
+		t.Fatalf("register template: %v", err)
+	}
+	server := mcp.NewServer(registry, resources, &mcp.ServerConfig{
+		Name:               "test-server",
+		Version:            "0.0.1",
+		AdvertisedVersions: append([]string{mcp.ProtocolVersion}, LegacyVersions...),
+	})
+	o := New(server, Config{})
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(context.Background(),
+		mustMarshal(t, json.RawMessage("1"), "initialize", legacyInitParams("2025-11-25", map[string]interface{}{})), bw)
+
+	var initResult legacyInitializeResult
+	decodeResult(t, bw.Message(), &initResult)
+	if initResult.Capabilities.Resources == nil {
+		t.Error("a templates-only registry did not declare the resources capability to a legacy client")
+	}
+}

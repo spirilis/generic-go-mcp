@@ -92,7 +92,8 @@ func (o *Overlay) HandleMessage(ctx context.Context, data []byte, w transport.Re
 	case "ping":
 		// Mandatory in these revisions: answer with an empty result.
 		w.WriteMessage(transport.NewSuccessResponse(req.ID, struct{}{}))
-	case "tools/list", "tools/call", "resources/list", "resources/read":
+	case "tools/list", "tools/call", "resources/list", "resources/read",
+		"resources/templates/list", "completion/complete":
 		o.forward(ctx, req, w)
 	default:
 		// Everything else — including resources/subscribe and resources/unsubscribe,
@@ -245,11 +246,17 @@ func (o *Overlay) buildInitializeResult(negotiated string, discoverResp []byte) 
 	}
 }
 
-// forward translates a legacy tools/list, tools/call, resources/list, or resources/read
-// request into the modern shape — these four share an identical params object between
-// eras, so only _meta needs adding — using the calling session's declared capabilities,
-// sends it to the inner handler, and writes the downgraded result back to w under the
-// legacy client's own request id.
+// forward translates a legacy tools/list, tools/call, resources/list, resources/read,
+// resources/templates/list, or completion/complete request into the modern shape — all of
+// these share an identical params object between eras, so only _meta needs adding — using
+// the calling session's declared capabilities, sends it to the inner handler, and writes the
+// downgraded result back to w under the legacy client's own request id.
+//
+// Resource templates and completion both predate 2026-07-28, so forwarding them is all that
+// is needed: the inner server's answer is already the shape a legacy client expects once
+// downgradeResult has stripped the modern envelope fields. A server with no completion
+// provider answers completion/complete with -32601 through the inner handler, which passes
+// straight through — the same "unsupported" signal a legacy client would probe for.
 func (o *Overlay) forward(ctx context.Context, req transport.JSONRPCRequest, w transport.ResponseWriter) {
 	sess, ok := o.sessions.get(o.sessionIDFromContext(ctx))
 
