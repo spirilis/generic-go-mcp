@@ -162,8 +162,16 @@ func (s *Server) capabilities() ServerCapabilities {
 	if s.registry.HasTools() {
 		caps.Tools = &ToolsCapability{ListChanged: true}
 	}
-	if s.resourceRegistry.HasResources() {
+	// Templates count: there is no separate "templates supported" capability in this
+	// revision, so a registry holding only templates and no concrete resources must still
+	// declare resources — otherwise a client (or the legacy compat overlay's handshake,
+	// which derives its capabilities from server/discover) would conclude this server
+	// serves no resources at all and never probe resources/templates/list.
+	if s.resourceRegistry.HasResources() || s.resourceRegistry.HasTemplates() {
 		caps.Resources = &ResourcesCapability{ListChanged: true}
+	}
+	if s.resourceRegistry.hasTemplateCompleters() {
+		caps.Completions = &CompletionsCapability{}
 	}
 	return caps
 }
@@ -233,8 +241,19 @@ func (s *Server) HandleMessage(ctx context.Context, data []byte, w transport.Res
 		result, rerr = s.handleToolsCall(ctx, meta, req.Params)
 	case "resources/list":
 		result, rerr = s.handleResourcesList(ctx, req.Params)
+	case "resources/templates/list":
+		result, rerr = s.handleResourcesTemplatesList(ctx, req.Params)
 	case "resources/read":
 		result, rerr = s.handleResourcesRead(ctx, req.Params)
+	case "completion/complete":
+		// Optional and opt-in: with no CompletionProvider attached to any template, the
+		// method genuinely does not exist here, and -32601 is the answer clients probe for.
+		if !s.resourceRegistry.hasTemplateCompleters() {
+			logging.Debug("completion/complete with no completion provider registered")
+			w.WriteMessage(transport.NewErrorResponse(req.ID, &transport.RPCError{Code: transport.MethodNotFound, Message: "Method not found"}))
+			return
+		}
+		result, rerr = s.handleCompletionComplete(ctx, req.Params)
 	default:
 		logging.Debug("JSON-RPC method not found", "method", req.Method)
 		w.WriteMessage(transport.NewErrorResponse(req.ID, &transport.RPCError{Code: transport.MethodNotFound, Message: "Method not found"}))

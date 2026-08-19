@@ -40,6 +40,7 @@ type ResourceRegistry struct {
 	mu        sync.RWMutex
 	resources []Resource
 	functions map[string]ResourceFunction // keyed by URI
+	templates []*compiledTemplate         // registration order; first match wins
 	onChange  func()
 	onUpdate  func(string)
 }
@@ -105,9 +106,19 @@ func (r *ResourceRegistry) Unregister(uri string) bool {
 // Unlike list_changed, the library cannot detect this on its own: a ResourceFunction is
 // called on demand and its output is opaque to the registry, so only the consumer knows when
 // the underlying thing changed. This is that explicit signal.
+//
+// A URI that matches no concrete resource but does match a registered resource template
+// counts as known: template members are readable, so they are announceable, and a server
+// watching an upstream (pods appearing and disappearing) needs to say so for URIs it never
+// registered individually. A URI matching neither is still a no-op returning false, which is
+// what catches a typo.
 func (r *ResourceRegistry) NotifyUpdated(uri string) bool {
 	r.mu.Lock()
 	_, known := r.functions[uri]
+	if !known {
+		matched, _ := r.matchTemplateLocked(uri)
+		known = matched != nil
+	}
 	update := r.onUpdate
 	r.mu.Unlock()
 	if known && update != nil {
@@ -173,6 +184,184 @@ func (r *ResourceRegistry) HasResources() bool {
 	return len(r.resources) > 0
 }
 
+// RegisterTemplate adds a resource template and the function that reads one concrete member
+// of it. Unlike Register, this can fail: the uriTemplate is compiled into a matcher up
+// front, and a malformed or unsupported template is reported here rather than silently
+// never matching anything. See compileURITemplate for the supported forms ({var}, and a
+// terminal {+var}).
+//
+// Registering a uriTemplate that is already present replaces it and moves it to the end of
+// the list, mirroring Register. Any completion provider previously attached with
+// SetTemplateCompleter is carried over — re-registering to change a description should not
+// silently drop completion support.
+//
+// Ordering matters: MatchTemplate is first-match-wins in registration order, so a general
+// template registered first will shadow a more specific one registered later. Register
+// "scheme://x/{a}/detail" before "scheme://x/{+rest}", not after.
+//
+// If the registry is already attached to a running Server, this fires a
+// notifications/resources/list_changed — the specification has no template-specific
+// notification, and list_changed covers the resource catalog as a whole.
+func (r *ResourceRegistry) RegisterTemplate(tmpl ResourceTemplate, fn ResourceTemplateFunction) error {
+	if fn == nil {
+		return fmt.Errorf("uri template %q: nil ResourceTemplateFunction", tmpl.URITemplate)
+	}
+	re, vars, err := compileURITemplate(tmpl.URITemplate)
+	if err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	compiled := &compiledTemplate{tmpl: tmpl, fn: fn, re: re, vars: vars}
+	if existing, i := r.findTemplateLocked(tmpl.URITemplate); existing != nil {
+		compiled.comp = existing.comp
+		r.templates = append(r.templates[:i], r.templates[i+1:]...)
+	}
+	r.templates = append(r.templates, compiled)
+	notify := r.onChange
+	r.mu.Unlock()
+
+	if notify != nil {
+		notify()
+	}
+	return nil
+}
+
+// UnregisterTemplate removes the template registered under the exact uriTemplate string,
+// reporting whether one was found. As with Unregister, removing something actually present
+// fires notifications/resources/list_changed; removing an absent template is a no-op that
+// notifies nobody.
+func (r *ResourceRegistry) UnregisterTemplate(uriTemplate string) bool {
+	r.mu.Lock()
+	existing, i := r.findTemplateLocked(uriTemplate)
+	removed := existing != nil
+	if removed {
+		r.templates = append(r.templates[:i], r.templates[i+1:]...)
+	}
+	notify := r.onChange
+	r.mu.Unlock()
+
+	if removed && notify != nil {
+		notify()
+	}
+	return removed
+}
+
+// ListTemplates returns all registered resource templates, in registration order.
+func (r *ResourceRegistry) ListTemplates() []ResourceTemplate {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	// Deliberately make() rather than a nil slice: this feeds resources/templates/list,
+	// where an empty catalog must serialize as [] and not null.
+	result := make([]ResourceTemplate, len(r.templates))
+	for i, t := range r.templates {
+		result[i] = t.tmpl
+	}
+	return result
+}
+
+// HasTemplates returns true if the registry has any resource templates.
+func (r *ResourceRegistry) HasTemplates() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.templates) > 0
+}
+
+// MatchTemplate finds the first registered template matching a concrete URI, in registration
+// order, and returns it along with its read function and the percent-decoded variable
+// bindings extracted from the URI.
+func (r *ResourceRegistry) MatchTemplate(uri string) (ResourceTemplate, ResourceTemplateFunction, map[string]string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	compiled, vars := r.matchTemplateLocked(uri)
+	if compiled == nil {
+		return ResourceTemplate{}, nil, nil, false
+	}
+	return compiled.tmpl, compiled.fn, vars, true
+}
+
+// SetTemplateCompleter attaches a completion provider to an already-registered template,
+// enabling completion/complete for its variables. Passing nil removes it.
+//
+// This is what turns the completions capability on: a server with no completers anywhere
+// does not advertise it and answers completion/complete with -32601, which is precisely the
+// probe clients use to detect support.
+func (r *ResourceRegistry) SetTemplateCompleter(uriTemplate string, p CompletionProvider) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	existing, _ := r.findTemplateLocked(uriTemplate)
+	if existing == nil {
+		return fmt.Errorf("no resource template registered for %q", uriTemplate)
+	}
+	existing.comp = p
+	return nil
+}
+
+// templateCompletion is an immutable snapshot of what completion/complete needs about one
+// template, taken under the registry lock so a concurrent SetTemplateCompleter cannot race
+// the handler.
+type templateCompletion struct {
+	provider CompletionProvider
+	vars     []string // immutable after compilation; safe to share
+}
+
+func (tc templateCompletion) hasVar(name string) bool {
+	for _, v := range tc.vars {
+		if v == name {
+			return true
+		}
+	}
+	return false
+}
+
+// templateCompletion looks up a template by its exact uriTemplate string — which is what a
+// completion/complete request's ref/resource "uri" carries.
+func (r *ResourceRegistry) templateCompletion(uriTemplate string) (templateCompletion, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	existing, _ := r.findTemplateLocked(uriTemplate)
+	if existing == nil {
+		return templateCompletion{}, false
+	}
+	return templateCompletion{provider: existing.comp, vars: existing.vars}, true
+}
+
+// hasTemplateCompleters reports whether any registered template can answer
+// completion/complete. It gates both the completions capability and the router.
+func (r *ResourceRegistry) hasTemplateCompleters() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, t := range r.templates {
+		if t.comp != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// findTemplateLocked returns the entry registered under the exact uriTemplate string and its
+// index, or (nil, -1). Callers must hold r.mu (either mode).
+func (r *ResourceRegistry) findTemplateLocked(uriTemplate string) (*compiledTemplate, int) {
+	for i, t := range r.templates {
+		if t.tmpl.URITemplate == uriTemplate {
+			return t, i
+		}
+	}
+	return nil, -1
+}
+
+// matchTemplateLocked runs the first-match-wins scan. Callers must hold r.mu — NotifyUpdated
+// holds it for writing and MatchTemplate for reading, which is why the lock is the caller's
+// job rather than this function's.
+func (r *ResourceRegistry) matchTemplateLocked(uri string) (*compiledTemplate, map[string]string) {
+	for _, t := range r.templates {
+		if vars, ok := t.match(uri); ok {
+			return t, vars
+		}
+	}
+	return nil, nil
+}
+
 // ResourceContent is one entry in a resources/read result's contents array.
 type ResourceContent struct {
 	URI         string                 `json:"uri"`
@@ -227,17 +416,37 @@ func (s *Server) handleResourcesRead(ctx context.Context, params json.RawMessage
 		return nil, invalidParamsErr("invalid resources/read params: %v", err)
 	}
 
-	res, ok := s.resourceRegistry.Get(p.URI)
-	if !ok {
-		return nil, invalidParamsErr("Unknown resource: %s", p.URI)
+	// Concrete resources win over templates: an exactly-registered URI is a deliberate
+	// statement about that one URI, and a template that happens to also match it is the
+	// more general claim.
+	if res, ok := s.resourceRegistry.Get(p.URI); ok {
+		content, err := s.resourceRegistry.Read(ctx, p.URI)
+		if err != nil {
+			return nil, readErr(p.URI, err)
+		}
+		return s.resourceReadResult(p.URI, res.Name, res.Title, res.MimeType, content), nil
 	}
 
-	content, err := s.resourceRegistry.Read(ctx, p.URI)
-	if err != nil {
-		return nil, internalErr(err)
+	if tmpl, fn, vars, ok := s.resourceRegistry.MatchTemplate(p.URI); ok {
+		content, err := fn(ctx, &ResourceReadRequest{URI: p.URI, Vars: vars})
+		if err != nil {
+			return nil, readErr(p.URI, err)
+		}
+		return s.resourceReadResult(p.URI, tmpl.Name, tmpl.Title, tmpl.MimeType, content), nil
 	}
 
-	mimeType := res.MimeType
+	// An error, never an empty contents array: "no such resource" and "a resource that is
+	// legitimately empty" must not look the same on the wire.
+	return nil, invalidParamsErr("Unknown resource: %s", p.URI)
+}
+
+// resourceReadResult builds the resources/read result shared by the concrete and template
+// paths. uri is always the concrete URI the client asked for — for a template read that is
+// the expansion, not the template. registeredMime is whatever the Resource or
+// ResourceTemplate declared; a per-read MimeType on the content overrides it, and
+// "text/plain" is the fallback when neither says anything.
+func (s *Server) resourceReadResult(uri, name, title, registeredMime string, content ResourceContentResult) *ResourcesReadResult {
+	mimeType := registeredMime
 	if content.MimeType != "" {
 		mimeType = content.MimeType
 	}
@@ -249,13 +458,13 @@ func (s *Server) handleResourcesRead(ctx context.Context, params json.RawMessage
 		CacheableResult: NewCacheableResult(s.readTTLMs, s.cacheScope()),
 		Contents: []ResourceContent{
 			{
-				URI:      p.URI,
-				Name:     res.Name,
-				Title:    res.Title,
+				URI:      uri,
+				Name:     name,
+				Title:    title,
 				MimeType: mimeType,
 				Text:     content.Text,
 				Blob:     content.Blob,
 			},
 		},
-	}, nil
+	}
 }

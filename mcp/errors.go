@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -17,6 +18,17 @@ func invalidParamsErr(format string, args ...interface{}) *transport.RPCError {
 // is reported as isError:true in a normal result, not a JSON-RPC error) as -32603.
 func internalErr(err error) *transport.RPCError {
 	return &transport.RPCError{Code: transport.InternalError, Message: err.Error()}
+}
+
+// readErr classifies an error from a ResourceFunction or ResourceTemplateFunction. A
+// resource the handler says is absent is -32602, the same answer an unregistered URI gets —
+// "you asked about something that isn't here" is a client-side fact, not a server fault.
+// Anything else is a genuine -32603. See ErrResourceNotFound.
+func readErr(uri string, err error) *transport.RPCError {
+	if errors.Is(err, ErrResourceNotFound) {
+		return invalidParamsErr("Unknown resource: %s", uri)
+	}
+	return internalErr(err)
 }
 
 // buildUnsupportedProtocolVersionErr builds the -32022 error a request gets when it
