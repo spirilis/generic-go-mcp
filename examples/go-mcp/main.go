@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -327,6 +329,52 @@ func main() {
 		}, func(ctx context.Context) (mcp.ResourceContentResult, error) {
 			return mcp.ResourceContentResult{Text: strconv.Itoa(os.Getpid())}, nil
 		})
+
+		// Register /env/{name} as a resource *template*. The environment is an unbounded
+		// keyspace as far as the protocol is concerned — there is no useful resources/list
+		// of it — so the server advertises the shape via resources/templates/list and the
+		// client expands it locally, then reads a concrete mcp+unix:///env/PATH.
+		if err := resourceRegistry.RegisterTemplate(mcp.ResourceTemplate{
+			URITemplate: "mcp+unix:///env/{name}",
+			Name:        "Environment Variable",
+			Title:       "Environment variable",
+			Description: "The value of one environment variable of the server process",
+			MimeType:    "text/plain",
+		}, func(ctx context.Context, req *mcp.ResourceReadRequest) (mcp.ResourceContentResult, error) {
+			value, ok := os.LookupEnv(req.Vars["name"])
+			if !ok {
+				// ErrResourceNotFound, so the client gets -32602 ("no such resource")
+				// rather than -32603 ("this server is broken"). Returning empty content
+				// instead would be indistinguishable from a variable set to "".
+				return mcp.ResourceContentResult{}, fmt.Errorf(
+					"environment variable %q is not set: %w", req.Vars["name"], mcp.ErrResourceNotFound)
+			}
+			return mcp.ResourceContentResult{Text: value}, nil
+		}); err != nil {
+			logging.Error("Failed to register env resource template", "error", err)
+			os.Exit(1)
+		}
+
+		// Completion is optional and entirely the embedder's business: the library owns the
+		// completion/complete wire format, this callback owns what is actually in the
+		// keyspace. Registering it is what makes the server declare the completions
+		// capability at all.
+		if err := resourceRegistry.SetTemplateCompleter("mcp+unix:///env/{name}", mcp.CompletionFunc(
+			func(ctx context.Context, req *mcp.CompletionRequest) (mcp.CompletionResult, error) {
+				var names []string
+				for _, entry := range os.Environ() {
+					name, _, _ := strings.Cut(entry, "=")
+					if strings.HasPrefix(name, req.Value) {
+						names = append(names, name)
+					}
+				}
+				sort.Strings(names)
+				total := len(names)
+				return mcp.CompletionResult{Values: names, Total: &total}, nil
+			})); err != nil {
+			logging.Error("Failed to register env completion provider", "error", err)
+			os.Exit(1)
+		}
 
 		trans = transport.NewUnixTransport(transport.UnixTransportConfig{
 			SocketPath: cfg.Server.Unix.SocketPath,
