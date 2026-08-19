@@ -185,10 +185,9 @@ against the resource-templates work released as `v0.7.0` (`mcp/templates.go`, `m
 and the template API on `ResourceRegistry` in `mcp/resources.go`); the example above was compiled
 verbatim against the working tree.
 
-**Pending re-verification against the tag:** this skill's `go get` line was updated to `v0.7.0` when
-the work landed, but the standing rule is to cross-check from a downstream consumer's `go get` of the
-*tagged* module rather than this checkout, since a checkout can run ahead of what `go get` resolves.
-Do that once `v0.7.0` is pushed.
+Cross-checked from a downstream consumer's `go get github.com/spirilis/generic-go-mcp@v0.7.0` — the
+*tagged* module resolved through the proxy, with no `replace` directive — and not just this checkout,
+since a checkout can run ahead of what `go get` resolves. Keep doing it that way.
 
 Note that `v0.6.0` changed `StdioTransport.Stop()` from blocking until the read loop exited to
 returning immediately. Snippets written against an earlier tag that relied on `Stop()` blocking
