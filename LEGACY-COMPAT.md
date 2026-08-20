@@ -98,7 +98,8 @@ compat off restores the strict answer.
 | `initialize` naming `2026-07-28` | The same `-32601` diagnostic a bare `mcp.Server` gives a modern client calling `initialize` — pointing at `server/discover` — and mints **no** session. Never quietly downgrades a modern client into a legacy one. |
 | `notifications/initialized` | Swallowed; extends the session's idle TTL. No response, as required for a notification. |
 | `ping` | `{}`. Mandatory in these revisions, unlike the modern stack (which doesn't route it at all). |
-| `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `completion/complete` | Translated to the modern shape using the calling session's declared capabilities, forwarded to the inner handler unchanged, and downgraded back. |
+| `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `completion/complete`, `skills/list`, `skills/get`, `resources/directory/read` | Translated to the modern shape using the calling session's declared capabilities, forwarded to the inner handler unchanged, and downgraded back. |
+| `skills/list` / `skills/get` / `resources/directory/read` specifics | The skills extension (SEP-2640) defines an identical params object regardless of era, so forwarding is all that is needed. `capabilities.extensions` reaches the legacy handshake too, because `buildInitializeResult` rebuilds capabilities through the typed `mcp.ServerCapabilities`, which has a field for it — a legacy client that understands the extension can use it, one that does not ignores an unknown key. A server with no `SkillRegistry` answers all three with the inner stack's `-32601`. See known limitation 7 below. |
 | `resources/templates/list` / `completion/complete` specifics | Both predate 2026-07-28 and share an identical params object across eras, so forwarding is all that is needed. A server with no `CompletionProvider` registered answers `completion/complete` with the inner stack's `-32601`, which passes straight through — the same "unsupported" signal a legacy client probes for. |
 | everything else (including `resources/subscribe`/`unsubscribe`) | `-32601` — the correct answer for a capability the handshake never declared. |
 
@@ -110,12 +111,15 @@ refused.
 
 Legacy result shapes are the modern ones minus the envelope: `tools/list` becomes
 `{tools, nextCursor?}`, `tools/call` becomes `{content, isError?}`, `resources/read` becomes
-`{contents}`, `resources/templates/list` becomes `{resourceTemplates, nextCursor?}`. `resultType`,
+`{contents}`, `resources/templates/list` becomes `{resourceTemplates, nextCursor?}`, `skills/list`
+becomes `{skills, nextCursor?}`, and `skills/get` becomes `{skill}`. `resultType`,
 `ttlMs`, `cacheScope`, and `_meta` are stripped rather than translated — they're inventions of the
 2026-07-28 envelope with no legacy equivalent.
 
 Downgrading is generic key-stripping on the raw JSON result, not a per-method translation, which is
-why a new result type needs no new downgrade code.
+why a new result type needs no new downgrade code. It strips only the four **top-level** keys and
+never descends, which is what lets a skill's per-entry `frontmatter` and per-file `digest` cross the
+boundary untouched.
 
 **MRTR (`input_required`) cannot be downgraded.** A client on a revision without it has no way to
 answer and retry — that mechanism requires a bidirectional request channel these transports no longer
@@ -175,6 +179,13 @@ minted.
    through unchanged. Clients on those revisions are expected to accept `-32602` as well; this
    applies to reads of both concrete resources and resource-template members.
 
+7. **The skills extension is forwarded, but it is experimental on both sides of the boundary.**
+   SEP-2640 is an unmerged proposal, the `extensions` capability mechanism itself postdates every
+   revision this overlay serves, and no public client consumes either. Forwarding it costs nothing —
+   a legacy client that does not understand the key ignores it — but do not read "it works over the
+   overlay" as "a 2025-11-25 client out there will use it". A server that never sets
+   `ServerConfig.Skills` exposes none of this in either era.
+
 **Nothing about the tools changes between eras.** Same registry, same schemas, same data, same auth.
 Only the envelope differs — "legacy mode" is not a degraded mode.
 
@@ -191,7 +202,10 @@ in already proves for every pre-existing test in this repository.
   lifecycle, capability propagation, result downgrading, MRTR refusal, advertised-version
   consistency, and the resource-template surface (`resources/templates/list` and template reads
   downgraded correctly, `completion/complete` with and without a provider, the `-32602` note above,
-  and a templates-only registry still declaring `resources` at handshake).
+  and a templates-only registry still declaring `resources` at handshake), plus the skills surface
+  (`skills/list`/`skills/get`/`resources/directory/read` forwarded and downgraded with frontmatter
+  and digests intact, `capabilities.extensions` surviving the handshake, and all three answering
+  `-32601` when the inner server has no skill registry).
 - `transport/http_compat_test.go` — the HTTP binding: header-validation exemptions, unknown-session
   handling, the standalone GET stream's two exit conditions, DELETE teardown, and CORS.
 - `mcp/conformance_test.go` and the pre-existing `transport/http_test.go` passing **unchanged** is

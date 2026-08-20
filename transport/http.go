@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,10 @@ import (
 
 	"github.com/spirilis/generic-go-mcp/logging"
 )
+
+// defaultMaxBodyBytes bounds a POST /mcp body when HTTPTransportConfig.MaxBodyBytes is
+// unset, matching the stdio framing's per-message ceiling (transport/stream.go).
+const defaultMaxBodyBytes = 16 << 20 // 16 MiB
 
 // AuthProvider is the subset of an authentication service that HTTPTransport needs to
 // register OAuth routes and gate /mcp behind a token check. Declaring it here — rather
@@ -109,6 +114,11 @@ type HTTPTransportConfig struct {
 	// Typically supplied by a compatibility layer wrapping the MessageHandler passed to
 	// Start (e.g. compat.Overlay.LegacySessions()).
 	LegacySessions LegacySessions
+
+	// MaxBodyBytes caps a single POST /mcp request body, so one oversized request cannot
+	// exhaust memory in io.ReadAll. Zero selects defaultMaxBodyBytes (16 MiB); a negative
+	// value disables the cap entirely (unbounded — not recommended on an exposed listener).
+	MaxBodyBytes int64
 }
 
 // HTTPTransport implements Transport using the stateless Streamable HTTP binding
@@ -144,6 +154,9 @@ func NewHTTPTransport(config HTTPTransportConfig) *HTTPTransport {
 	}
 	if config.Port == 0 {
 		config.Port = 8080
+	}
+	if config.MaxBodyBytes == 0 {
+		config.MaxBodyBytes = defaultMaxBodyBytes
 	}
 
 	authService := config.AuthService
@@ -188,6 +201,14 @@ func (t *HTTPTransport) Start(handler MessageHandler) error {
 	t.server = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", t.config.Host, t.config.Port),
 		Handler: mux,
+		// Bound how long a client may take to send its request, so a slow-loris client
+		// cannot tie up a connection indefinitely. WriteTimeout is deliberately left unset:
+		// a subscriptions/listen response is a long-lived SSE stream, and a write deadline
+		// would sever it. Body size is bounded separately (MaxBodyBytes), and the stream's
+		// own keep-alive guards idle intermediaries.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	t.wg.Add(1)
@@ -545,8 +566,16 @@ func (discardResponseWriter) WriteMessage([]byte) error                   { retu
 
 // handlePost handles POST requests, the only operation this transport defines.
 func (t *HTTPTransport) handlePost(w http.ResponseWriter, r *http.Request) {
+	if t.config.MaxBodyBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, t.config.MaxBodyBytes)
+	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeHTTPError(w, http.StatusRequestEntityTooLarge, nil, InvalidRequest, "Request body too large")
+			return
+		}
 		writeHTTPError(w, http.StatusBadRequest, nil, ParseError, "Failed to read request body")
 		return
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/spirilis/generic-go-mcp/logging"
 	"github.com/spirilis/generic-go-mcp/transport"
 )
 
@@ -15,9 +16,13 @@ func invalidParamsErr(format string, args ...interface{}) *transport.RPCError {
 }
 
 // internalErr wraps an unexpected Go error (as opposed to a tool execution error, which
-// is reported as isError:true in a normal result, not a JSON-RPC error) as -32603.
+// is reported as isError:true in a normal result, not a JSON-RPC error) as -32603. The
+// underlying detail is logged rather than put on the wire: an internal failure's message
+// can carry implementation detail (paths, upstream addresses, query fragments) a client has
+// no business seeing. Enable debug logging to see it.
 func internalErr(err error) *transport.RPCError {
-	return &transport.RPCError{Code: transport.InternalError, Message: err.Error()}
+	logging.Debug("internal error", "error", err)
+	return &transport.RPCError{Code: transport.InternalError, Message: "Internal error"}
 }
 
 // readErr classifies an error from a ResourceFunction or ResourceTemplateFunction. A

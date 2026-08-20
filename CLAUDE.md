@@ -12,9 +12,12 @@ Roots, Sampling, and MCP's own Logging utility are deprecated upstream in this r
 implemented here; Prompts are not yet implemented (see that document's "Out of scope" section).
 Parameterized resources **are** implemented: RFC 6570 resource templates via
 `resources/templates/list`, matched back to a concrete URI on `resources/read`, plus an opt-in
-`completion/complete` provider for narrowing a template variable — see "Resource Templates" below. An
-optional `compat` package (off by default) can additionally serve clients still on 2025-11-25 or
-earlier alongside this native 2026-07-28 support — see [LEGACY-COMPAT.md](LEGACY-COMPAT.md).
+`completion/complete` provider for narrowing a template variable — see "Resource Templates" below.
+The `io.modelcontextprotocol/skills` extension (SEP-2640) is implemented as an explicitly
+**experimental, opt-in** surface: `skills/list`, `skills/get`, and `resources/directory/read`, off
+entirely unless `ServerConfig.Skills` is set — see "Skills" below. An optional `compat` package (off
+by default) can additionally serve clients still on 2025-11-25 or earlier alongside this native
+2026-07-28 support — see [LEGACY-COMPAT.md](LEGACY-COMPAT.md).
 
 ## Build Commands
 
@@ -149,8 +152,12 @@ everywhere else in this file. See [LEGACY-COMPAT.md](LEGACY-COMPAT.md).
 - Legacy session lifecycle (handshake, TTL, teardown) — the modern stack has none
 - Translating a legacy request into the modern wire shape and forwarding it to the inner handler
   unchanged, then downgrading the result back (stripping `resultType`/`ttlMs`/`cacheScope`/`_meta`).
-  Resource templates and `completion/complete` predate 2026-07-28 and share an identical params
-  object across eras, so they are forwarded like any other method
+  Resource templates, `completion/complete`, and the skills extension's three methods
+  (`skills/list`, `skills/get`, `resources/directory/read`) are all era-neutral and share an
+  identical params object across eras, so they are forwarded like any other method. Downgrading does
+  not descend into nested values, so a skill's frontmatter and per-file digests survive untouched,
+  and `capabilities.extensions` reaches the legacy handshake because `mcp.ServerCapabilities` has a
+  typed field for it
 - Refusing MRTR (`input_required`) results visibly to legacy clients, which have no way to answer one
 
 ### Auth Layer (`auth/`)
@@ -201,8 +208,11 @@ protocol logic. Implementations:
 `UserFromContext`), not `*auth.AuthService`. `auth.AuthService` satisfies it (see the compile-time
 assertion in `auth/middleware.go`), so passing one just works, but `transport` — and therefore
 `mcp`, which depends on `transport` — never pulls in `auth`'s BoltDB dependency. A consumer
-importing only `mcp` + `transport` (stdio, or unauthenticated HTTP) gets a pure-stdlib dependency
-graph. When wiring this up, only assign `AuthService` when auth is actually enabled: an
+importing only `mcp` + `transport` (stdio, or unauthenticated HTTP) therefore gets a dependency
+graph of `transport` (pure standard library) plus one library: `gopkg.in/yaml.v3`, which `mcp`
+imports for `SkillRegistry.LoadFS` to parse `SKILL.md` frontmatter. It was already a direct module
+dependency by way of `config`, so nothing new enters `go.mod`, but `mcp` is no longer stdlib-only.
+When wiring this up, only assign `AuthService` when auth is actually enabled: an
 unconditionally-assigned nil `*auth.AuthService` is a typed nil that reads as non-nil through the
 interface (`NewHTTPTransport` also guards against this defensively, but callers should get it
 right rather than lean on that).
@@ -360,6 +370,46 @@ content is never the right way to say "not found".
 See `mcp/templates.go`, `mcp/completion.go`, and the template API on `ResourceRegistry` in
 `mcp/resources.go`.
 
+### Skills (EXPERIMENTAL — SEP-2640)
+
+`examples/go-mcp/main.go`'s UNIX-socket mode embeds `examples/go-mcp/skills/` and hands it to
+`SkillRegistry.LoadFS`, which is what makes that server declare the
+`io.modelcontextprotocol/skills` extension and answer `skills/list`, `skills/get`, and (because it
+also sets `SkillsDirectoryRead`) `resources/directory/read`.
+
+**This tracks an unmerged proposal.** SEP-2640 is Extensions Track, open, written here against head
+`641d1eb` (2026-08-20). Nothing about skills is in the ratified 2026-07-28 spec and no public client
+consumes it yet. Every exported symbol in `mcp/skills.go` carries an `EXPERIMENTAL:` doc comment
+naming the SEP and that commit, so drift is visible in `go doc`. The single most important design
+property is that `ServerConfig.Skills == nil` means *nothing changes*: no capability key, no method
+answering anything but `-32601`.
+
+Two rules from the SEP that the code must never soften:
+
+1. **`skill://` is not privileged.** A server MAY serve skills under any scheme native to its domain,
+   so nothing inspects or requires a scheme.
+2. **Skill-ness is established only by `skills/list`/`skills/get`.** The library must never
+   synthesize a skill entry by scanning the resource registry for a URI shape.
+
+Key behaviors: a skill's files ARE resources, registered through the same `ResourceRegistry`, so
+`resources/read` serves them and registration fires the ordinary
+`notifications/resources/list_changed` — once per skill, not once per file, via the unexported
+`ResourceRegistry.mutateBatch`. Digests are derived from the bytes, never supplied by a caller, so
+the published `sha256:` and what `resources/read` returns cannot drift. The last path segment of a
+skill's URI must equal its frontmatter `name`. Nested skills publish flat and share files with the
+enclosing skill, which is why `SkillRegistry` refcounts file URIs. `skills/get` falls back to an
+optional `SkillResolver` for unenumerable catalogs (that resolver owns its own digests and must be
+paired with a `ResourceTemplate` to keep the files readable). `resources/directory/read` derives
+direct children lexically from registered resource URIs rather than bookkeeping directories, so it
+is scheme-agnostic and cannot go stale; a directory with no registered descendants and one that
+never existed both answer `-32602`. `skills/get`'s cache envelope is this library's choice — the SEP
+leaves it open. SEP-2640 defines no skills notification and none is invented here, which does leave a
+real gap: a client that cached `skills/list` cannot learn a skill's frontmatter changed while its
+file set stayed identical.
+
+See `mcp/skills.go` (types, registry, loader, handlers), `DirectoryChildren` and `mutateBatch` in
+`mcp/resources.go`, and the `Skills` / `SkillsDirectoryRead` fields on `ServerConfig`.
+
 ## Project Structure
 
 ```
@@ -372,6 +422,7 @@ generic-go-mcp/
 ├── compat/               # PUBLIC: Optional legacy (2025-11-25 and earlier) compatibility overlay
 ├── examples/             # Example implementations
 │   ├── go-mcp/           # Example MCP server application
+│   │   └── skills/       # Embedded demonstration skill (SEP-2640, UNIX-socket mode)
 │   └── tools/            # Reference tool implementations (date, fortune, confirm_delete/MRTR)
 ├── CLAUDE.md             # This file
 └── go.mod                # Go module definition

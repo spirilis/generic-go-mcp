@@ -10,6 +10,9 @@ description: |
   tools, RFC 6570 resource templates (resources/templates/list) for
   parameterized resources over unbounded keyspaces plus the optional
   completion/complete provider for narrowing a template variable,
+  the experimental opt-in skills extension (SEP-2640: skills/list,
+  skills/get, resources/directory/read, and SkillRegistry.LoadFS over an
+  embed.FS of SKILL.md directories),
   mutating the tool/resource catalog at runtime and pushing change
   notifications to clients (subscriptions/listen, list_changed,
   resources/updated), the optional compat.Overlay for serving legacy
@@ -20,7 +23,9 @@ description: |
   tool or resource to an existing generic-go-mcp server, exposing a
   parameterized/templated resource family (URIs with variables, e.g. one
   pod or one row per URI), adding autocompletion for a resource template
-  variable, picking a transport, wiring OAuth, registering or unregistering
+  variable, serving Agent Skills over MCP (SKILL.md frontmatter, sha256
+  digests, skill:// or any other scheme), picking a transport, wiring
+  OAuth, registering or unregistering
   tools/resources while the server is running, notifying clients that a tool
   list or a resource's content changed, debugging "missing required _meta
   field" or "missing required header" errors, or a client that can't get
@@ -42,13 +47,17 @@ one thing from this file, remember that — it's the failure mode you'll hit fir
 ## Get the module
 
 ```bash
-go get github.com/spirilis/generic-go-mcp@v0.7.0
+go get github.com/spirilis/generic-go-mcp@v0.8.0
 ```
 
+Skills (SEP-2640) landed in `v0.8.0`; everything on this page is in `v0.8.0`.
+
 Import weight depends on what you use:
-- `mcp` + `transport` alone (stdio or unauthenticated HTTP) → **pure standard library**, nothing else.
+- `transport` alone → **pure standard library**, nothing else.
+- `mcp` → adds `gopkg.in/yaml.v3`, which `SkillRegistry.LoadFS` uses to parse `SKILL.md`
+  frontmatter. Nothing else, and nothing transitive.
 - `auth` → adds `go.etcd.io/bbolt` (token storage) and `golang.org/x/sys`.
-- `config` → adds `gopkg.in/yaml.v3`. You don't need it; it's an optional convenience for YAML-file
+- `config` → also `gopkg.in/yaml.v3`. You don't need it; it's an optional convenience for YAML-file
   config. A CLI tool with flags, or a hardcoded config struct, works just as well.
 
 ## Minimal stdio server
@@ -130,8 +139,10 @@ correct for a deployed HTTP one.
 | `RequestStateKey` | **random per process** | Signs MRTR `requestState`. Set it explicitly on HTTP, or retries break across restarts and replicas — see `references/transports-and-auth.md` |
 | `PrincipalFromContext` | empty principal | Binds `requestState` to the caller so one user's confirmation can't be replayed by another — see `references/mrtr-and-resources.md` |
 | `DefaultCacheScope` | `"public"` | Set `"private"` when the catalog or resource content varies per user (i.e. whenever auth is on) |
-| `ListTTLMs` | `300000` (5 min) | `ttlMs` cache hint on `server/discover`, `tools/list`, `resources/list`, `resources/templates/list` |
+| `ListTTLMs` | `300000` (5 min) | `ttlMs` cache hint on `server/discover`, `tools/list`, `resources/list`, `resources/templates/list`, `skills/list`, `skills/get` |
 | `ReadTTLMs` | `0` (always refetch) | `ttlMs` cache hint on `resources/read` |
+| `Skills` | `nil` | A `*mcp.SkillRegistry` turns on the experimental `io.modelcontextprotocol/skills` extension. `nil` means the extension does not exist at all — see `references/mrtr-and-resources.md` |
+| `SkillsDirectoryRead` | `false` | Opts into `resources/directory/read`; reported as the extension's `directoryRead` setting. Ignored when `Skills` is `nil` |
 
 `ListTTLMs`/`ReadTTLMs` are `*int64`, so `0` and "unset" are distinguishable — take the address of a
 variable to set them.
@@ -173,19 +184,25 @@ curl recipes for exercising a running server by hand.
 |---|---|
 | Define a tool's schema, handler signature, content/error conventions | `references/tool-authoring.md` |
 | Choose stdio vs UNIX socket vs Streamable HTTP; wire optional GitHub OAuth; serve legacy (pre-2026-07-28) clients via `compat.Overlay` | `references/transports-and-auth.md` |
-| Build a confirm-before-act tool (delete, send, pay), a readable resource, or a parameterized resource family (RFC 6570 templates + optional completion) | `references/mrtr-and-resources.md` |
+| Build a confirm-before-act tool (delete, send, pay), a readable resource, a parameterized resource family (RFC 6570 templates + optional completion), or serve Agent Skills over MCP (experimental, SEP-2640) | `references/mrtr-and-resources.md` |
 | Mutate the tool/resource catalog at runtime, or push change notifications to clients | `references/notifications-and-registries.md` |
 | Debug a client that can't complete its first request; header/error reference | `references/protocol-essentials.md` |
 
 ## Accuracy note for future edits to this skill
 
 Every snippet here was checked against the real source (`mcp/`, `transport/`, `auth/`, `compat/`,
-`examples/`), not written from memory of "what an MCP library usually looks like." Last verified
-against the resource-templates work released as `v0.7.0` (`mcp/templates.go`, `mcp/completion.go`,
-and the template API on `ResourceRegistry` in `mcp/resources.go`); the example above was compiled
-verbatim against the working tree.
+`examples/`), not written from memory of "what an MCP library usually looks like." Everything up to
+and including resource templates was verified against `v0.7.0` (`mcp/templates.go`,
+`mcp/completion.go`, and the template API on `ResourceRegistry` in `mcp/resources.go`); the example
+above was compiled verbatim against the working tree.
 
-Cross-checked from a downstream consumer's `go get github.com/spirilis/generic-go-mcp@v0.7.0` — the
+The **skills** material shipped in `v0.8.0`: it was verified against `mcp/skills.go`,
+`DirectoryChildren`/`mutateBatch` in `mcp/resources.go`, and `examples/go-mcp/main.go`, and driven
+end-to-end against the built example server over a UNIX socket (digests recomputed from what
+`resources/read` actually returned). It tracks SEP-2640 at head `641d1eb` (2026-08-20), which is
+**not merged** — re-read the SEP before trusting a wire shape here.
+
+Cross-checked from a downstream consumer's `go get github.com/spirilis/generic-go-mcp@v0.8.0` — the
 *tagged* module resolved through the proxy, with no `replace` directive — and not just this checkout,
 since a checkout can run ahead of what `go get` resolves. Keep doing it that way.
 

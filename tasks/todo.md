@@ -1,81 +1,42 @@
-# Parameterized Resources Engine (Resource Templates) — v0.7.0
+# Audit remediation — Skills (SEP-2640) & general codebase — DONE
 
-Plan: `/home/spirilis/.claude/plans/get-started-on-a-agile-hellman.md`
+Source: security/correctness audit (plan file take-a-look-at-encapsulated-creek.md).
 
-## Implementation
-
-- [x] `mcp/templates.go` — ResourceTemplate / ResourceReadRequest / ResourceTemplateFunction types
-- [x] `mcp/templates.go` — `compileURITemplate` matcher ({var} + terminal {+var}, stdlib only)
-- [x] `mcp/resources.go` — registry: RegisterTemplate / UnregisterTemplate / ListTemplates / HasTemplates / MatchTemplate
-- [x] `mcp/resources.go` — NotifyUpdated falls through to template matching
-- [x] `mcp/resources.go` — handleResourcesRead template dispatch + shared resourceReadResult helper
-- [x] `mcp/templates.go` — handleResourcesTemplatesList + ResourcesTemplatesListResult
-- [x] `mcp/server.go` — dispatch case + capabilities() widened to HasResources() || HasTemplates()
-- [x] `mcp/completion.go` — optional CompletionProvider, completion/complete handler, completions capability
-- [x] `compat/overlay.go` — forward resources/templates/list and completion/complete
-
-## Tests
-
-- [x] `mcp/templates_test.go` — matcher compile/match unit tests
-- [x] `mcp/conformance_test.go` — templates/list, read precedence, notifications, capability, completions
-- [x] `compat/compat_test.go` — legacy templates/list downgraded, legacy read on a template URI
-
-## Docs / examples
-
-- [x] `examples/go-mcp/main.go` — mcp+unix:///env/{name} template + completer
-- [x] `README.md`
-- [x] `LEGACY-COMPAT.md`
-- [x] `.claude/skills/generic-go-mcp-consumption/` (SKILL.md + references/mrtr-and-resources.md)
-- [x] `CLAUDE.md`
+## Fixes
+- [x] G1 (HIGH): `auth/errors.go` — removed the `http.Redirect(w, nil, …)` nil-request panic
+      (set Location directly); handle url.Parse error; reordered `handleAuthorize` so client +
+      redirect_uri are validated FIRST and reported directly (never redirect an error to an
+      unvalidated URI). Added `authErrorDirect`. Regression tests in auth/handlers_test.go.
+- [x] G2 (MED, decision=ENFORCE): `authenticateClient` verifies client_secret for confidential
+      (client_secret_post) clients in both grants; public clients (no stored secret) still pass
+      on PKCE. `verifySecret` now constant-time and live. Tests cover wrong/missing/correct.
+- [x] G3 (MED): `NewAuthService` logs a Warn when auth is enabled with an empty allowlist.
+- [x] G4 (MED): `transport/http.go` — ReadHeader/Read/Idle timeouts (WriteTimeout omitted so
+      it can't sever long-lived SSE), plus `http.MaxBytesReader` body cap (MaxBodyBytes,
+      default 16 MiB) → 413. Tests: oversized→413, within-cap→200.
+- [x] G5 (LOW): `internalErr` logs detail, returns generic "Internal error" (no raw Go text).
+- [x] S1 (LOW): SkillRegistry `digests` map + pre-mutation guard rejects two skills publishing
+      one file URI with different bytes (excludes a skill's own replacement). Tests added.
+- [x] S2 (LOW): `Register`/`Unregister` hold the registry lock through `rr.mutateBatch`, so a
+      skill is never listable before its files are readable (lock order is one-way, no deadlock).
+- [x] S3 (VLOW): `DirectoryChildren` skips empty-segment children on degenerate prefixes.
 
 ## Verification
-
-- [x] gofmt -l . clean, go vet ./..., go test ./...
-- [x] examples/go-mcp builds and answers the three end-to-end requests
-- [x] mcp-kube-baker builds against the working tree
+- [x] `gofmt -l .` clean, `go vet ./...` clean, `go test -race ./...` all green (fresh cache).
+- [x] Example server builds.
+- [x] New auth tests: denied authorize redirects (no panic); invalid redirect_uri / unknown
+      client reported directly (no open redirect); token grant enforces client_secret.
+- [x] New transport tests: oversized POST → 413 (handler not invoked); within-cap → 200.
 
 ## Review
+Nine findings from the audit addressed. The only HIGH (G1) was a confirmed nil-request panic
+that broke the entire OAuth error-redirect path and was unauthenticated-triggerable; the fix
+also closes the latent open-redirect it masked by validating redirect_uri before redirecting.
+G2 was resolved per the user's decision to enforce secrets. New tests were added for auth
+(previously untested) and for the two mechanical protections (G4 body cap, S1 digest guard).
+The skills code itself needed only low-severity hardening — the audit found it sound, and there
+is no SQL/injection surface anywhere (BoltDB key/value).
 
-All items complete. `gofmt -l .` clean, `go vet ./...` clean, `go test -race ./...` green
-(92 passing tests across `mcp` + `compat`; 44 new test functions in `mcp/templates_test.go`,
-7 new in `compat/compat_test.go`). No existing test was modified — the pre-existing suite passing
-unchanged is the evidence the modern-only posture is untouched.
-
-### What shipped
-
-- `mcp/templates.go` — `ResourceTemplate`, `ResourceReadRequest`, `ResourceTemplateFunction`,
-  `ErrResourceNotFound`, the hand-rolled RFC 6570 matcher, and `handleResourcesTemplatesList`.
-- `mcp/completion.go` — opt-in `CompletionProvider` / `CompletionFunc` and `completion/complete`.
-- `mcp/resources.go` — template registry API, `NotifyUpdated` template fallthrough, read dispatch.
-- `mcp/server.go` / `mcp/capabilities.go` — two dispatch cases, widened `resources` capability,
-  new `completions` capability.
-- `compat/overlay.go` — two methods added to the forward list (no downgrade changes needed).
-- Docs: `README.md`, `LEGACY-COMPAT.md`, `CLAUDE.md`, and three skill files.
-
-### Deviations from the approved plan
-
-1. **Added `mcp.ErrResourceNotFound`** (not in the plan). End-to-end testing showed a URI that
-   *matches* a template but names an absent member returned `-32603` (server fault) instead of
-   `-32602` (no such resource). A template claims a whole URI shape, so the handler is the only
-   thing that knows the member is missing, and it previously had no way to say so. Applies to
-   concrete `ResourceFunction`s too, for symmetry.
-2. **`RegisterTemplate` rejects a variable-free template** with "register it as a concrete Resource
-   instead" — it would otherwise be unreachable via `resources/list` and duplicate `Register`.
-3. **Template tests live in `mcp/templates_test.go`**, not appended to the 922-line
-   `mcp/conformance_test.go`. They use that file's existing package-level helpers (`call`,
-   `validMeta`, `observeDuringMutation`, `hasNotification`, `notificationParams`) unchanged.
-4. **`newTestServer` / `newTestOverlay` were left alone**; the new tests build their own fixtures,
-   so no existing assertion shifted underneath.
-
-### Known follow-ups (not blocking)
-
-- **`v0.7.0` is not tagged yet.** `SKILL.md`'s `go get` pin was bumped to `v0.7.0` and its accuracy
-  note now carries an explicit "pending re-verification against the tag" marker, per that note's own
-  rule about checking a downstream `go get` of the tagged module rather than a checkout.
-- **`mcp-kube-baker` does not currently build**, for a reason unrelated to this work: its `go.sum`
-  has zero `gopkg.in/yaml.v3` entries. Verified instead with a standalone consumer program that
-  exercises the whole new public API (`RegisterTemplate`, `SetTemplateCompleter`, `MatchTemplate`,
-  `NotifyUpdated`, `ErrResourceNotFound`, `CompletionFunc`) on a pure `mcp` + `transport` import
-  graph. A `go mod tidy` in that repo is theirs to run.
-- Out of scope by decision: `{?query}` and other RFC 6570 levels, `ref/prompt` completion (prompts
-  are unimplemented), and MRTR from `resources/read`.
+Not done (out of scope / no user request): nothing committed; no new tag; config-file plumbing
+for MaxBodyBytes was not added (the 16 MiB default protects every HTTP deployment, and the knob
+is available on HTTPTransportConfig for embedders who need it).

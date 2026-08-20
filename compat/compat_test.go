@@ -771,3 +771,151 @@ func TestLegacyHandshakeDeclaresResourcesForTemplatesOnlyRegistry(t *testing.T) 
 		t.Error("a templates-only registry did not declare the resources capability to a legacy client")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Skills extension (SEP-2640) over the legacy overlay
+// ---------------------------------------------------------------------------
+
+const legacySkillBody = "---\nname: refunds\ndescription: refund policy\nlicense: Apache-2.0\n---\n\nbody\n"
+
+// newSkillOverlay is newTestOverlay plus a skill registry, so the forwarded skills/* methods
+// have something to answer with.
+func newSkillOverlay(t *testing.T) *Overlay {
+	t.Helper()
+
+	resourceRegistry := mcp.NewResourceRegistry()
+	skills := mcp.NewSkillRegistry(resourceRegistry)
+	if err := skills.Register(mcp.SkillDef{
+		URI: "skill://refunds/SKILL.md",
+		Frontmatter: map[string]interface{}{
+			"name":        "refunds",
+			"description": "refund policy",
+			"license":     "Apache-2.0",
+		},
+		Files: map[string]mcp.SkillContent{
+			"skill://refunds/SKILL.md":          {Bytes: []byte(legacySkillBody)},
+			"skill://refunds/examples/email.md": {Bytes: []byte("# Email\n")},
+		},
+	}); err != nil {
+		t.Fatalf("register skill: %v", err)
+	}
+
+	server := mcp.NewServer(mcp.NewToolRegistry(), resourceRegistry, &mcp.ServerConfig{
+		Name:                "test-server",
+		Version:             "0.0.1",
+		AdvertisedVersions:  append([]string{mcp.ProtocolVersion}, LegacyVersions...),
+		Skills:              skills,
+		SkillsDirectoryRead: true,
+	})
+	return New(server, Config{})
+}
+
+func TestLegacyInitializeCarriesSkillsExtension(t *testing.T) {
+	o := newSkillOverlay(t)
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(context.Background(),
+		mustMarshal(t, json.RawMessage("1"), "initialize", legacyInitParams("2025-11-25", map[string]interface{}{})), bw)
+
+	var result legacyInitializeResult
+	decodeResult(t, bw.Message(), &result)
+
+	// The extensions mechanism postdates these revisions, but a legacy client that
+	// understands it can use it and one that does not ignores an unknown capability key.
+	raw, present := result.Capabilities.Extensions[mcp.SkillsExtensionID]
+	if !present {
+		t.Fatalf("legacy handshake dropped the skills extension: %s", bw.Message())
+	}
+	if string(raw) != `{"directoryRead":true}` {
+		t.Errorf("extension settings = %s, want {\"directoryRead\":true}", raw)
+	}
+}
+
+func TestLegacySkillsListForwardsAndDowngrades(t *testing.T) {
+	o := newSkillOverlay(t)
+	ctx := legacySessionContext(t, o)
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(ctx, mustMarshal(t, json.RawMessage("2"), "skills/list", map[string]interface{}{}), bw)
+
+	var result struct {
+		Skills []mcp.Skill `json:"skills"`
+	}
+	decodeResult(t, bw.Message(), &result)
+	if len(result.Skills) != 1 {
+		t.Fatalf("got %d skills, want 1: %s", len(result.Skills), bw.Message())
+	}
+
+	// Downgrading strips only top-level envelope keys and does not descend, so everything
+	// a host needs about the skill itself has to survive intact.
+	skill := result.Skills[0]
+	if skill.Frontmatter["license"] != "Apache-2.0" {
+		t.Errorf("frontmatter did not survive the downgrade: %#v", skill.Frontmatter)
+	}
+	if len(skill.Resources) != 2 {
+		t.Fatalf("resources = %#v, want both files", skill.Resources)
+	}
+	for _, res := range skill.Resources {
+		if !strings.HasPrefix(res.Digest, "sha256:") || len(res.Digest) != len("sha256:")+64 {
+			t.Errorf("digest %q did not survive the downgrade", res.Digest)
+		}
+	}
+	assertDowngraded(t, bw.Message())
+}
+
+func TestLegacySkillsGetForwardsAndDowngrades(t *testing.T) {
+	o := newSkillOverlay(t)
+	ctx := legacySessionContext(t, o)
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(ctx, mustMarshal(t, json.RawMessage("2"), "skills/get",
+		map[string]interface{}{"uri": "skill://refunds/SKILL.md"}), bw)
+
+	var result struct {
+		Skill mcp.Skill `json:"skill"`
+	}
+	decodeResult(t, bw.Message(), &result)
+	if result.Skill.URI != "skill://refunds/SKILL.md" {
+		t.Errorf("uri = %q", result.Skill.URI)
+	}
+	assertDowngraded(t, bw.Message())
+}
+
+func TestLegacyDirectoryReadForwards(t *testing.T) {
+	o := newSkillOverlay(t)
+	ctx := legacySessionContext(t, o)
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(ctx, mustMarshal(t, json.RawMessage("2"), "resources/directory/read",
+		map[string]interface{}{"uri": "skill://refunds"}), bw)
+
+	var result struct {
+		Resources []mcp.Resource `json:"resources"`
+	}
+	decodeResult(t, bw.Message(), &result)
+	if len(result.Resources) != 2 {
+		t.Fatalf("children = %#v, want SKILL.md and the examples directory", result.Resources)
+	}
+	assertDowngraded(t, bw.Message())
+}
+
+func TestLegacySkillsMethodsUnimplementedWithoutRegistry(t *testing.T) {
+	o, _, _ := newTestOverlay(t, Config{}) // no skill registry on the inner server
+	ctx := legacySessionContext(t, o)
+
+	for _, method := range []string{"skills/list", "skills/get", "resources/directory/read"} {
+		bw := transport.NewBufferedResponseWriter()
+		o.HandleMessage(ctx, mustMarshal(t, json.RawMessage("2"), method,
+			map[string]interface{}{"uri": "skill://x/SKILL.md"}), bw)
+
+		var env struct {
+			Error *transport.RPCError `json:"error"`
+		}
+		if err := json.Unmarshal(bw.Message(), &env); err != nil {
+			t.Fatalf("decode %s response: %v", method, err)
+		}
+		if env.Error == nil || env.Error.Code != transport.MethodNotFound {
+			t.Errorf("%s: want the inner -32601 to pass straight through, got %+v", method, env.Error)
+		}
+	}
+}

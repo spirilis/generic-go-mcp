@@ -3,11 +3,13 @@ package auth
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"time"
 
 	"github.com/spirilis/generic-go-mcp/config"
+	"github.com/spirilis/generic-go-mcp/logging"
 )
 
 // AuthService is the main entry point for all auth operations
@@ -37,6 +39,14 @@ func NewAuthService(cfg *config.AuthConfig) (*AuthService, error) {
 		storage:      storage,
 		githubClient: githubClient,
 		tokenService: tokenService,
+	}
+
+	// A completely empty allowlist means isUserAuthorized admits every authenticated GitHub
+	// user (see github.go). That is a legitimate configuration, but a dangerous default to
+	// hit by accident on a deployed server, so make it loud rather than silent.
+	if len(cfg.Allowlist.Users) == 0 && len(cfg.Allowlist.Orgs) == 0 && len(cfg.Allowlist.Teams) == 0 {
+		logging.Warn("auth enabled with an empty allowlist: every authenticated GitHub user will be authorized; " +
+			"set auth.allowlist.users/orgs/teams to restrict access")
 	}
 
 	// Initialize static clients from config
@@ -164,9 +174,29 @@ func hashSecret(secret string) string {
 	return hex.EncodeToString(hash[:])
 }
 
-// verifySecret checks if a secret matches a hashed value
+// verifySecret checks if a secret matches a hashed value, comparing in constant time so a
+// timing side channel can't be used to probe the stored hash.
 func verifySecret(secret, hashedSecret string) bool {
-	return hashSecret(secret) == hashedSecret
+	return subtle.ConstantTimeCompare([]byte(hashSecret(secret)), []byte(hashedSecret)) == 1
+}
+
+// authenticateClient authenticates the client presenting itself at the token endpoint.
+// It returns an empty string on success, or a human-readable error_description otherwise
+// (mapped to an OAuth "invalid_client" error by the caller).
+//
+// A client registered with a stored secret is confidential (client_secret_post) and MUST
+// present the matching secret. A client with no stored secret is public and authenticates
+// by PKCE alone (verified separately, per grant), so an empty stored secret is not a
+// bypass — it is the marker of a public client.
+func (svc *AuthService) authenticateClient(ctx context.Context, clientID, clientSecret string) string {
+	client, err := svc.storage.GetClient(ctx, clientID)
+	if err != nil || client == nil {
+		return "Unknown client"
+	}
+	if client.ClientSecret != "" && !verifySecret(clientSecret, client.ClientSecret) {
+		return "Invalid client credentials"
+	}
+	return ""
 }
 
 // validateRedirectURI checks if a redirect URI matches one of the registered URIs

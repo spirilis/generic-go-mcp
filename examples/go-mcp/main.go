@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"embed"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/signal"
 	"sort"
@@ -20,6 +22,13 @@ import (
 	"github.com/spirilis/generic-go-mcp/mcp"
 	"github.com/spirilis/generic-go-mcp/transport"
 )
+
+// skillFS carries the demonstration skill served in UNIX-socket mode. Embedding is the
+// easy case a skill catalog usually is: static content, immutable per build, digested once
+// at startup by SkillRegistry.LoadFS.
+//
+//go:embed all:skills
+var skillFS embed.FS
 
 // cliFlags holds all command-line flag values
 type cliFlags struct {
@@ -234,11 +243,33 @@ func main() {
 		advertisedVersions = append(advertisedVersions, compat.LegacyVersions...)
 	}
 
+	// Skills (SEP-2640, EXPERIMENTAL) are demonstrated in UNIX-socket mode alongside the
+	// resource template and completion provider, so the stdio and HTTP modes stay minimal.
+	// The registry has to exist before NewServer, since a nil ServerConfig.Skills is what
+	// makes the whole extension invisible: no capability key, and skills/list, skills/get,
+	// and resources/directory/read all -32601.
+	var skillRegistry *mcp.SkillRegistry
+	if cfg.Server.Mode == "unix" {
+		skillRegistry = mcp.NewSkillRegistry(resourceRegistry)
+		// fs.Sub so the embed directory name does not end up in every skill URI.
+		content, err := fs.Sub(skillFS, "skills")
+		if err != nil {
+			logging.Error("Failed to open embedded skills", "error", err)
+			os.Exit(1)
+		}
+		if err := skillRegistry.LoadFS(content, "skill://"); err != nil {
+			logging.Error("Failed to load embedded skills", "error", err)
+			os.Exit(1)
+		}
+	}
+
 	// Create MCP server
 	server := mcp.NewServer(registry, resourceRegistry, &mcp.ServerConfig{
-		Name:               serverName,
-		Version:            serverVersion,
-		AdvertisedVersions: advertisedVersions,
+		Name:                serverName,
+		Version:             serverVersion,
+		AdvertisedVersions:  advertisedVersions,
+		Skills:              skillRegistry,
+		SkillsDirectoryRead: skillRegistry != nil,
 	})
 
 	// Wrap in the legacy-compatibility overlay if enabled. handler is what actually gets

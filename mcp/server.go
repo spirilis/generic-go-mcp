@@ -63,6 +63,21 @@ type ServerConfig struct {
 	// revision it serves, so a client told "unsupported" always sees one consistent,
 	// truthful story about what the server (overlay included) actually speaks.
 	AdvertisedVersions []string
+
+	// Skills enables the io.modelcontextprotocol/skills extension when non-nil: the
+	// capability is declared in server/discover and skills/list and skills/get start
+	// answering. Leaving it nil is not a degraded mode — those methods genuinely do not
+	// exist, no capability key is emitted, and nothing else changes.
+	//
+	// EXPERIMENTAL: tracks SEP-2640, an Extensions Track proposal that is open and not
+	// merged. Wire shapes may change. See mcp/skills.go.
+	Skills *SkillRegistry
+
+	// SkillsDirectoryRead opts into resources/directory/read and is reported as the skills
+	// extension's directoryRead setting. Ignored when Skills is nil.
+	//
+	// EXPERIMENTAL: tracks SEP-2640, which is not merged.
+	SkillsDirectoryRead bool
 }
 
 // Server implements the MCP protocol (2026-07-28): a stateless request router over a
@@ -99,6 +114,8 @@ func NewServer(registry *ToolRegistry, resourceRegistry *ResourceRegistry, confi
 		cfg.ListTTLMs = config.ListTTLMs
 		cfg.ReadTTLMs = config.ReadTTLMs
 		cfg.AdvertisedVersions = config.AdvertisedVersions
+		cfg.Skills = config.Skills
+		cfg.SkillsDirectoryRead = config.SkillsDirectoryRead
 	}
 	if len(cfg.AdvertisedVersions) == 0 {
 		cfg.AdvertisedVersions = SupportedVersions
@@ -173,7 +190,32 @@ func (s *Server) capabilities() ServerCapabilities {
 	if s.resourceRegistry.hasTemplateCompleters() {
 		caps.Completions = &CompletionsCapability{}
 	}
+	if s.skillsEnabled() {
+		// Declared whenever a SkillRegistry is configured, even with nothing registered:
+		// unlike tools and resources, an empty skills/list is legitimate (a
+		// resolver-backed catalog is unenumerable by design) and the SEP says hosts MUST
+		// NOT read one as proof that a server has no skills.
+		//
+		// SEP-2640's own text says this goes in the "initialize response" because it was
+		// drafted before 2026-07-28 removed the handshake. server/discover is where
+		// capabilities live in this revision — do not "fix" this back.
+		settings, _ := json.Marshal(skillsExtensionSettings{DirectoryRead: s.config.SkillsDirectoryRead})
+		caps.Extensions = map[string]json.RawMessage{SkillsExtensionID: settings}
+	}
 	return caps
+}
+
+// skillsEnabled reports whether this server serves the io.modelcontextprotocol/skills
+// extension. It gates both the capability and the router, the same way
+// hasTemplateCompleters gates completions.
+func (s *Server) skillsEnabled() bool {
+	return s.config.Skills != nil
+}
+
+// directoryReadEnabled reports whether resources/directory/read is served. It is a setting
+// of the skills extension, so it means nothing without the extension itself.
+func (s *Server) directoryReadEnabled() bool {
+	return s.skillsEnabled() && s.config.SkillsDirectoryRead
 }
 
 // HandleMessage implements transport.MessageHandler: it parses one JSON-RPC request or
@@ -249,14 +291,34 @@ func (s *Server) HandleMessage(ctx context.Context, data []byte, w transport.Res
 		// Optional and opt-in: with no CompletionProvider attached to any template, the
 		// method genuinely does not exist here, and -32601 is the answer clients probe for.
 		if !s.resourceRegistry.hasTemplateCompleters() {
-			logging.Debug("completion/complete with no completion provider registered")
-			w.WriteMessage(transport.NewErrorResponse(req.ID, &transport.RPCError{Code: transport.MethodNotFound, Message: "Method not found"}))
+			writeMethodNotFound(w, req.ID, req.Method, "no completion provider registered")
 			return
 		}
 		result, rerr = s.handleCompletionComplete(ctx, req.Params)
+	case "skills/list":
+		// Same opt-in shape as completion/complete: without a SkillRegistry this server
+		// does not serve the skills extension, and -32601 is the honest answer.
+		if !s.skillsEnabled() {
+			writeMethodNotFound(w, req.ID, req.Method, "no skill registry configured")
+			return
+		}
+		result, rerr = s.handleSkillsList(ctx, req.Params)
+	case "skills/get":
+		if !s.skillsEnabled() {
+			writeMethodNotFound(w, req.ID, req.Method, "no skill registry configured")
+			return
+		}
+		result, rerr = s.handleSkillsGet(ctx, req.Params)
+	case "resources/directory/read":
+		// Gated a second time by the extension's directoryRead setting: a server that
+		// declares directoryRead:false must not answer this method.
+		if !s.directoryReadEnabled() {
+			writeMethodNotFound(w, req.ID, req.Method, "directory read not enabled")
+			return
+		}
+		result, rerr = s.handleResourcesDirectoryRead(ctx, req.Params)
 	default:
-		logging.Debug("JSON-RPC method not found", "method", req.Method)
-		w.WriteMessage(transport.NewErrorResponse(req.ID, &transport.RPCError{Code: transport.MethodNotFound, Message: "Method not found"}))
+		writeMethodNotFound(w, req.ID, req.Method, "")
 		return
 	}
 
@@ -275,4 +337,16 @@ func (s *Server) HandleMessage(ctx context.Context, data []byte, w transport.Res
 	}
 
 	w.WriteMessage(transport.NewSuccessResponse(req.ID, result))
+}
+
+// writeMethodNotFound answers -32601. reason, when non-empty, is logged but never sent: an
+// opt-in method that is switched off must be indistinguishable from one this server never
+// implemented, which is exactly what clients probe for.
+func writeMethodNotFound(w transport.ResponseWriter, id json.RawMessage, method, reason string) {
+	if reason != "" {
+		logging.Debug("JSON-RPC method not found", "method", method, "reason", reason)
+	} else {
+		logging.Debug("JSON-RPC method not found", "method", method)
+	}
+	w.WriteMessage(transport.NewErrorResponse(id, &transport.RPCError{Code: transport.MethodNotFound, Message: "Method not found"}))
 }

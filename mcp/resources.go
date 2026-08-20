@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/spirilis/generic-go-mcp/transport"
@@ -25,10 +26,18 @@ type Resource struct {
 // ResourceContentResult is what a ResourceFunction returns: exactly one of Text or Blob
 // (base64-encoded binary) should be set. MimeType, if non-empty, overrides the mime type
 // registered on the Resource for this particular read.
+//
+// Meta and Annotations are optional and reach the wire as the contents[0]._meta and
+// contents[0].annotations fields of the resources/read result. They are per-read: catalog
+// metadata belongs on the Resource (or ResourceTemplate) instead. Keys under a reserved
+// reverse-domain prefix are the specification's business, not this library's — see
+// SkillsMetaPrefix for one such use.
 type ResourceContentResult struct {
-	Text     string
-	Blob     string
-	MimeType string
+	Text        string
+	Blob        string
+	MimeType    string
+	Meta        map[string]interface{}
+	Annotations *Annotations
 }
 
 // ResourceFunction produces the content of a resource when read.
@@ -144,6 +153,45 @@ func (r *ResourceRegistry) removeLocked(uri string) bool {
 	return true
 }
 
+// mutateBatch removes every URI in remove and registers every resource in add (paired
+// positionally with fns) under a single lock, firing notifications/resources/list_changed
+// at most once for the whole batch instead of once per entry.
+//
+// This exists for SkillRegistry, where one skill is many resources: a client should be told
+// the catalog changed once, not six times for one registration. Replacement semantics match
+// Register — a URI already present is swapped and moved to the end, and fires
+// notifications/resources/updated as well.
+func (r *ResourceRegistry) mutateBatch(remove []string, add []Resource, fns []ResourceFunction) bool {
+	r.mu.Lock()
+	changed := false
+	for _, uri := range remove {
+		if r.removeLocked(uri) {
+			changed = true
+		}
+	}
+	var replaced []string
+	for i, res := range add {
+		if r.removeLocked(res.URI) {
+			replaced = append(replaced, res.URI)
+		}
+		r.resources = append(r.resources, res)
+		r.functions[res.URI] = fns[i]
+		changed = true
+	}
+	notify, update := r.onChange, r.onUpdate
+	r.mu.Unlock()
+
+	if changed && notify != nil {
+		notify()
+	}
+	if update != nil {
+		for _, uri := range replaced {
+			update(uri)
+		}
+	}
+	return changed
+}
+
 // List returns all registered resources
 func (r *ResourceRegistry) List() []Resource {
 	r.mu.RLock()
@@ -182,6 +230,73 @@ func (r *ResourceRegistry) HasResources() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.resources) > 0
+}
+
+// DirectoryChildren returns the direct children of dirURI, reporting whether dirURI names
+// a directory at all. It backs resources/directory/read.
+//
+// The answer is derived lexically from the URIs of registered concrete resources rather
+// than from any directory bookkeeping: a resource whose URI begins with dirURI+"/" is a
+// descendant, its next path segment names the child, and a descendant further down
+// collapses into a synthesized "inode/directory" entry for that segment. Nothing has to be
+// kept in step with anything, and the method works for any scheme — the specification is
+// explicit that directory reads are not skill-exclusive.
+//
+// File children are the registered Resource with Name replaced by the child's own segment,
+// which is what a directory listing wants; resources/list keeps the fuller, disambiguating
+// name. Resource template members are not consulted: a template describes an unbounded
+// keyspace, so its members are not enumerable and a directory of them does not exist.
+//
+// One consequence of deriving rather than bookkeeping: a directory with no registered
+// descendants is indistinguishable from one that was never there, and both report false —
+// which resources/directory/read answers with -32602.
+func (r *ResourceRegistry) DirectoryChildren(dirURI string) ([]Resource, bool) {
+	dirURI = strings.TrimSuffix(dirURI, "/")
+	if dirURI == "" {
+		return nil, false
+	}
+	prefix := dirURI + "/"
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	children := make([]Resource, 0, 8)
+	seen := make(map[string]struct{})
+	for _, res := range r.resources {
+		if !strings.HasPrefix(res.URI, prefix) {
+			continue
+		}
+		rest := res.URI[len(prefix):]
+		if rest == "" {
+			continue
+		}
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			seg := rest[:i]
+			if seg == "" {
+				// A leading "/" in the remainder (e.g. a degenerate prefix like "scheme:/"
+				// against "scheme://host/…") would otherwise synthesize a nameless child.
+				continue
+			}
+			uri := prefix + seg
+			if _, dup := seen[uri]; dup {
+				continue
+			}
+			seen[uri] = struct{}{}
+			children = append(children, Resource{URI: uri, Name: displaySegment(seg), MimeType: mimeTypeDirectory})
+			continue
+		}
+		if _, dup := seen[res.URI]; dup {
+			continue
+		}
+		seen[res.URI] = struct{}{}
+		child := res
+		child.Name = displaySegment(rest)
+		children = append(children, child)
+	}
+	if len(children) == 0 {
+		return nil, false
+	}
+	return children, true
 }
 
 // RegisterTemplate adds a resource template and the function that reads one concrete member
@@ -458,12 +573,14 @@ func (s *Server) resourceReadResult(uri, name, title, registeredMime string, con
 		CacheableResult: NewCacheableResult(s.readTTLMs, s.cacheScope()),
 		Contents: []ResourceContent{
 			{
-				URI:      uri,
-				Name:     name,
-				Title:    title,
-				MimeType: mimeType,
-				Text:     content.Text,
-				Blob:     content.Blob,
+				URI:         uri,
+				Name:        name,
+				Title:       title,
+				MimeType:    mimeType,
+				Text:        content.Text,
+				Blob:        content.Blob,
+				Annotations: content.Annotations,
+				Meta:        content.Meta,
 			},
 		},
 	}

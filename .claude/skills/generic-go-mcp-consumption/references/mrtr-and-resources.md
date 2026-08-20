@@ -246,3 +246,113 @@ Note that most hosts today will not exercise templates: resources are *applicati
 decides how to surface them), while tools are *model*-driven. If the model needs to look something
 up mid-reasoning, give it a **tool** — implement templates for the linkable, citable surface, not as
 a replacement for a lookup tool.
+
+## Skills over MCP (experimental, SEP-2640)
+
+**Read this first.** [SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640)
+is an Extensions Track proposal that is **open and not merged** — this library implements it against
+head `641d1eb` (2026-08-20). Nothing about skills is in the ratified 2026-07-28 specification, and
+no public client consumes it yet (Claude Code's skills are local-only; the SEP says Anthropic's
+support is prototyped internally). Everything below may change with the SEP. Every exported symbol
+carries an `EXPERIMENTAL:` doc comment naming the SEP and that commit.
+
+If what you actually want today is "let the model pull in a procedure mid-reasoning", write a
+**tool** whose description carries the catalog — that works with every client right now. The skills
+extension is the complementary thing: it lets a *host* deliberately load a skill.
+
+### What you serve
+
+A skill is a directory with a `SKILL.md` at its root ([Agent Skills
+specification](https://agentskills.io/specification)) plus supporting files. The library publishes
+each skill's frontmatter verbatim along with a `sha256` digest per file, and serves the files as
+ordinary resources.
+
+```go
+//go:embed all:skills
+var skillFS embed.FS
+
+resources := mcp.NewResourceRegistry()
+skills := mcp.NewSkillRegistry(resources) // a skill's files ARE resources
+
+content, err := fs.Sub(skillFS, "skills") // keep "skills/" out of every URI
+if err != nil {
+	log.Fatal(err)
+}
+if err := skills.LoadFS(content, "skill://"); err != nil {
+	log.Fatal(err) // bad frontmatter, a name that doesn't match its directory, ...
+}
+
+server := mcp.NewServer(tools, resources, &mcp.ServerConfig{
+	Skills:              skills, // nil (the default) means the extension does not exist
+	SkillsDirectoryRead: true,   // opt into resources/directory/read
+})
+```
+
+That is the whole integration. `LoadFS` walks the filesystem, parses and validates frontmatter,
+computes digests over raw bytes, and registers every file as a readable resource.
+
+**Never hand-maintain a digest**, and note that the API gives you no way to: `SkillRegistry` derives
+every digest from the same bytes `resources/read` returns. `Register(mcp.SkillDef{...})` is the
+non-filesystem path and takes `Files map[string]mcp.SkillContent` — bytes in, digests out.
+
+### The rules that bite
+
+- **The last path segment must equal the frontmatter `name`.** `skill://acme/billing/refunds/SKILL.md`
+  needs `name: refunds`. Segments before it are a free organizational prefix.
+- **`name` is `[a-z0-9]` in single-hyphen-separated groups, 1–64 chars**, and must match the
+  directory name. `description` is required, non-empty, ≤ 1024 chars. `compatibility` ≤ 500.
+  Everything else in the frontmatter is passed through **verbatim and uninterpreted** — including
+  `allowed-tools`, which is a host consent matter the SEP says hosts MUST ignore for MCP-origin
+  skills. Do not build server behavior on it.
+- **The `skill://` scheme is not privileged.** `github://owner/repo/skills/refunds/SKILL.md` works
+  identically. Correspondingly, registering a `skill://` resource straight on the `ResourceRegistry`
+  does **not** make it a skill — skill-ness comes only from `skills/list` / `skills/get`.
+- **Nested skills publish flat.** A skill directory may contain further skills; the nested skill's
+  files appear in the enclosing skill's `resources` list *and* the nested skill is listed as an
+  ordinary top-level entry. Unregistering one leaves files the other still publishes readable.
+- **Registration fires the ordinary `notifications/resources/list_changed`** — once per skill, not
+  once per file. SEP-2640 defines no skills-specific notification, so a client that cached
+  `skills/list` has no way to learn a skill's frontmatter changed while its file set did not.
+
+### Catalogs too big to list
+
+`skills/get` must answer for skills `skills/list` never returned. Attach a resolver, consulted only
+when a registered lookup misses:
+
+```go
+skills.SetResolver(func(ctx context.Context, uri string) (mcp.Skill, bool, error) {
+	fm, files, ok := generateSkill(ctx, uri)
+	if !ok {
+		return mcp.Skill{}, false, nil // -> -32602, not a fabricated entry
+	}
+	return mcp.Skill{URI: uri, Frontmatter: fm, Resources: files}, true, nil
+})
+```
+
+A resolver returns the wire shape directly, so **it owns digest correctness**, and nothing is
+registered on the `ResourceRegistry` on its behalf — pair it with a `ResourceTemplate` over the same
+URI namespace or the files will not be readable. Omitting `Resources` entirely is legal for a
+dynamically generated skill (hosts MAY decline to load one).
+
+### `resources/directory/read`
+
+A second opt-in (`SkillsDirectoryRead`), reported as the extension's `directoryRead` setting. It
+lists the *direct* children of a directory in the resource namespace, marking subdirectories
+`inode/directory`. Children are derived lexically from registered resource URIs, so there is nothing
+to keep in step and it is scheme-agnostic rather than skill-only. A directory with no registered
+descendants is indistinguishable from one that never existed — both `-32602`. It paginates like
+`resources/list`.
+
+### Checking your work by hand
+
+```bash
+# the extension shows up only when ServerConfig.Skills is non-nil
+... server/discover | jq '.result.capabilities.extensions'
+# {"io.modelcontextprotocol/skills":{"directoryRead":true}}
+
+# the invariant worth automating: published digest == sha256 of what resources/read returns
+... skills/list | jq -r '.result.skills[].resources[] | .uri'
+```
+
+With `ServerConfig.Skills` left `nil`, `server/discover` has no `extensions` key and all three
+methods answer `-32601` — the probe a client uses to detect an unimplemented extension.

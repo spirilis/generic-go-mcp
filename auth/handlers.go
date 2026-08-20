@@ -53,7 +53,21 @@ func (svc *AuthService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 	codeChallengeMethod := params.Get("code_challenge_method")
 	resource := params.Get("resource") // RFC 8707
 
-	// Validate required parameters
+	// Validate the client and redirect_uri FIRST, and report their failures directly rather
+	// than by redirecting. A redirect target is only trustworthy once it has been matched
+	// against the client's registered set; redirecting an error to an unvalidated URI would
+	// be an open redirect that leaks the error to an attacker-controlled destination.
+	client, err := svc.storage.GetClient(r.Context(), clientID)
+	if err != nil || client == nil {
+		svc.authErrorDirect(w, "invalid_client", "Unknown client_id")
+		return
+	}
+	if !svc.validateRedirectURI(client, redirectURI) {
+		svc.authErrorDirect(w, "invalid_request", "Invalid redirect_uri")
+		return
+	}
+
+	// redirect_uri is now trusted: subsequent errors are delivered to it per OAuth 2.1.
 	if responseType != "code" {
 		svc.authError(w, redirectURI, "unsupported_response_type",
 			"Only 'code' response_type is supported", state)
@@ -63,19 +77,6 @@ func (svc *AuthService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 	// Validate PKCE (MANDATORY in OAuth 2.1)
 	if err := ValidateCodeChallenge(codeChallenge, codeChallengeMethod); err != nil {
 		svc.authError(w, redirectURI, "invalid_request", err.Error(), state)
-		return
-	}
-
-	// Validate client
-	client, err := svc.storage.GetClient(r.Context(), clientID)
-	if err != nil || client == nil {
-		svc.authError(w, redirectURI, "invalid_client", "Unknown client_id", state)
-		return
-	}
-
-	// Validate redirect_uri
-	if !svc.validateRedirectURI(client, redirectURI) {
-		svc.authError(w, redirectURI, "invalid_request", "Invalid redirect_uri", state)
 		return
 	}
 
@@ -226,8 +227,17 @@ func (svc *AuthService) handleAuthCodeGrant(w http.ResponseWriter, r *http.Reque
 	code := r.FormValue("code")
 	redirectURI := r.FormValue("redirect_uri")
 	clientID := r.FormValue("client_id")
+	clientSecret := r.FormValue("client_secret")
 	codeVerifier := r.FormValue("code_verifier")
 	resource := r.FormValue("resource") // RFC 8707
+
+	// Authenticate the client. A client registered with a secret (confidential,
+	// client_secret_post) MUST present the matching secret; a public client — one with no
+	// stored secret — relies on PKCE alone.
+	if rerr := svc.authenticateClient(r.Context(), clientID, clientSecret); rerr != "" {
+		svc.tokenError(w, "invalid_client", rerr)
+		return
+	}
 
 	// Get authorization code
 	authCode, err := svc.storage.GetAuthCode(r.Context(), code)
@@ -301,6 +311,13 @@ func (svc *AuthService) handleAuthCodeGrant(w http.ResponseWriter, r *http.Reque
 func (svc *AuthService) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 	refreshTokenStr := r.FormValue("refresh_token")
 	clientID := r.FormValue("client_id")
+	clientSecret := r.FormValue("client_secret")
+
+	// Authenticate the client before honoring the refresh (see handleAuthCodeGrant).
+	if rerr := svc.authenticateClient(r.Context(), clientID, clientSecret); rerr != "" {
+		svc.tokenError(w, "invalid_client", rerr)
+		return
+	}
 
 	// Get refresh token
 	refreshToken, err := svc.storage.GetRefreshToken(r.Context(), refreshTokenStr)

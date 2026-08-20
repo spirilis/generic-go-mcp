@@ -137,9 +137,13 @@ rationale, the hard-cutover decisions, and a worked wire-to-Go-types example.
 - **Parameterized Resources** - RFC 6570 resource templates (`resources/templates/list`) for
   unbounded keyspaces no `resources/list` could enumerate, with optional `completion/complete`
   to help clients narrow a template variable
+- **Skills (experimental)** - Opt-in support for the `io.modelcontextprotocol/skills` extension
+  (SEP-2640): `skills/list`, `skills/get`, and `resources/directory/read`, with a loader that turns
+  an `embed.FS` of skill directories into a digest-correct catalog. Off unless you configure it
 - **Production Ready** - BoltDB token storage, HMAC-signed MRTR request state, graceful shutdown
-- **Dependency-Free Core** - `mcp` and `transport` import nothing beyond the Go standard library
-  (and each other); `auth` (BoltDB) and `config` (YAML) are opt-in, pulled in only if you import them
+- **Small Dependency Surface** - `transport` imports nothing beyond the Go standard library; `mcp`
+  adds only `gopkg.in/yaml.v3` (for parsing skill frontmatter). `auth` (BoltDB) is opt-in, pulled in
+  only if you import it
 
 ## Using this library from another project
 
@@ -233,6 +237,7 @@ generic-go-mcp/
 ├── compat/               # Optional legacy (2025-11-25 and earlier) compatibility overlay
 ├── examples/
 │   ├── go-mcp/           # Complete example server application
+│   │   └── skills/       # Embedded demonstration skill (SEP-2640, UNIX-socket mode)
 │   └── tools/            # Reference tools (date, fortune, confirm_delete/MRTR)
 ├── CLAUDE-new-project-harness.md  # Comprehensive getting started guide
 ├── CLAUDE.md             # Architecture and design patterns
@@ -370,8 +375,9 @@ one connection, so `HandleMessage` takes a `context.Context` and a `ResponseWrit
 returning a single buffered response.
 
 `transport` does not import `auth`: `HTTPTransportConfig.AuthService` is the small
-`transport.AuthProvider` interface, so a server using only `mcp` + `transport` stays pure-stdlib.
-Assign it only when auth is actually enabled — an unconditionally-assigned nil `*auth.AuthService`
+`transport.AuthProvider` interface, so a server using only `mcp` + `transport` never pulls in
+BoltDB. (`transport` itself is pure stdlib; `mcp` adds `gopkg.in/yaml.v3`, which the skills loader
+needs to parse `SKILL.md` frontmatter.) Assign it only when auth is actually enabled — an unconditionally-assigned nil `*auth.AuthService`
 is a typed nil that reads as non-nil through the interface.
 
 ### Tool and Resource Registries
@@ -505,6 +511,91 @@ resources.SetTemplateCompleter("mcp+kubectl://{context}/pod/{namespace}/{name}",
 Back it with a prefix index or a paged upstream query; never materialize the keyspace, since not
 fitting in memory is why the template exists. The server truncates `Values` to the spec's 100-value
 ceiling and sets `hasMore` if it had to.
+
+### Skills (experimental)
+
+**Status: opt-in and unstable.** This implements [SEP-2640, the Skills
+Extension](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640) — an
+Extensions Track proposal that is **open and not merged**, written here against head `641d1eb`
+(2026-08-20). Nothing about skills appears in the ratified 2026-07-28 specification, and **no
+public client consumes it yet**: Claude Code's skills are local-only (`~/.claude/skills`, project
+directories, plugins, claude.ai sync) with no `skill://` support, and SEP-2640 says Anthropic's
+own support is prototyped internally. Wire shapes may change. Adopt it to be ready, not to be
+consumed today.
+
+A *skill* is a directory holding a `SKILL.md` with YAML frontmatter, plus any supporting files.
+Serving one over MCP lets a host load a procedure written against **your** tools rather than
+generic advice. The library's job is the catalog: publishing each skill's frontmatter verbatim
+along with a sha256 digest per file, and serving those files as ordinary resources.
+
+```go
+//go:embed all:skills
+var skillFS embed.FS
+
+resources := mcp.NewResourceRegistry()
+skills := mcp.NewSkillRegistry(resources)
+
+content, _ := fs.Sub(skillFS, "skills") // keep the embed directory out of the URIs
+if err := skills.LoadFS(content, "skill://"); err != nil {
+    log.Fatal(err)
+}
+
+server := mcp.NewServer(tools, resources, &mcp.ServerConfig{
+    Skills:              skills, // nil (the default) disables the whole extension
+    SkillsDirectoryRead: true,   // opt into resources/directory/read
+})
+```
+
+`LoadFS` walks the filesystem, parses and validates frontmatter, computes digests over raw bytes,
+and registers every file as a readable resource. That single call is the point of the API: a
+hand-maintained digest rots silently, and this one cannot — `SkillRegistry` derives digests from
+the same bytes `resources/read` returns and offers no way to supply one.
+
+Registering a skill (or a whole `LoadFS`) fires the ordinary
+`notifications/resources/list_changed`, once per skill rather than once per file. SEP-2640 defines
+no skills-specific notification, so none is invented here.
+
+**Validation**, from the [Agent Skills specification](https://agentskills.io/specification), applied
+at registration:
+
+| Field | Rule |
+|---|---|
+| `name` | required, 1–64 chars, `[a-z0-9]` in single-hyphen-separated groups, and equal to the skill directory's name |
+| `description` | required, non-empty, ≤ 1024 chars |
+| `compatibility` | optional, ≤ 500 chars |
+| everything else | passed through verbatim and uninterpreted |
+
+`allowed-tools` is deliberately in that last row. It is a host-side consent matter that SEP-2640
+says hosts MUST ignore for MCP-origin skills absent explicit per-skill approval, so this library
+must not act on it.
+
+Things worth knowing:
+
+- **The `skill://` scheme is not privileged.** A server MAY serve skills under any scheme native to
+  its domain (`github://owner/repo/skills/refunds/SKILL.md`), and everything works identically.
+- **Skill-ness is established only by `skills/list` and `skills/get`.** Registering a `skill://`
+  resource directly on the `ResourceRegistry` does *not* make it a skill, and this library never
+  scans for a URI shape to invent one.
+- **The last path segment must equal the frontmatter `name`.** `skill://acme/billing/refunds/SKILL.md`
+  needs `name: refunds`; the segments before it are a free organizational prefix.
+- **Nested skills publish flat.** A skill directory may contain further skills; the nested skill's
+  files also appear in the enclosing skill's `resources` list, and the nested skill is listed as an
+  ordinary top-level entry. Unregistering one leaves files the other still publishes readable.
+- **`skills/get` answers for URIs `skills/list` never returned.** Attach a `SkillResolver` for a
+  catalog too large or too dynamic to enumerate; it is consulted only when a registered lookup
+  misses, and pair it with a `ResourceTemplate` so the files stay readable.
+- **`skills/get`'s cache envelope is this library's call, not the spec's.** SEP-2640 defines `ttlMs`
+  and `cacheScope` for `skills/list` and leaves `skills/get` open; a single entry gets the same
+  hints with the same list TTL.
+
+`resources/directory/read` is a separate opt-in (`SkillsDirectoryRead`) reported as the extension's
+`directoryRead` setting. It lists the direct children of a directory in the resource namespace,
+derived lexically from registered resource URIs — nothing to keep in step, and it is
+scheme-agnostic rather than skill-exclusive. A directory with no registered descendants is
+indistinguishable from one that never existed, and both answer `-32602`.
+
+With `ServerConfig.Skills` left nil there is no `extensions` key in `server/discover` and all three
+methods answer `-32601` — the same probe clients use to detect an unimplemented extension.
 
 ### Change Notifications
 

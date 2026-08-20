@@ -244,3 +244,50 @@ func TestNotificationBeforeResultUpgradesToSSE(t *testing.T) {
 		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
 	}
 }
+
+// G4: a POST body larger than MaxBodyBytes is rejected with 413 rather than read unbounded.
+func TestOversizedBodyRejected(t *testing.T) {
+	called := false
+	tr := NewHTTPTransport(HTTPTransportConfig{MaxBodyBytes: 1024})
+	tr.handler = &fakeHandler{fn: func(ctx context.Context, data []byte, w ResponseWriter) {
+		called = true
+		w.WriteMessage(NewSuccessResponse(json.RawMessage(`1`), struct{}{}))
+	}}
+
+	big := strings.Repeat("a", 4096)
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"pad":"%s",%s}}`, big, validMetaJSON)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set(ProtocolVersionHeader, "2026-07-28")
+	req.Header.Set(MethodHeader, "tools/list")
+
+	resp := doRequest(tr, req)
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+	if called {
+		t.Error("handler was invoked for an oversized body; it should have been rejected first")
+	}
+}
+
+// A body within the cap still flows through to the handler.
+func TestBodyWithinCapIsAccepted(t *testing.T) {
+	called := false
+	tr := NewHTTPTransport(HTTPTransportConfig{MaxBodyBytes: 1 << 20})
+	tr.handler = &fakeHandler{fn: func(ctx context.Context, data []byte, w ResponseWriter) {
+		called = true
+		w.WriteMessage(NewSuccessResponse(json.RawMessage(`1`), struct{}{}))
+	}}
+
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{%s}}`, validMetaJSON)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set(ProtocolVersionHeader, "2026-07-28")
+	req.Header.Set(MethodHeader, "tools/list")
+
+	resp := doRequest(tr, req)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if !called {
+		t.Error("handler was not invoked for a body within the cap")
+	}
+}
