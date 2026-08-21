@@ -170,6 +170,40 @@ A disallowed `Origin` gets `403 Forbidden`.
 | Unknown tool/resource name | 200 | `-32602` (never the retired `-32002`) |
 | Tool execution failure | 200 | not a JSON-RPC error — `isError: true` in the result, so the model can see and self-correct |
 
+## Serving your own endpoints alongside `/mcp`
+
+This transport builds and owns its `http.ServeMux` and `http.Server`, so an embedder cannot mount
+`/mcp` onto a router of its own. `HTTPTransportConfig.ExtraRoutes` is the seam for the endpoints
+that need to share the listener anyway — Kubernetes liveness/readiness probes, a Docker
+`HEALTHCHECK`, a metrics scrape:
+
+```go
+tr := transport.NewHTTPTransport(transport.HTTPTransportConfig{
+    Host: "0.0.0.0",
+    Port: 8080,
+    ExtraRoutes: func(mux *http.ServeMux) {
+        mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+            w.Write([]byte(`{"status":"healthy"}`))
+        })
+        mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+            w.Write([]byte(`{"status":"ready"}`))
+        })
+    },
+})
+```
+
+The hook runs **before** `/mcp` and any auth routes are registered, so a pattern collision panics at
+startup instead of silently shadowing an endpoint the protocol depends on. That means the embedder
+must not claim `/mcp`, and — when `AuthService` is set — must not claim `/authorize`, `/token`,
+`/callback`, `/register`, `/admin/` or `/.well-known/` either.
+
+Routes registered here are **not** behind the auth middleware: that wraps `/mcp` alone. A health
+endpoint should stay unauthenticated (a probe has no token), but do not use this hook for anything
+that needs protecting.
+
+Leaving `ExtraRoutes` nil is byte-for-byte the behavior this transport had before the field
+existed — an unmatched path is a plain `404`.
+
 ## Legacy compatibility overlay
 
 Everything above describes this transport with `HTTPTransportConfig.LegacySessions` left unset (the

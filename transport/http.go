@@ -119,6 +119,18 @@ type HTTPTransportConfig struct {
 	// exhaust memory in io.ReadAll. Zero selects defaultMaxBodyBytes (16 MiB); a negative
 	// value disables the cap entirely (unbounded — not recommended on an exposed listener).
 	MaxBodyBytes int64
+
+	// ExtraRoutes, if non-nil, is called with this transport's mux before /mcp and any auth
+	// routes are registered, so an embedder can serve its own endpoints — health and
+	// readiness probes, metrics — from the same listener without owning the http.Server.
+	// This transport builds and keeps its own mux, so without this hook those endpoints have
+	// nowhere to live.
+	//
+	// Registering "/mcp" here is undefined behavior: Start registers it afterwards, and
+	// http.ServeMux panics on a duplicate pattern. The auth routes registered after this hook
+	// would panic the same way, so an embedder must not claim /authorize, /token, /callback,
+	// /register, /admin/ or /.well-known/ either when AuthService is set.
+	ExtraRoutes func(mux *http.ServeMux)
 }
 
 // HTTPTransport implements Transport using the stateless Streamable HTTP binding
@@ -179,11 +191,18 @@ func NewHTTPTransport(config HTTPTransportConfig) *HTTPTransport {
 	}
 }
 
-// Start begins the HTTP server
-func (t *HTTPTransport) Start(handler MessageHandler) error {
-	t.handler = handler
-
+// buildMux assembles the routes this transport serves. It is separate from Start so the
+// routing table can be exercised without binding a listener.
+//
+// Ordering is deliberate: embedder-supplied routes go on first, so a pattern that collides
+// with /mcp or an auth route panics here — at startup, loudly — rather than silently
+// shadowing an endpoint the protocol depends on.
+func (t *HTTPTransport) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
+
+	if t.config.ExtraRoutes != nil {
+		t.config.ExtraRoutes(mux)
+	}
 
 	// Register auth endpoints if auth is enabled
 	if t.authService != nil {
@@ -198,9 +217,16 @@ func (t *HTTPTransport) Start(handler MessageHandler) error {
 		mux.HandleFunc("/mcp", t.handleMCP)
 	}
 
+	return mux
+}
+
+// Start begins the HTTP server
+func (t *HTTPTransport) Start(handler MessageHandler) error {
+	t.handler = handler
+
 	t.server = &http.Server{
 		Addr:    fmt.Sprintf("%s:%d", t.config.Host, t.config.Port),
-		Handler: mux,
+		Handler: t.buildMux(),
 		// Bound how long a client may take to send its request, so a slow-loris client
 		// cannot tie up a connection indefinitely. WriteTimeout is deliberately left unset:
 		// a subscriptions/listen response is a long-lived SSE stream, and a write deadline

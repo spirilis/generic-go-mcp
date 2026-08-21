@@ -291,3 +291,52 @@ func TestBodyWithinCapIsAccepted(t *testing.T) {
 		t.Error("handler was not invoked for a body within the cap")
 	}
 }
+
+func TestExtraRoutesAreServedAlongsideMCP(t *testing.T) {
+	tr := NewHTTPTransport(HTTPTransportConfig{
+		ExtraRoutes: func(mux *http.ServeMux) {
+			mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"status":"healthy"}`))
+			})
+		},
+	})
+	tr.handler = &fakeHandler{fn: func(ctx context.Context, data []byte, w ResponseWriter) {
+		w.WriteMessage(NewSuccessResponse(json.RawMessage(`1`), map[string]string{"ok": "true"}))
+	}}
+	mux := tr.buildMux()
+
+	// The embedder's route is reachable.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/health status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != `{"status":"healthy"}` {
+		t.Errorf("/health body = %q", got)
+	}
+
+	// ...and /mcp still works alongside it.
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{%s}}`, validMetaJSON)
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set(ProtocolVersionHeader, "2026-07-28")
+	req.Header.Set(MethodHeader, "tools/list")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/mcp status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+func TestNilExtraRoutesLeavesRoutingUnchanged(t *testing.T) {
+	tr := newTestTransport(&fakeHandler{})
+	mux := tr.buildMux()
+
+	// Nothing but /mcp is registered, so an unrelated path is a plain 404 — the same
+	// behavior this transport had before ExtraRoutes existed.
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("/health status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
