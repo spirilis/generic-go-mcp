@@ -6,6 +6,8 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"strings"
 	"time"
 
 	"github.com/spirilis/generic-go-mcp/config"
@@ -18,12 +20,28 @@ type AuthService struct {
 	storage      Storage
 	githubClient *GitHubClient
 	tokenService *TokenService
+
+	// trustedClients are the client IDs pre-registered in config. The operator vetted their
+	// redirect URIs, so they skip the consent screen. Membership is deliberately not
+	// RegisteredClient.IsStatic: /admin/clients sets that too, for clients no operator reviewed.
+	trustedClients map[string]bool
+
+	// allowedRedirectHosts is config.RegistrationConfig.AllowedRedirectHosts, normalized. Empty
+	// means /register accepts any redirect host.
+	allowedRedirectHosts map[string]bool
 }
 
 // NewAuthService creates a new authentication service
 func NewAuthService(cfg *config.AuthConfig) (*AuthService, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("auth config is required")
+	}
+
+	// Validate before opening storage, so a bad entry fails startup without leaving the database
+	// open.
+	allowedHosts, err := normalizeRedirectHosts(cfg.Registration.AllowedRedirectHosts)
+	if err != nil {
+		return nil, err
 	}
 
 	storage, err := NewBoltStorage(cfg.Storage.DBPath)
@@ -35,10 +53,12 @@ func NewAuthService(cfg *config.AuthConfig) (*AuthService, error) {
 	tokenService := NewTokenService(cfg.Issuer, storage)
 
 	svc := &AuthService{
-		config:       cfg,
-		storage:      storage,
-		githubClient: githubClient,
-		tokenService: tokenService,
+		config:               cfg,
+		storage:              storage,
+		githubClient:         githubClient,
+		tokenService:         tokenService,
+		trustedClients:       make(map[string]bool, len(cfg.Clients)),
+		allowedRedirectHosts: allowedHosts,
 	}
 
 	// A completely empty allowlist means isUserAuthorized admits every authenticated GitHub
@@ -51,6 +71,7 @@ func NewAuthService(cfg *config.AuthConfig) (*AuthService, error) {
 
 	// Initialize static clients from config
 	for _, client := range cfg.Clients {
+		svc.trustedClients[client.ClientID] = true
 		err := svc.storage.StoreClient(context.Background(), &RegisteredClient{
 			ClientID:                client.ClientID,
 			ClientSecret:            hashSecret(client.ClientSecret),
@@ -166,6 +187,42 @@ type PendingAuthRequest struct {
 	Resource            string    `json:"resource,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 	ExpiresAt           time.Time `json:"expires_at"`
+}
+
+// PendingConsent is an authorization that has passed GitHub login and the allowlist, parked
+// until the user approves or denies the requesting client on the consent screen.
+type PendingConsent struct {
+	ID string `json:"id"`
+
+	// BindingHash is the SHA-256 of the consent cookie set on the browser that was shown the
+	// consent screen. The approval must come back from that same browser.
+	BindingHash string `json:"binding_hash"`
+
+	UserID    string             `json:"user_id"`
+	Request   PendingAuthRequest `json:"request"`
+	ExpiresAt time.Time          `json:"expires_at"`
+}
+
+// normalizeRedirectHosts validates config.RegistrationConfig.AllowedRedirectHosts and returns it
+// as a lowercase set. Entries must be bare hostnames. A URL, a host:port or a path is rejected
+// rather than silently never matching: an allowlist that matches nothing would lock out every
+// client, and one that was meant to be narrower than it is would pass review unnoticed.
+func normalizeRedirectHosts(hosts []string) (map[string]bool, error) {
+	set := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		host := strings.ToLower(strings.TrimSpace(h))
+		host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]") // "[::1]" -> "::1"
+		switch {
+		case host == "":
+			return nil, fmt.Errorf("auth.registration.allowedRedirectHosts: empty entry")
+		case strings.ContainsAny(host, "/?#@"),
+			strings.Contains(host, ":") && net.ParseIP(host) == nil:
+			return nil, fmt.Errorf("auth.registration.allowedRedirectHosts: %q must be a bare hostname "+
+				"(e.g. \"claude.ai\" or \"localhost\"), with no scheme, port or path", h)
+		}
+		set[host] = true
+	}
+	return set, nil
 }
 
 // hashSecret hashes a secret using SHA-256

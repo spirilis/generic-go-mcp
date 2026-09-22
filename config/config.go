@@ -69,6 +69,22 @@ type AuthConfig struct {
 	Storage   StorageConfig   `yaml:"storage"`           // Token/session/client storage config
 	Allowlist AllowlistConfig `yaml:"allowlist"`         // Authorization allowlist
 	Clients   []StaticClient  `yaml:"clients,omitempty"` // Pre-configured static clients
+
+	// Registration constrains RFC 7591 dynamic client registration at /register.
+	Registration RegistrationConfig `yaml:"registration,omitempty"`
+}
+
+// RegistrationConfig constrains which clients may register themselves at /register.
+type RegistrationConfig struct {
+	// AllowedRedirectHosts, when non-empty, restricts the redirect_uris a self-registering
+	// client may declare to these hostnames — compared case-insensitively, with any port and
+	// path accepted. Entries are bare hostnames ("claude.ai", "localhost", "::1"), not URLs.
+	//
+	// Empty leaves registration open. The consent screen shown before a self-registered
+	// client first receives an authorization code is then what stops a client registered to
+	// an attacker's host from harvesting codes; this list is a second, stricter layer for
+	// deployments whose client population is known in advance.
+	AllowedRedirectHosts []string `yaml:"allowedRedirectHosts,omitempty"`
 }
 
 // GitHubConfig represents GitHub OAuth provider configuration

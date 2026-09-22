@@ -319,6 +319,9 @@ auth:
     teams:
       - org: "my-company"
         team: "platform-team"   # team slug, not display name
+  # Optional: only these hosts may appear in a self-registered client's redirect_uris.
+  # registration:
+  #   allowedRedirectHosts: ["claude.ai", "localhost", "127.0.0.1"]
 
 logging:
   level: "info"
@@ -330,6 +333,30 @@ struct tags in `config/config.go`. There is no `redirect_url` key: the callback 
 with GitHub is always `<issuer>/callback`. See
 [config-oauth-example.yaml](config-oauth-example.yaml) for the fully annotated version, including
 pre-registered static clients.
+
+#### The consent screen
+
+Dynamic client registration at `<issuer>/register` is open, as RFC 7591 intends, and GitHub skips its
+own approval prompt for an OAuth app the user has already authorized. Together those would let
+anyone register a client whose `redirect_uri` is their own host and harvest a working authorization
+code from an allowlisted user who merely follows a link — the confused-deputy problem the MCP
+security guidance describes. So after GitHub sign-in and the allowlist check, the first time a user
+authorizes a client the operator did not list under `auth.clients`, the server shows a consent screen
+on the issuer's own origin. It names the client, the signed-in GitHub login, and the host the
+browser will be sent to. The approval is remembered per user and client, so it costs one click per
+new client, not one per sign-in.
+
+The screen cannot be framed, and it is bound to the browser that started the sign-in by a one-shot
+`SameSite=Strict` cookie (`__Host-mcp_consent` on an https issuer). Clients listed in `auth.clients`
+skip it, since the operator vetted their redirect URIs. Clients created through `/admin/clients` do
+not skip it.
+
+For a deployment whose clients are known in advance, `auth.registration.allowedRedirectHosts`
+additionally limits the hosts a self-registered client may name. Entries are bare hostnames,
+compared case-insensitively with any port and path accepted, and a malformed entry fails startup.
+Regardless of that setting, `/register` always rejects non-absolute URIs, fragments, and the
+`javascript:`, `data:`, `vbscript:`, `file:`, `blob:` and `about:` schemes. Native-app custom schemes
+are allowed (RFC 8252).
 
 ## Documentation
 

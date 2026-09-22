@@ -67,3 +67,15 @@ auth:
       name: "Custom MCP Client"
       redirectUris:
         - "https://app.example.com/oauth/callback"
+
+  # Dynamic client registration (RFC 7591) at <issuer>/register is always on. A self-registered
+  # client must be approved by each user on a consent screen before it first receives a code.
+  # Clients listed under `clients` above skip that screen.
+  #
+  # Optionally, restrict which hosts a self-registered client may use as its redirect_uri.
+  # Entries are bare hostnames (no scheme, port or path), compared case-insensitively.
+  # registration:
+  #   allowedRedirectHosts:
+  #     - "claude.ai"
+  #     - "localhost"
+  #     - "127.0.0.1"

@@ -2,8 +2,10 @@ package auth
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -26,6 +28,9 @@ func (svc *AuthService) RegisterRoutes(mux *http.ServeMux) {
 
 	// GitHub OAuth callback
 	mux.HandleFunc("/callback", svc.handleGitHubCallback)
+
+	// Consent screen submission (see consent.go)
+	mux.HandleFunc("/consent", svc.handleConsent)
 }
 
 // handleAuthorize handles the authorization endpoint (GET and POST)
@@ -174,32 +179,9 @@ func (svc *AuthService) handleGitHubCallback(w http.ResponseWriter, r *http.Requ
 	}
 	svc.storage.StoreUser(r.Context(), user)
 
-	// Generate authorization code
-	authCode, err := svc.tokenService.GenerateAuthorizationCode(
-		authReq.ClientID,
-		authReq.RedirectURI,
-		authReq.Scope,
-		authReq.CodeChallenge,
-		authReq.CodeChallengeMethod,
-		authReq.Resource,
-		user.ID,
-	)
-	if err != nil {
-		svc.authError(w, authReq.RedirectURI, "server_error",
-			"Failed to generate authorization code", authReq.State)
-		return
-	}
-
-	// Redirect back to client with authorization code
-	redirectURL, _ := url.Parse(authReq.RedirectURI)
-	q := redirectURL.Query()
-	q.Set("code", authCode.Code)
-	if authReq.State != "" {
-		q.Set("state", authReq.State)
-	}
-	redirectURL.RawQuery = q.Encode()
-
-	http.Redirect(w, r, redirectURL.String(), http.StatusFound)
+	// Straight back to the client if it is pre-registered or already approved by this user;
+	// otherwise via the consent screen.
+	svc.grantOrAskConsent(w, r, authReq, user)
 }
 
 // handleToken handles the token endpoint
@@ -379,6 +361,12 @@ func (svc *AuthService) handleClientRegistration(w http.ResponseWriter, r *http.
 		svc.registrationError(w, "invalid_redirect_uri", "redirect_uris is required")
 		return
 	}
+	for _, uri := range req.RedirectURIs {
+		if problem := svc.checkRegisteredRedirectURI(uri); problem != "" {
+			svc.registrationError(w, "invalid_redirect_uri", problem)
+			return
+		}
+	}
 
 	// Generate client credentials
 	clientID, clientSecret := GenerateClientCredentials()
@@ -421,6 +409,31 @@ func (svc *AuthService) handleClientRegistration(w http.ResponseWriter, r *http.
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(resp)
+}
+
+// checkRegisteredRedirectURI vets a redirect_uri offered at /register, returning a description
+// of the problem or "" if it is acceptable.
+//
+// Always enforced: an absolute URI with no fragment (RFC 6749 §3.1.2), and none of the schemes
+// that execute or read locally instead of navigating. Custom schemes stay allowed, since native
+// apps use them (RFC 8252). The host allowlist applies only when configured.
+func (svc *AuthService) checkRegisteredRedirectURI(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() {
+		return fmt.Sprintf("redirect_uri %q is not an absolute URI", raw)
+	}
+	if u.Fragment != "" || strings.Contains(raw, "#") {
+		return fmt.Sprintf("redirect_uri %q must not contain a fragment", raw)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "javascript", "data", "vbscript", "file", "blob", "about":
+		return fmt.Sprintf("redirect_uri scheme %q is not permitted", u.Scheme)
+	}
+	if len(svc.allowedRedirectHosts) > 0 && !svc.allowedRedirectHosts[strings.ToLower(u.Hostname())] {
+		return fmt.Sprintf("redirect_uri host %q is not permitted by this server's registration policy",
+			u.Hostname())
+	}
+	return ""
 }
 
 // TokenResponse is the OAuth token endpoint response

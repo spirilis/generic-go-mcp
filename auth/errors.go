@@ -15,6 +15,11 @@ var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrUserNotFound       = errors.New("user not found")
 	ErrSessionNotFound    = errors.New("session not found")
+
+	// Pending-consent outcomes (see Storage.TakePendingConsent).
+	ErrConsentNotFound        = errors.New("consent request not found")
+	ErrConsentExpired         = errors.New("consent request expired")
+	ErrConsentBindingMismatch = errors.New("consent request was started in a different browser")
 )
 
 // OAuthError represents an OAuth error response per RFC 6749

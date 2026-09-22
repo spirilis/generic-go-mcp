@@ -165,6 +165,9 @@ Implements authentication and authorization for HTTP/SSE mode.
 
 **Components:**
 - GitHub OAuth 2.0 Authorization Code flow
+- Per-client consent screen (`auth/consent.go`) before a client the operator did not list in
+  `auth.clients` first receives a code. It closes the open-registration confused-deputy hole: see
+  the README's "The consent screen".
 - Token persistence (BoltDB)
 - Session management
 - Authentication middleware
@@ -238,11 +241,12 @@ capabilities, and (optionally) identity in `params._meta` — there is no separa
 
 ### OAuth 2.0 Authorization Code Flow
 For HTTP/SSE mode, implements GitHub OAuth:
-1. Redirect to GitHub authorization URL
-2. Handle callback with authorization code
-3. Exchange code for access token
-4. Store token securely in BoltDB
-5. Use token for API authentication
+1. `/authorize` validates the client, the exact redirect_uri and PKCE, then redirects to GitHub
+2. `/callback` exchanges GitHub's code, loads the user, and checks the allowlist
+3. Unless the client is in `auth.clients` or this user already approved it, `/consent` shows the
+   consent screen, bound to the browser by a one-shot cookie, and waits for Approve
+4. An authorization code is issued to the client's redirect_uri; `/token` redeems it with PKCE
+5. Tokens are stored in BoltDB and validated by the `/mcp` middleware
 
 ### BoltDB for Token/Session Storage
 Embedded key-value store for persisting:

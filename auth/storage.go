@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -49,6 +50,14 @@ type Storage interface {
 	GetAuthRequest(ctx context.Context, id string) (*PendingAuthRequest, error)
 	DeleteAuthRequest(ctx context.Context, id string) error
 
+	// Consent. A pending consent is an authorization that has passed GitHub login and the
+	// allowlist and is waiting on the user to approve the client; TakePendingConsent claims it
+	// exactly once, and only for the browser that holds the matching binding cookie.
+	StorePendingConsent(ctx context.Context, pc *PendingConsent) error
+	TakePendingConsent(ctx context.Context, id, bindingHash string) (*PendingConsent, error)
+	StoreConsent(ctx context.Context, userID, clientID string) error
+	HasConsent(ctx context.Context, userID, clientID string) (bool, error)
+
 	// Close
 	Close() error
 }
@@ -69,6 +78,8 @@ const (
 	BucketSessions        = "sessions"
 	BucketSessionsByToken = "sessions_by_token"
 	BucketAuthRequests    = "auth_requests"
+	BucketPendingConsents = "pending_consents"
+	BucketConsents        = "consents"
 )
 
 // NewBoltStorage creates a new BoltDB storage
@@ -84,6 +95,7 @@ func NewBoltStorage(path string) (*BoltStorage, error) {
 			BucketAuthCodes, BucketAccessTokens, BucketRefreshTokens,
 			BucketClients, BucketUsers, BucketUsersByGitHub,
 			BucketSessions, BucketSessionsByToken, BucketAuthRequests,
+			BucketPendingConsents, BucketConsents,
 		}
 		for _, bucket := range buckets {
 			if _, err := tx.CreateBucketIfNotExists([]byte(bucket)); err != nil {
@@ -426,4 +438,94 @@ func (s *BoltStorage) DeleteAuthRequest(ctx context.Context, id string) error {
 		b := tx.Bucket([]byte(BucketAuthRequests))
 		return b.Delete([]byte(id))
 	})
+}
+
+// Consent
+
+func (s *BoltStorage) StorePendingConsent(ctx context.Context, pc *PendingConsent) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(BucketPendingConsents))
+		data, err := json.Marshal(pc)
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte(pc.ID), data)
+	})
+}
+
+// TakePendingConsent claims a pending consent in one transaction: it is returned and deleted
+// only when it exists, has not expired, and bindingHash matches the one stored with it.
+//
+// A binding mismatch leaves the record in place. Otherwise anyone who learned a consent ID could
+// burn it by posting with the wrong cookie, and the legitimate browser's approval would then
+// fail. An expired record is deleted, since nothing can ever claim it.
+func (s *BoltStorage) TakePendingConsent(ctx context.Context, id, bindingHash string) (*PendingConsent, error) {
+	if id == "" {
+		return nil, ErrConsentNotFound
+	}
+
+	var pc *PendingConsent
+	expired := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(BucketPendingConsents))
+		data := b.Get([]byte(id))
+		if data == nil {
+			return ErrConsentNotFound
+		}
+
+		var rec PendingConsent
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return err
+		}
+
+		// Returning an error from Update rolls the transaction back, so the expired record's
+		// deletion is committed by returning nil and reporting expiry afterwards.
+		if time.Now().After(rec.ExpiresAt) {
+			expired = true
+			return b.Delete([]byte(id))
+		}
+		if subtle.ConstantTimeCompare([]byte(rec.BindingHash), []byte(bindingHash)) != 1 {
+			return ErrConsentBindingMismatch
+		}
+		if err := b.Delete([]byte(id)); err != nil {
+			return err
+		}
+		pc = &rec
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if expired {
+		return nil, ErrConsentExpired
+	}
+	return pc, nil
+}
+
+// consentKey is the consents bucket key for a user's grant to one client. The NUL separator
+// cannot occur in either generated identifier, so distinct pairs cannot collide.
+func consentKey(userID, clientID string) []byte {
+	return []byte(userID + "\x00" + clientID)
+}
+
+func (s *BoltStorage) StoreConsent(ctx context.Context, userID, clientID string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(BucketConsents))
+		data, err := json.Marshal(struct {
+			GrantedAt time.Time `json:"granted_at"`
+		}{GrantedAt: time.Now()})
+		if err != nil {
+			return err
+		}
+		return b.Put(consentKey(userID, clientID), data)
+	})
+}
+
+func (s *BoltStorage) HasConsent(ctx context.Context, userID, clientID string) (bool, error) {
+	granted := false
+	err := s.db.View(func(tx *bolt.Tx) error {
+		granted = tx.Bucket([]byte(BucketConsents)).Get(consentKey(userID, clientID)) != nil
+		return nil
+	})
+	return granted, err
 }

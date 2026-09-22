@@ -195,7 +195,7 @@ tr := transport.NewHTTPTransport(transport.HTTPTransportConfig{
 The hook runs **before** `/mcp` and any auth routes are registered, so a pattern collision panics at
 startup instead of silently shadowing an endpoint the protocol depends on. That means the embedder
 must not claim `/mcp`, and — when `AuthService` is set — must not claim `/authorize`, `/token`,
-`/callback`, `/register`, `/admin/` or `/.well-known/` either.
+`/callback`, `/consent`, `/register`, `/admin/` or `/.well-known/` either.
 
 Routes registered here are **not** behind the auth middleware: that wraps `/mcp` alone. A health
 endpoint should stay unauthenticated (a probe has no token), but do not use this hook for anything
