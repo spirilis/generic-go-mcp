@@ -55,3 +55,17 @@ is available on HTTPTransportConfig for embedders who need it).
 
 Known, not fixed here: `Start` sets `ReadTimeout: 30s`, and an expired read deadline cancels the request
 context once net/http's background read starts, so SSE streams under `Start` likely end after ~30s.
+
+# v0.10.1: dynamic client registration as MCP clients send it (2026-10-18)
+
+Claude Desktop's custom connector failed at `POST /register` with 400 `invalid_client_metadata` "Invalid JSON":
+`ClientRegistrationRequest.Scope` was `[]string`, but RFC 7591 §2 makes `scope` a space-separated string, and Claude
+sends one (the metadata advertises `scopes_supported`).
+
+- [x] `ScopeList`: accepts the string (and the old array form), written back as the RFC string; the response now
+      carries `scope`. A decode failure names its cause instead of "Invalid JSON".
+- [x] `token_endpoint_auth_method: "none"` (advertised in the metadata) registers a public client (no secret; PKCE is
+      mandatory at /authorize; /token already treats a secret-less client as public). Others: client_secret_post.
+- [x] `client_secret_expires_at: 0` whenever a secret is issued (RFC 7591 §3.2.1 requires it).
+- [x] Tests: Claude's registration body (fails on v0.10.0 with the production error), array scope, numeric scope,
+      public vs confidential registration and /token client authentication.

@@ -358,6 +358,11 @@ Regardless of that setting, `/register` always rejects non-absolute URIs, fragme
 `javascript:`, `data:`, `vbscript:`, `file:`, `blob:` and `about:` schemes. Native-app custom schemes
 are allowed (RFC 8252).
 
+`/register` reads RFC 7591 metadata as clients send it: `scope` is one space-separated string (an array
+is accepted too). A client asking for `token_endpoint_auth_method: "none"` is registered as a public
+client, with no secret, relying on PKCE, which `/authorize` requires of every client. Any other request
+gets `client_secret_post` and a secret, returned once with `client_secret_expires_at: 0`.
+
 ## Documentation
 
 - **[CLAUDE-new-project-harness.md](CLAUDE-new-project-harness.md)** - Complete guide to building MCP servers with this library

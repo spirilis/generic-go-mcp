@@ -404,3 +404,98 @@ func TestAllowedRedirectHostsMustBeBareHostnames(t *testing.T) {
 		}
 	}
 }
+
+// registerJSON posts a raw registration body, as a real client writes it.
+func registerJSON(t *testing.T, svc *AuthService, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	svc.handleClientRegistration(rec, req)
+	return rec
+}
+
+// TestRegistrationScopeIsAString: RFC 7591 §2 makes "scope" one space-separated string, and that
+// is what MCP clients send (Claude's connector registration carries the scopes_supported this
+// server advertises). An array is still accepted for older callers; either way the stored client
+// gets the list and the response carries the RFC string form.
+func TestRegistrationScopeIsAString(t *testing.T) {
+	svc := newConsentTestService(t, func(c *config.AuthConfig) {
+		c.Registration.AllowedRedirectHosts = []string{"claude.ai", "claude.com"}
+	})
+	for _, body := range []string{
+		// The shape of Claude's dynamic client registration, as a confidential client.
+		`{"client_name":"Claude","redirect_uris":["https://claude.ai/api/mcp/auth_callback"],
+		  "grant_types":["authorization_code","refresh_token"],"response_types":["code"],
+		  "token_endpoint_auth_method":"client_secret_post","scope":"mcp:tools mcp:resources mcp:prompts"}`,
+		`{"client_name":"old","redirect_uris":["https://claude.com/cb"],"scope":["mcp:tools","mcp:resources","mcp:prompts"]}`,
+	} {
+		rec := registerJSON(t, svc, body)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if resp["scope"] != "mcp:tools mcp:resources mcp:prompts" {
+			t.Errorf("response scope = %#v, want the space-separated string", resp["scope"])
+		}
+		if v, ok := resp["client_secret_expires_at"]; !ok || v != float64(0) {
+			t.Errorf("client_secret_expires_at = %#v, want 0 (RFC 7591 requires it with a secret)", v)
+		}
+		client, err := svc.storage.GetClient(context.Background(), resp["client_id"].(string))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Join(client.Scopes, ",") != "mcp:tools,mcp:resources,mcp:prompts" {
+			t.Errorf("stored scopes = %v", client.Scopes)
+		}
+	}
+
+	rec := registerJSON(t, svc, `{"redirect_uris":["https://claude.ai/cb"],"scope":42}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_client_metadata") ||
+		!strings.Contains(rec.Body.String(), "scope must be") {
+		t.Errorf("numeric scope: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestRegistrationPublicClient: token_endpoint_auth_method "none" (advertised in the metadata)
+// registers a public client: no secret issued or stored, and /token's client check passes without
+// one, leaving PKCE (mandatory at /authorize) to bind the code. Anything else stays confidential.
+func TestRegistrationPublicClient(t *testing.T) {
+	svc := newConsentTestService(t, func(c *config.AuthConfig) {
+		c.Registration.AllowedRedirectHosts = []string{"claude.ai"}
+	})
+	rec := registerJSON(t, svc, `{"client_name":"Claude","redirect_uris":["https://claude.ai/api/mcp/auth_callback"],
+		"grant_types":["authorization_code","refresh_token"],"response_types":["code"],
+		"token_endpoint_auth_method":"none","scope":"mcp:tools"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+	var pub map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &pub); err != nil {
+		t.Fatal(err)
+	}
+	if pub["token_endpoint_auth_method"] != "none" || pub["client_secret"] != nil || pub["client_secret_expires_at"] != nil {
+		t.Errorf("public registration response = %v", pub)
+	}
+	id := pub["client_id"].(string)
+	if msg := svc.authenticateClient(context.Background(), id, ""); msg != "" {
+		t.Errorf("public client without a secret at /token: %q", msg)
+	}
+
+	rec = registerJSON(t, svc, `{"redirect_uris":["https://claude.ai/cb"]}`)
+	var conf map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &conf); err != nil {
+		t.Fatal(err)
+	}
+	if conf["token_endpoint_auth_method"] != "client_secret_post" || conf["client_secret"] == "" || conf["client_secret"] == nil {
+		t.Fatalf("default registration response = %v", conf)
+	}
+	if msg := svc.authenticateClient(context.Background(), conf["client_id"].(string), ""); msg == "" {
+		t.Error("a confidential client passed /token's check without its secret")
+	}
+	if msg := svc.authenticateClient(context.Background(), conf["client_id"].(string), conf["client_secret"].(string)); msg != "" {
+		t.Errorf("confidential client with its secret: %q", msg)
+	}
+}

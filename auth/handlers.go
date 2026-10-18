@@ -352,7 +352,7 @@ func (svc *AuthService) handleClientRegistration(w http.ResponseWriter, r *http.
 
 	var req ClientRegistrationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		svc.registrationError(w, "invalid_client_metadata", "Invalid JSON")
+		svc.registrationError(w, "invalid_client_metadata", "Invalid client metadata: "+err.Error())
 		return
 	}
 
@@ -368,21 +368,28 @@ func (svc *AuthService) handleClientRegistration(w http.ResponseWriter, r *http.
 		}
 	}
 
-	// Generate client credentials
+	// Generate client credentials. A client asking for token_endpoint_auth_method "none" (which the
+	// metadata advertises) is a public client: no secret, PKCE alone, as /authorize requires PKCE of
+	// everyone and /token treats a client without a stored secret as public. Any other request gets
+	// client_secret_post, the one secret-based method /token accepts.
 	clientID, clientSecret := GenerateClientCredentials()
+	authMethod, storedSecret := "client_secret_post", hashSecret(clientSecret)
+	if req.TokenEndpointAuthMethod == "none" {
+		authMethod, clientSecret, storedSecret = "none", "", ""
+	}
 
 	// Create client record
 	client := &RegisteredClient{
 		ClientID:                clientID,
-		ClientSecret:            hashSecret(clientSecret),
+		ClientSecret:            storedSecret,
 		ClientName:              req.ClientName,
 		ClientURI:               req.ClientURI,
 		LogoURI:                 req.LogoURI,
 		RedirectURIs:            req.RedirectURIs,
-		Scopes:                  req.Scope,
+		Scopes:                  []string(req.Scope),
 		GrantTypes:              []string{"authorization_code", "refresh_token"},
 		ResponseTypes:           []string{"code"},
-		TokenEndpointAuthMethod: "client_secret_post",
+		TokenEndpointAuthMethod: authMethod,
 		IsStatic:                false,
 		CreatedAt:               time.Now(),
 	}
@@ -403,7 +410,12 @@ func (svc *AuthService) handleClientRegistration(w http.ResponseWriter, r *http.
 		GrantTypes:              client.GrantTypes,
 		ResponseTypes:           client.ResponseTypes,
 		TokenEndpointAuthMethod: client.TokenEndpointAuthMethod,
+		Scope:                   ScopeList(client.Scopes),
 		ClientIDIssuedAt:        client.CreatedAt.Unix(),
+	}
+	if clientSecret != "" {
+		never := int64(0)
+		resp.ClientSecretExpiresAt = &never
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -445,28 +457,55 @@ type TokenResponse struct {
 	Scope        string `json:"scope,omitempty"`
 }
 
+// ScopeList is a client's registered scope. RFC 7591 §2 defines the "scope" metadata as one
+// string of space-separated values ("mcp:tools mcp:resources"), which is what MCP clients such as
+// Claude send; a JSON array is accepted too, for callers written against the earlier []string
+// field. It is written back in the RFC form.
+type ScopeList []string
+
+// UnmarshalJSON implements json.Unmarshaler: a space-separated string or an array of strings.
+func (s *ScopeList) UnmarshalJSON(data []byte) error {
+	var str string
+	if err := json.Unmarshal(data, &str); err == nil {
+		*s = strings.Fields(str)
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal(data, &list); err != nil {
+		return fmt.Errorf("scope must be a string of space-separated values")
+	}
+	*s = list
+	return nil
+}
+
+// MarshalJSON implements json.Marshaler: one space-separated string (RFC 7591 §2).
+func (s ScopeList) MarshalJSON() ([]byte, error) { return json.Marshal(strings.Join(s, " ")) }
+
 // ClientRegistrationRequest per RFC 7591
 type ClientRegistrationRequest struct {
-	RedirectURIs            []string `json:"redirect_uris"`
-	ClientName              string   `json:"client_name,omitempty"`
-	ClientURI               string   `json:"client_uri,omitempty"`
-	LogoURI                 string   `json:"logo_uri,omitempty"`
-	Scope                   []string `json:"scope,omitempty"`
-	GrantTypes              []string `json:"grant_types,omitempty"`
-	ResponseTypes           []string `json:"response_types,omitempty"`
-	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty"`
+	RedirectURIs            []string  `json:"redirect_uris"`
+	ClientName              string    `json:"client_name,omitempty"`
+	ClientURI               string    `json:"client_uri,omitempty"`
+	LogoURI                 string    `json:"logo_uri,omitempty"`
+	Scope                   ScopeList `json:"scope,omitempty"`
+	GrantTypes              []string  `json:"grant_types,omitempty"`
+	ResponseTypes           []string  `json:"response_types,omitempty"`
+	TokenEndpointAuthMethod string    `json:"token_endpoint_auth_method,omitempty"`
 }
 
 // ClientRegistrationResponse per RFC 7591
 type ClientRegistrationResponse struct {
-	ClientID                string   `json:"client_id"`
-	ClientSecret            string   `json:"client_secret,omitempty"`
-	ClientName              string   `json:"client_name,omitempty"`
-	ClientURI               string   `json:"client_uri,omitempty"`
-	LogoURI                 string   `json:"logo_uri,omitempty"`
-	RedirectURIs            []string `json:"redirect_uris"`
-	GrantTypes              []string `json:"grant_types,omitempty"`
-	ResponseTypes           []string `json:"response_types,omitempty"`
-	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method,omitempty"`
-	ClientIDIssuedAt        int64    `json:"client_id_issued_at,omitempty"`
+	ClientID                string    `json:"client_id"`
+	ClientSecret            string    `json:"client_secret,omitempty"`
+	ClientName              string    `json:"client_name,omitempty"`
+	ClientURI               string    `json:"client_uri,omitempty"`
+	LogoURI                 string    `json:"logo_uri,omitempty"`
+	RedirectURIs            []string  `json:"redirect_uris"`
+	GrantTypes              []string  `json:"grant_types,omitempty"`
+	ResponseTypes           []string  `json:"response_types,omitempty"`
+	TokenEndpointAuthMethod string    `json:"token_endpoint_auth_method,omitempty"`
+	Scope                   ScopeList `json:"scope,omitempty"`
+	ClientIDIssuedAt        int64     `json:"client_id_issued_at,omitempty"`
+	// ClientSecretExpiresAt is required whenever a secret is issued (RFC 7591 §3.2.1); 0 = never.
+	ClientSecretExpiresAt *int64 `json:"client_secret_expires_at,omitempty"`
 }
