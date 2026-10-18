@@ -159,6 +159,11 @@ down (`204`, then a `404` on reuse); and `Mcp-Session-Id` is exposed via
 `Access-Control-Expose-Headers` so a browser client can actually read the id an `initialize` handshake
 minted.
 
+A JSON-RPC error on a legacy request is delivered in a `200` response, as the connection-scoped
+revisions expect; the 2026-07-28 error-to-status table (`-32601` → `404`, `-32602` → `400`, ...)
+applies to modern requests only. Otherwise a `404` for, say, an unadvertised method would read to a
+2025-11-25 client as "session gone" and send it back through `initialize`.
+
 ## Known limitations
 
 1. **A modern client omitting its mandatory `_meta` gets a legacy-shaped response, not `-32602`**,

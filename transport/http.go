@@ -92,6 +92,10 @@ func (r *responseRecorder) Flush() {
 	}
 }
 
+// Unwrap returns the wrapped ResponseWriter, so http.ResponseController (deadlines, flush)
+// reaches the underlying connection through the recorder.
+func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 // HTTPTransportConfig holds configuration for HTTP transport
 type HTTPTransportConfig struct {
 	Host        string
@@ -129,7 +133,8 @@ type HTTPTransportConfig struct {
 	// Registering "/mcp" here is undefined behavior: Start registers it afterwards, and
 	// http.ServeMux panics on a duplicate pattern. The auth routes registered after this hook
 	// would panic the same way, so an embedder must not claim /authorize, /token, /callback,
-	// /register, /admin/ or /.well-known/ either when AuthService is set.
+	// /register, /consent, /admin/ or /.well-known/ either when AuthService is set. An embedder
+	// that owns its own http.Server mounts Handler instead.
 	ExtraRoutes func(mux *http.ServeMux)
 }
 
@@ -208,16 +213,42 @@ func (t *HTTPTransport) buildMux() *http.ServeMux {
 	if t.authService != nil {
 		t.authService.RegisterRoutes(mux)
 		t.authService.RegisterAdminRoutes(mux)
-
-		// Wrap /mcp with auth middleware
-		mux.Handle("/mcp", t.authService.Middleware(http.HandlerFunc(t.handleMCP)))
 		logging.Info("OAuth authentication enabled")
-	} else {
-		// No auth - direct handler
-		mux.HandleFunc("/mcp", t.handleMCP)
 	}
+	mux.Handle("/mcp", t.mcpHandler())
 
 	return mux
+}
+
+// mcpHandler is the /mcp endpoint: handleMCP, behind the auth middleware when an auth
+// provider is configured.
+func (t *HTTPTransport) mcpHandler() http.Handler {
+	var h http.Handler = http.HandlerFunc(t.handleMCP)
+	if t.authService != nil {
+		h = t.authService.Middleware(h)
+	}
+	return h
+}
+
+// Handler binds handler and returns the /mcp endpoint as an http.Handler, for an embedder
+// that owns its own http.Server and mux. Mount it at exactly "/mcp" (the OAuth
+// protected-resource metadata names Issuer+"/mcp"), with no method in the pattern: the
+// endpoint answers its own 405s.
+//
+// The returned handler honors AllowedOrigins, LegacySessions, MaxBodyBytes and AuthService —
+// the last only as the middleware in front of /mcp. Host, Port and ExtraRoutes are ignored,
+// and no other route is registered: an embedder using auth registers the OAuth routes on its
+// own mux (AuthProvider.RegisterRoutes). Do not also call Start.
+//
+// The embedder's http.Server must not cut long-lived responses: a subscriptions/listen
+// response and a legacy GET stream are SSE streams that stay open. Leave WriteTimeout unset,
+// and either leave ReadTimeout unset or clear the read deadline once the request body has
+// been read — net/http cancels the request context when an expired read deadline interrupts
+// its background read. The ResponseWriter passed in should implement http.Flusher (directly
+// or by forwarding), or SSE events are not flushed as they are written.
+func (t *HTTPTransport) Handler(handler MessageHandler) http.Handler {
+	t.handler = handler
+	return t.mcpHandler()
 }
 
 // Start begins the HTTP server
@@ -657,6 +688,7 @@ func (t *HTTPTransport) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rw := newHTTPResponseWriter(w)
+	rw.legacy = legacy
 	defer rw.closeDone()
 	t.handler.HandleMessage(ctx, body, rw)
 }
@@ -672,6 +704,10 @@ type httpResponseWriter struct {
 	sse     bool
 	once    sync.Once
 	done    chan struct{}
+	// legacy marks a response to a request the compatibility layer claimed. The 2026-07-28
+	// error-to-status table does not apply to it: the connection-scoped revisions carry
+	// JSON-RPC errors in a 200 response, and a 404 there means "session gone, re-initialize".
+	legacy bool
 }
 
 func newHTTPResponseWriter(w http.ResponseWriter) *httpResponseWriter {
@@ -752,7 +788,7 @@ func (rw *httpResponseWriter) WriteMessage(data []byte) error {
 
 	if !rw.started {
 		status := http.StatusOK
-		if code, ok := rpcErrorCode(data); ok {
+		if code, ok := rpcErrorCode(data); ok && !rw.legacy {
 			status = HTTPStatusForRPCError(code)
 		}
 		rw.w.Header().Set("Content-Type", "application/json")

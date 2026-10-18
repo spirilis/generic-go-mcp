@@ -40,3 +40,18 @@ is no SQL/injection surface anywhere (BoltDB key/value).
 Not done (out of scope / no user request): nothing committed; no new tag; config-file plumbing
 for MaxBodyBytes was not added (the 16 MiB default protects every HTTP deployment, and the knob
 is available on HTTPTransportConfig for embedders who need it).
+
+# v0.10.0: mount /mcp on an embedder's own server (2026-10-17, for bin-inventory Phase 4)
+
+- [x] `HTTPTransport.Handler(handler) http.Handler`: the /mcp endpoint (auth middleware included) for an
+      embedder that owns its http.Server and mux; registers no routes; `buildMux` uses the same `mcpHandler`.
+- [x] Legacy requests' JSON-RPC errors answer HTTP 200 (the 2026-07-28 status table is modern-only; a 404
+      told 2025-11-25 clients their session was gone). Unknown-session 404 unchanged.
+- [x] `responseRecorder.Unwrap` so http.ResponseController reaches the connection through it.
+- [x] Docs: HTTP-TRANSPORT.md (mounting section, server timeout guidance, legacy status note), README,
+      LEGACY-COMPAT.md, ExtraRoutes comment lists /consent.
+- [x] Tests: Handler on an embedder mux (POST, own 405, Origin, embedder route), auth middleware only (no
+      route registration), recorder Unwrap, legacy error → 200 vs modern → 404 (fails without the fix).
+
+Known, not fixed here: `Start` sets `ReadTimeout: 30s`, and an expired read deadline cancels the request
+context once net/http's background read starts, so SSE streams under `Start` likely end after ~30s.

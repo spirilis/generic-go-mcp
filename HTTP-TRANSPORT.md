@@ -170,12 +170,19 @@ A disallowed `Origin` gets `403 Forbidden`.
 | Unknown tool/resource name | 200 | `-32602` (never the retired `-32002`) |
 | Tool execution failure | 200 | not a JSON-RPC error — `isError: true` in the result, so the model can see and self-correct |
 
+The table is the 2026-07-28 binding. With the [legacy overlay](#legacy-compatibility-overlay) on, a
+JSON-RPC error answering a request the overlay claimed travels in a `200` response instead: the
+connection-scoped revisions carry errors in the body, and a `404` there tells the client its session
+is gone and it must re-`initialize`. Only an unknown `Mcp-Session-Id` is a legacy `404`.
+
 ## Serving your own endpoints alongside `/mcp`
 
-This transport builds and owns its `http.ServeMux` and `http.Server`, so an embedder cannot mount
-`/mcp` onto a router of its own. `HTTPTransportConfig.ExtraRoutes` is the seam for the endpoints
-that need to share the listener anyway — Kubernetes liveness/readiness probes, a Docker
-`HEALTHCHECK`, a metrics scrape:
+There are two ways to share a listener with `/mcp`: let `Start` own the `http.Server` and hand it
+extra routes (`ExtraRoutes`, below), or own the server yourself and mount the endpoint `Handler`
+returns ([next section](#mounting-mcp-on-your-own-server)).
+
+`HTTPTransportConfig.ExtraRoutes` is the seam for the endpoints that need to share the transport's
+listener — Kubernetes liveness/readiness probes, a Docker `HEALTHCHECK`, a metrics scrape:
 
 ```go
 tr := transport.NewHTTPTransport(transport.HTTPTransportConfig{
@@ -203,6 +210,41 @@ that needs protecting.
 
 Leaving `ExtraRoutes` nil is byte-for-byte the behavior this transport had before the field
 existed — an unmatched path is a plain `404`.
+
+## Mounting `/mcp` on your own server
+
+An application that already runs an `http.Server` (its own REST API, a web UI, OAuth routes it
+registers itself) mounts the endpoint instead of calling `Start`:
+
+```go
+tr := transport.NewHTTPTransport(transport.HTTPTransportConfig{
+    AuthService:    authService,    // optional: its Middleware guards /mcp
+    AllowedOrigins: allowedOrigins,
+    LegacySessions: legacySessions, // optional: compat.Overlay.LegacySessions()
+})
+mux.Handle("/mcp", tr.Handler(handler)) // no method in the pattern: the endpoint answers its own 405s
+if authService != nil {
+    authService.RegisterRoutes(mux) // Handler registers nothing but what it returns
+}
+```
+
+`Handler` honors `AllowedOrigins`, `LegacySessions`, `MaxBodyBytes` and `AuthService` (as the
+middleware in front of `/mcp` only); `Host`, `Port` and `ExtraRoutes` are ignored, and `Start` must
+not also be called. Mount it at exactly `/mcp`: the OAuth protected-resource metadata names
+`Issuer + "/mcp"`.
+
+Your server's timeouts must not cut the long-lived responses — a `subscriptions/listen` response
+and a legacy `GET` stream are SSE streams that stay open:
+
+- leave `WriteTimeout` unset (or clear the write deadline per request with
+  `http.ResponseController`);
+- leave `ReadTimeout` unset, or clear the read deadline once the body has been read. When an
+  expired read deadline interrupts the background read net/http starts after the body, the server
+  cancels the request context — which ends the stream;
+- make sure any middleware `ResponseWriter` wrapper implements `http.Flusher` (forwarding to the
+  wrapped writer), or SSE events sit in the buffer;
+- an open stream ends when its request context does, so cancel long-lived requests from
+  `http.Server.RegisterOnShutdown` if `Shutdown` should finish promptly.
 
 ## Legacy compatibility overlay
 

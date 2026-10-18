@@ -329,3 +329,32 @@ func TestCORSUnchangedWhenCompatOff(t *testing.T) {
 		t.Errorf("Access-Control-Allow-Methods = %q, must not contain DELETE when compat is off", got)
 	}
 }
+
+// TestLegacyErrorsAnswer200 pins the era split in the status mapping: a JSON-RPC error on a
+// legacy request travels in a 200 response (a 404 would tell a 2025-11-25 client its session
+// is gone), while the same error on a modern request keeps the 2026-07-28 status table.
+func TestLegacyErrorsAnswer200(t *testing.T) {
+	fake := newFakeLegacySessions()
+	fake.add("sess-1")
+	tr := newTestTransportWithLegacySessions(&fakeHandler{fn: func(ctx context.Context, data []byte, w ResponseWriter) {
+		w.WriteMessage(NewErrorResponse(json.RawMessage(`1`), &RPCError{Code: MethodNotFound, Message: "Method not found"}))
+	}}, fake)
+
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{}}`))
+	req.Header.Set(SessionIDHeader, "sess-1")
+	resp := doRequest(tr, req)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("legacy error status = %d, want 200", resp.StatusCode)
+	}
+	if rerr := decodeError(t, resp); rerr == nil || rerr.Code != MethodNotFound {
+		t.Fatalf("legacy error = %+v, want code %d", rerr, MethodNotFound)
+	}
+
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{%s}}`, validMetaJSON)
+	req = httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	req.Header.Set(ProtocolVersionHeader, "2026-07-28")
+	req.Header.Set(MethodHeader, "prompts/list")
+	if resp := doRequest(tr, req); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("modern error status = %d, want 404", resp.StatusCode)
+	}
+}

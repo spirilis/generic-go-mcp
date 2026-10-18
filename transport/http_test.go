@@ -340,3 +340,131 @@ func TestNilExtraRoutesLeavesRoutingUnchanged(t *testing.T) {
 		t.Fatalf("/health status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }
+
+// fakeAuthProvider gates requests on a fixed bearer token and records route registration,
+// so a test can tell whether Handler registered anything on the embedder's behalf.
+type fakeAuthProvider struct {
+	registered bool
+}
+
+func (f *fakeAuthProvider) RegisterRoutes(*http.ServeMux)      { f.registered = true }
+func (f *fakeAuthProvider) RegisterAdminRoutes(*http.ServeMux) { f.registered = true }
+func (f *fakeAuthProvider) Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer good" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+func (f *fakeAuthProvider) UserFromContext(context.Context) (string, string, bool) {
+	return "", "", false
+}
+
+func modernToolsList(t *testing.T, url string) *http.Request {
+	t.Helper()
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{%s}}`, validMetaJSON)
+	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(ProtocolVersionHeader, "2026-07-28")
+	req.Header.Set(MethodHeader, "tools/list")
+	return req
+}
+
+// TestHandlerMountsOnEmbedderMux drives the exported Handler through a real server built
+// from the embedder's own mux: POST is served, GET is the endpoint's own 405 (compat off),
+// a foreign Origin is refused, and the embedder's other routes are untouched.
+func TestHandlerMountsOnEmbedderMux(t *testing.T) {
+	tr := NewHTTPTransport(HTTPTransportConfig{})
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", tr.Handler(&fakeHandler{fn: func(ctx context.Context, data []byte, w ResponseWriter) {
+		w.WriteMessage(NewSuccessResponse(json.RawMessage(`1`), map[string]string{"ok": "true"}))
+	}}))
+	mux.HandleFunc("/own", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusTeapot) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.DefaultClient.Do(modernToolsList(t, srv.URL+"/mcp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("POST /mcp = %d %q, want 200 application/json", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+
+	resp, err = http.Get(srv.URL + "/mcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET /mcp = %d, want 405", resp.StatusCode)
+	}
+
+	req := modernToolsList(t, srv.URL+"/mcp")
+	req.Header.Set("Origin", "https://evil.example")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("foreign Origin = %d, want 403", resp.StatusCode)
+	}
+
+	resp, err = http.Get(srv.URL + "/own")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTeapot {
+		t.Errorf("embedder route = %d, want 418", resp.StatusCode)
+	}
+}
+
+// TestHandlerAppliesAuthMiddlewareOnly: with an AuthService, Handler puts its middleware in
+// front of /mcp but registers no routes — the embedder owns its mux.
+func TestHandlerAppliesAuthMiddlewareOnly(t *testing.T) {
+	auth := &fakeAuthProvider{}
+	tr := NewHTTPTransport(HTTPTransportConfig{AuthService: auth})
+	h := tr.Handler(&fakeHandler{fn: func(ctx context.Context, data []byte, w ResponseWriter) {
+		w.WriteMessage(NewSuccessResponse(json.RawMessage(`1`), map[string]string{"ok": "true"}))
+	}})
+	if auth.registered {
+		t.Fatal("Handler must not register auth routes")
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.DefaultClient.Do(modernToolsList(t, srv.URL+"/mcp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no token = %d, want 401", resp.StatusCode)
+	}
+	req := modernToolsList(t, srv.URL+"/mcp")
+	req.Header.Set("Authorization", "Bearer good")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("good token = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestResponseRecorderUnwraps lets http.ResponseController reach the connection through
+// the recorder handleMCP wraps every response in.
+func TestResponseRecorderUnwraps(t *testing.T) {
+	inner := httptest.NewRecorder()
+	if got := newResponseRecorder(inner).Unwrap(); got != inner {
+		t.Fatalf("Unwrap() = %v, want the wrapped writer", got)
+	}
+}

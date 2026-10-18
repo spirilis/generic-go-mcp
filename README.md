@@ -401,12 +401,14 @@ Because the protocol is stateless, a transport may have several requests in flig
 one connection, so `HandleMessage` takes a `context.Context` and a `ResponseWriter` rather than
 returning a single buffered response.
 
-`HTTPTransport` owns its own `http.ServeMux` and `http.Server`, so `/mcp` cannot be mounted onto a
-router you control. `HTTPTransportConfig.ExtraRoutes func(*http.ServeMux)` is the seam for endpoints
-that need the same listener anyway — health and readiness probes, metrics. It runs before `/mcp` and
-the auth routes, so a colliding pattern panics at startup rather than shadowing the protocol
-endpoint, and the routes it adds sit outside the auth middleware. Leave it nil and routing is
-exactly what it was before the field existed. See [HTTP-TRANSPORT.md](HTTP-TRANSPORT.md).
+`HTTPTransport.Start` owns its own `http.ServeMux` and `http.Server`.
+`HTTPTransportConfig.ExtraRoutes func(*http.ServeMux)` is the seam for endpoints that need that
+listener too — health and readiness probes, metrics. It runs before `/mcp` and the auth routes, so a
+colliding pattern panics at startup rather than shadowing the protocol endpoint, and the routes it
+adds sit outside the auth middleware. Leave it nil and routing is exactly what it was before the
+field existed. An application that runs its own server instead mounts
+`HTTPTransport.Handler(handler)` at `/mcp` on its own mux (no `Start`; it registers the auth routes
+itself). See [HTTP-TRANSPORT.md](HTTP-TRANSPORT.md#mounting-mcp-on-your-own-server).
 
 `transport` does not import `auth`: `HTTPTransportConfig.AuthService` is the small
 `transport.AuthProvider` interface, so a server using only `mcp` + `transport` never pulls in
