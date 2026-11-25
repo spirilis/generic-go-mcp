@@ -213,6 +213,15 @@ content varies per user. It defaults to `"public"`, which tells intermediaries o
 See `config-oauth-example.yaml` in this repo for a full YAML config including allowlists
 (by user, GitHub org, or org/team) and static OAuth clients.
 
+**Consent screen (v0.9.0+).** `/register` is open (RFC 7591), so after GitHub sign-in and the
+allowlist check, a client that is not listed in `config.AuthConfig.Clients` must be approved by the
+user on a consent screen (`/consent`) before it first receives a code. The approval is remembered per
+user and client. Without this, anyone could register a client pointing at their own host and harvest
+codes from an allowlisted user who follows a link. For a known client population, also set
+`config.AuthConfig.Registration.AllowedRedirectHosts` (bare hostnames, e.g. `claude.ai`,
+`localhost`) to reject other redirect hosts at registration. An embedder's `ExtraRoutes` must not
+claim `/consent`.
+
 ## Deploying HTTP: set `RequestStateKey`
 
 `mcp.ServerConfig.RequestStateKey` signs the MRTR `requestState` blob. Leave it empty and
