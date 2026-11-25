@@ -29,6 +29,9 @@ type AuthService struct {
 	// allowedRedirectHosts is config.RegistrationConfig.AllowedRedirectHosts, normalized. Empty
 	// means /register accepts any redirect host.
 	allowedRedirectHosts map[string]bool
+
+	// stopSweep ends the background sweep of expired records; sweepDone closes when it has.
+	stopSweep, sweepDone chan struct{}
 }
 
 // NewAuthService creates a new authentication service
@@ -89,11 +92,13 @@ func NewAuthService(cfg *config.AuthConfig) (*AuthService, error) {
 		}
 	}
 
+	svc.startSweeper()
 	return svc, nil
 }
 
 // Close closes the auth service and releases resources
 func (svc *AuthService) Close() error {
+	svc.stopSweeper()
 	if svc.storage != nil {
 		return svc.storage.Close()
 	}

@@ -45,7 +45,11 @@ func (svc *AuthService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 	if r.Method == http.MethodGet {
 		params = r.URL.Query()
 	} else {
-		r.ParseForm()
+		r.Body = http.MaxBytesReader(w, r.Body, maxOAuthBodyBytes)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Invalid or oversized request", http.StatusBadRequest)
+			return
+		}
 		params = r.Form
 	}
 
@@ -57,6 +61,12 @@ func (svc *AuthService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 	codeChallenge := params.Get("code_challenge")
 	codeChallengeMethod := params.Get("code_challenge_method")
 	resource := params.Get("resource") // RFC 8707
+
+	// The request is stored until the GitHub callback, and anyone can send one.
+	if problem := authorizeProblem(state, scope, resource, codeChallenge, codeChallengeMethod, redirectURI); problem != "" {
+		http.Error(w, "Invalid request: "+problem, http.StatusBadRequest)
+		return
+	}
 
 	// Validate the client and redirect_uri FIRST, and report their failures directly rather
 	// than by redirecting. A redirect target is only trustworthy once it has been matched
@@ -87,7 +97,7 @@ func (svc *AuthService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 
 	// Store authorization request in pending storage and redirect to GitHub
 	authRequestID := generateSecureToken(16)
-	svc.storage.StoreAuthRequest(r.Context(), &PendingAuthRequest{
+	if err := svc.storage.StoreAuthRequest(r.Context(), &PendingAuthRequest{
 		ID:                  authRequestID,
 		ClientID:            clientID,
 		RedirectURI:         redirectURI,
@@ -98,7 +108,11 @@ func (svc *AuthService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 		Resource:            resource,
 		CreatedAt:           time.Now(),
 		ExpiresAt:           time.Now().Add(10 * time.Minute),
-	})
+	}); err != nil {
+		// Sending the user to GitHub now would only fail at the callback, with a misleading error.
+		http.Error(w, "Could not start authorization; try again later", http.StatusServiceUnavailable)
+		return
+	}
 
 	// Redirect to GitHub OAuth
 	githubCallbackURL := svc.config.Issuer + "/callback"
@@ -191,7 +205,11 @@ func (svc *AuthService) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	r.ParseForm()
+	r.Body = http.MaxBytesReader(w, r.Body, maxOAuthBodyBytes)
+	if err := r.ParseForm(); err != nil {
+		svc.tokenError(w, "invalid_request", "Invalid or oversized request")
+		return
+	}
 	grantType := r.FormValue("grant_type")
 
 	switch grantType {
@@ -350,9 +368,19 @@ func (svc *AuthService) handleClientRegistration(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Anyone can reach this endpoint: bound what it reads and what it keeps.
+	r.Body = http.MaxBytesReader(w, r.Body, maxOAuthBodyBytes)
 	var req ClientRegistrationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		svc.registrationError(w, "invalid_client_metadata", "Invalid client metadata: "+err.Error())
+		return
+	}
+	if problem := registrationProblem(&req); problem != "" {
+		svc.registrationError(w, "invalid_client_metadata", problem)
+		return
+	}
+	if n, err := svc.dynamicClientCount(r.Context()); err != nil || n >= maxDynamicClients {
+		svc.registrationError(w, "server_error", "Too many registered clients; try again later")
 		return
 	}
 

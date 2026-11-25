@@ -420,7 +420,7 @@ func (t *HTTPTransport) handleGet(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	rw := newHTTPResponseWriter(w)
-	defer rw.closeDone()
+	defer rw.finish()
 	// A standalone GET stream opens text/event-stream immediately — there is no final
 	// JSON-RPC message to wait for, unlike a request-scoped notification stream that only
 	// upgrades lazily on its first WriteNotification.
@@ -689,7 +689,7 @@ func (t *HTTPTransport) handlePost(w http.ResponseWriter, r *http.Request) {
 
 	rw := newHTTPResponseWriter(w)
 	rw.legacy = legacy
-	defer rw.closeDone()
+	defer rw.finish()
 	t.handler.HandleMessage(ctx, body, rw)
 }
 
@@ -704,6 +704,12 @@ type httpResponseWriter struct {
 	sse     bool
 	once    sync.Once
 	done    chan struct{}
+	// closed is set, under mu, once the response is finished. Every write checks it under the
+	// same lock, so nothing touches w after the handler has returned: net/http reuses the
+	// underlying writer, and a late write from the keep-alive goroutine would panic.
+	closed bool
+	// interval is the keep-alive period (tests shorten it).
+	interval time.Duration
 	// legacy marks a response to a request the compatibility layer claimed. The 2026-07-28
 	// error-to-status table does not apply to it: the connection-scoped revisions carry
 	// JSON-RPC errors in a 200 response, and a 404 there means "session gone, re-initialize".
@@ -712,12 +718,24 @@ type httpResponseWriter struct {
 
 func newHTTPResponseWriter(w http.ResponseWriter) *httpResponseWriter {
 	fl, _ := w.(http.Flusher)
-	return &httpResponseWriter{w: w, flusher: fl, done: make(chan struct{})}
+	return &httpResponseWriter{w: w, flusher: fl, done: make(chan struct{}), interval: keepAliveInterval}
 }
 
 func (rw *httpResponseWriter) closeDone() {
 	rw.once.Do(func() { close(rw.done) })
 }
+
+// finish marks the response finished and stops the keep-alive goroutine. A handler MUST call
+// it (deferred) before returning. When it returns, no goroutine is writing to w and none will.
+func (rw *httpResponseWriter) finish() {
+	rw.mu.Lock()
+	rw.closed = true
+	rw.mu.Unlock()
+	rw.closeDone()
+}
+
+// errResponseFinished is returned by a write that arrives after the response was finished.
+var errResponseFinished = errors.New("response already finished")
 
 // startSSE forces the immediate upgrade to text/event-stream, for a standalone GET stream
 // that has no final JSON-RPC response to wait for and so cannot rely on the lazy
@@ -725,7 +743,7 @@ func (rw *httpResponseWriter) closeDone() {
 func (rw *httpResponseWriter) startSSE() {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
-	if !rw.started {
+	if !rw.started && !rw.closed {
 		rw.upgradeToSSELocked()
 	}
 }
@@ -744,10 +762,13 @@ func (rw *httpResponseWriter) upgradeToSSELocked() {
 	go rw.keepAlive()
 }
 
+// keepAliveInterval is how often an open SSE stream gets a comment line.
+const keepAliveInterval = 15 * time.Second
+
 // keepAlive periodically emits an SSE comment line so intermediaries and client idle
 // timeouts don't close a quiet long-lived stream (chiefly subscriptions/listen).
 func (rw *httpResponseWriter) keepAlive() {
-	ticker := time.NewTicker(15 * time.Second)
+	ticker := time.NewTicker(rw.interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -755,6 +776,10 @@ func (rw *httpResponseWriter) keepAlive() {
 			return
 		case <-ticker.C:
 			rw.mu.Lock()
+			if rw.closed {
+				rw.mu.Unlock()
+				return
+			}
 			fmt.Fprint(rw.w, ":\r\n")
 			if rw.flusher != nil {
 				rw.flusher.Flush()
@@ -767,6 +792,9 @@ func (rw *httpResponseWriter) keepAlive() {
 func (rw *httpResponseWriter) WriteNotification(method string, params interface{}) error {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
+	if rw.closed {
+		return errResponseFinished
+	}
 	if !rw.started {
 		rw.upgradeToSSELocked()
 	}
@@ -784,7 +812,11 @@ func (rw *httpResponseWriter) WriteNotification(method string, params interface{
 func (rw *httpResponseWriter) WriteMessage(data []byte) error {
 	rw.mu.Lock()
 	defer rw.mu.Unlock()
-	defer rw.closeDone()
+	if rw.closed {
+		return errResponseFinished
+	}
+	// The final message ends the response: later writes are refused.
+	defer func() { rw.closed = true; rw.closeDone() }()
 
 	if !rw.started {
 		status := http.StatusOK
