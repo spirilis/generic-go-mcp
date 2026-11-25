@@ -83,7 +83,13 @@ func (svc *AuthService) authErrorDirect(w http.ResponseWriter, errorCode, descri
 func (svc *AuthService) tokenError(w http.ResponseWriter, errorCode, description string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusBadRequest)
+	// A client treats a 400 as "this grant is dead" and discards its refresh token; a fault
+	// on this side must not read that way.
+	status := http.StatusBadRequest
+	if errorCode == "server_error" {
+		status = http.StatusInternalServerError
+	}
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(OAuthError{
 		Error:            errorCode,
 		ErrorDescription: description,

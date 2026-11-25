@@ -1,3 +1,22 @@
+# v0.11.1: compact the OAuth store (2026-11-25) — DONE
+
+From the mcp-kube-baker security audit: anonymous `/authorize` and `/register` traffic can grow the bbolt
+file, which sweeping never shrinks, and a store failure made the refresh grant burn the token and panic.
+
+- [x] `BoltStorage.Compact(ctx)`: copy live data to `<path>.compact` (`bolt.Compact`), close, atomic rename,
+      reopen. Writes are gated for the whole run (`writeGate`), reads only for the swap (`dbMu`). Every
+      storage method now goes through `view`/`update`.
+- [x] `AuthService.CompactStore(ctx)`: sweep, then compact; returns `CompactResult`. Not scheduled by the
+      library: the embedder runs it hourly or on SIGUSR1 (README "Keeping the token store small").
+- [x] Refresh grant: mint the new tokens before deleting the old one; a store failure answers `server_error`.
+- [x] Tests: flood + sweep + compact shrinks the file and keeps live data; write waits and read proceeds
+      between copy and swap; no acknowledged write lost under concurrent load (-race); leftover temp file;
+      cancelled run; refresh survives a failing store (panics without the fix).
+
+Not done: no cap or rate limit on pending `/authorize` records (a cap lets an attacker block sign-ins for
+the 10-minute TTL instead); `/register` slots can still be pinned; a POST form to `/authorize` is bounded
+by the 64 KiB body limit, not the embedder's query limit.
+
 # Skills extension: August draft -> released Beta spec (2026-11-25) — DONE
 
 Target: `specification/beta/skills.mdx` in modelcontextprotocol/ext-skills (SEP-2640 Final,

@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -64,7 +65,38 @@ type Storage interface {
 
 // BoltStorage implements Storage using BoltDB
 type BoltStorage struct {
-	db *bolt.DB
+	path string
+
+	// writeGate is held shared by every write and exclusively by Compact for its whole run,
+	// so the copy Compact makes cannot miss a write. dbMu guards the db handle itself: held
+	// shared by every read and write, exclusively only while Compact swaps the file (and by
+	// Close). Lock order is writeGate, then dbMu.
+	writeGate sync.RWMutex
+	dbMu      sync.RWMutex
+	db        *bolt.DB
+
+	// compactHook, when set by a test, runs after the copy and before the swap.
+	compactHook func()
+}
+
+// view runs fn in a read transaction.
+func (s *BoltStorage) view(fn func(*bolt.Tx) error) error {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	return s.db.View(fn)
+}
+
+// update runs fn in a write transaction. It waits while Compact runs.
+func (s *BoltStorage) update(fn func(*bolt.Tx) error) error {
+	s.writeGate.RLock()
+	defer s.writeGate.RUnlock()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	return s.db.Update(fn)
+}
+
+func openBolt(path string) (*bolt.DB, error) {
+	return bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
 }
 
 // Bucket names
@@ -84,7 +116,7 @@ const (
 
 // NewBoltStorage creates a new BoltDB storage
 func NewBoltStorage(path string) (*BoltStorage, error) {
-	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	db, err := openBolt(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open bolt db: %w", err)
 	}
@@ -109,17 +141,21 @@ func NewBoltStorage(path string) (*BoltStorage, error) {
 		return nil, fmt.Errorf("failed to create buckets: %w", err)
 	}
 
-	return &BoltStorage{db: db}, nil
+	return &BoltStorage{path: path, db: db}, nil
 }
 
 // Close closes the database
 func (s *BoltStorage) Close() error {
+	s.writeGate.Lock()
+	defer s.writeGate.Unlock()
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
 	return s.db.Close()
 }
 
 // Authorization Codes
 func (s *BoltStorage) StoreAuthCode(ctx context.Context, code *AuthorizationCode) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketAuthCodes))
 		data, err := json.Marshal(code)
 		if err != nil {
@@ -131,7 +167,7 @@ func (s *BoltStorage) StoreAuthCode(ctx context.Context, code *AuthorizationCode
 
 func (s *BoltStorage) GetAuthCode(ctx context.Context, code string) (*AuthorizationCode, error) {
 	var authCode *AuthorizationCode
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketAuthCodes))
 		data := b.Get([]byte(code))
 		if data == nil {
@@ -144,7 +180,7 @@ func (s *BoltStorage) GetAuthCode(ctx context.Context, code string) (*Authorizat
 }
 
 func (s *BoltStorage) DeleteAuthCode(ctx context.Context, code string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketAuthCodes))
 		return b.Delete([]byte(code))
 	})
@@ -152,7 +188,7 @@ func (s *BoltStorage) DeleteAuthCode(ctx context.Context, code string) error {
 
 // Access Tokens
 func (s *BoltStorage) StoreAccessToken(ctx context.Context, token *AccessToken) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketAccessTokens))
 		data, err := json.Marshal(token)
 		if err != nil {
@@ -164,7 +200,7 @@ func (s *BoltStorage) StoreAccessToken(ctx context.Context, token *AccessToken) 
 
 func (s *BoltStorage) GetAccessToken(ctx context.Context, token string) (*AccessToken, error) {
 	var accessToken *AccessToken
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketAccessTokens))
 		data := b.Get([]byte(token))
 		if data == nil {
@@ -177,7 +213,7 @@ func (s *BoltStorage) GetAccessToken(ctx context.Context, token string) (*Access
 }
 
 func (s *BoltStorage) DeleteAccessToken(ctx context.Context, token string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketAccessTokens))
 		return b.Delete([]byte(token))
 	})
@@ -185,7 +221,7 @@ func (s *BoltStorage) DeleteAccessToken(ctx context.Context, token string) error
 
 // Refresh Tokens
 func (s *BoltStorage) StoreRefreshToken(ctx context.Context, token *RefreshToken) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketRefreshTokens))
 		data, err := json.Marshal(token)
 		if err != nil {
@@ -197,7 +233,7 @@ func (s *BoltStorage) StoreRefreshToken(ctx context.Context, token *RefreshToken
 
 func (s *BoltStorage) GetRefreshToken(ctx context.Context, token string) (*RefreshToken, error) {
 	var refreshToken *RefreshToken
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketRefreshTokens))
 		data := b.Get([]byte(token))
 		if data == nil {
@@ -210,7 +246,7 @@ func (s *BoltStorage) GetRefreshToken(ctx context.Context, token string) (*Refre
 }
 
 func (s *BoltStorage) DeleteRefreshToken(ctx context.Context, token string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketRefreshTokens))
 		return b.Delete([]byte(token))
 	})
@@ -218,7 +254,7 @@ func (s *BoltStorage) DeleteRefreshToken(ctx context.Context, token string) erro
 
 // Clients
 func (s *BoltStorage) StoreClient(ctx context.Context, client *RegisteredClient) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketClients))
 		data, err := json.Marshal(client)
 		if err != nil {
@@ -230,7 +266,7 @@ func (s *BoltStorage) StoreClient(ctx context.Context, client *RegisteredClient)
 
 func (s *BoltStorage) GetClient(ctx context.Context, clientID string) (*RegisteredClient, error) {
 	var client *RegisteredClient
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketClients))
 		data := b.Get([]byte(clientID))
 		if data == nil {
@@ -243,7 +279,7 @@ func (s *BoltStorage) GetClient(ctx context.Context, clientID string) (*Register
 }
 
 func (s *BoltStorage) DeleteClient(ctx context.Context, clientID string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketClients))
 		return b.Delete([]byte(clientID))
 	})
@@ -251,7 +287,7 @@ func (s *BoltStorage) DeleteClient(ctx context.Context, clientID string) error {
 
 func (s *BoltStorage) ListClients(ctx context.Context) ([]*RegisteredClient, error) {
 	var clients []*RegisteredClient
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketClients))
 		return b.ForEach(func(k, v []byte) error {
 			var client RegisteredClient
@@ -267,7 +303,7 @@ func (s *BoltStorage) ListClients(ctx context.Context) ([]*RegisteredClient, err
 
 // Users
 func (s *BoltStorage) StoreUser(ctx context.Context, user *User) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketUsers))
 		data, err := json.Marshal(user)
 		if err != nil {
@@ -285,7 +321,7 @@ func (s *BoltStorage) StoreUser(ctx context.Context, user *User) error {
 
 func (s *BoltStorage) GetUser(ctx context.Context, userID string) (*User, error) {
 	var user *User
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketUsers))
 		data := b.Get([]byte(userID))
 		if data == nil {
@@ -299,7 +335,7 @@ func (s *BoltStorage) GetUser(ctx context.Context, userID string) (*User, error)
 
 func (s *BoltStorage) GetUserByGitHubLogin(ctx context.Context, login string) (*User, error) {
 	var user *User
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		bGH := tx.Bucket([]byte(BucketUsersByGitHub))
 		userID := bGH.Get([]byte(login))
 		if userID == nil {
@@ -319,7 +355,7 @@ func (s *BoltStorage) GetUserByGitHubLogin(ctx context.Context, login string) (*
 
 // Sessions
 func (s *BoltStorage) StoreSession(ctx context.Context, session *AuthSession) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketSessions))
 		data, err := json.Marshal(session)
 		if err != nil {
@@ -337,7 +373,7 @@ func (s *BoltStorage) StoreSession(ctx context.Context, session *AuthSession) er
 
 func (s *BoltStorage) GetSession(ctx context.Context, sessionID string) (*AuthSession, error) {
 	var session *AuthSession
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketSessions))
 		data := b.Get([]byte(sessionID))
 		if data == nil {
@@ -351,7 +387,7 @@ func (s *BoltStorage) GetSession(ctx context.Context, sessionID string) (*AuthSe
 
 func (s *BoltStorage) GetSessionByAccessToken(ctx context.Context, token string) (*AuthSession, error) {
 	var session *AuthSession
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		bToken := tx.Bucket([]byte(BucketSessionsByToken))
 		sessionID := bToken.Get([]byte(token))
 		if sessionID == nil {
@@ -370,7 +406,7 @@ func (s *BoltStorage) GetSessionByAccessToken(ctx context.Context, token string)
 }
 
 func (s *BoltStorage) UpdateSessionLastUsed(ctx context.Context, sessionID string, lastUsed time.Time) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketSessions))
 		data := b.Get([]byte(sessionID))
 		if data == nil {
@@ -392,7 +428,7 @@ func (s *BoltStorage) UpdateSessionLastUsed(ctx context.Context, sessionID strin
 }
 
 func (s *BoltStorage) DeleteSession(ctx context.Context, sessionID string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketSessions))
 		data := b.Get([]byte(sessionID))
 		if data != nil {
@@ -409,7 +445,7 @@ func (s *BoltStorage) DeleteSession(ctx context.Context, sessionID string) error
 
 // Pending Auth Requests
 func (s *BoltStorage) StoreAuthRequest(ctx context.Context, req *PendingAuthRequest) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketAuthRequests))
 		data, err := json.Marshal(req)
 		if err != nil {
@@ -421,7 +457,7 @@ func (s *BoltStorage) StoreAuthRequest(ctx context.Context, req *PendingAuthRequ
 
 func (s *BoltStorage) GetAuthRequest(ctx context.Context, id string) (*PendingAuthRequest, error) {
 	var req *PendingAuthRequest
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketAuthRequests))
 		data := b.Get([]byte(id))
 		if data == nil {
@@ -434,7 +470,7 @@ func (s *BoltStorage) GetAuthRequest(ctx context.Context, id string) (*PendingAu
 }
 
 func (s *BoltStorage) DeleteAuthRequest(ctx context.Context, id string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketAuthRequests))
 		return b.Delete([]byte(id))
 	})
@@ -443,7 +479,7 @@ func (s *BoltStorage) DeleteAuthRequest(ctx context.Context, id string) error {
 // Consent
 
 func (s *BoltStorage) StorePendingConsent(ctx context.Context, pc *PendingConsent) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketPendingConsents))
 		data, err := json.Marshal(pc)
 		if err != nil {
@@ -466,7 +502,7 @@ func (s *BoltStorage) TakePendingConsent(ctx context.Context, id, bindingHash st
 
 	var pc *PendingConsent
 	expired := false
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketPendingConsents))
 		data := b.Get([]byte(id))
 		if data == nil {
@@ -509,7 +545,7 @@ func consentKey(userID, clientID string) []byte {
 }
 
 func (s *BoltStorage) StoreConsent(ctx context.Context, userID, clientID string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+	return s.update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte(BucketConsents))
 		data, err := json.Marshal(struct {
 			GrantedAt time.Time `json:"granted_at"`
@@ -523,7 +559,7 @@ func (s *BoltStorage) StoreConsent(ctx context.Context, userID, clientID string)
 
 func (s *BoltStorage) HasConsent(ctx context.Context, userID, clientID string) (bool, error) {
 	granted := false
-	err := s.db.View(func(tx *bolt.Tx) error {
+	err := s.view(func(tx *bolt.Tx) error {
 		granted = tx.Bucket([]byte(BucketConsents)).Get(consentKey(userID, clientID)) != nil
 		return nil
 	})

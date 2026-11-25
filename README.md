@@ -365,6 +365,47 @@ is accepted too). A client asking for `token_endpoint_auth_method: "none"` is re
 client, with no secret, relying on PKCE, which `/authorize` requires of every client. Any other request
 gets `client_secret_post` and a secret, returned once with `client_secret_expires_at: 0`.
 
+#### Keeping the token store small
+
+The store is one bbolt file. The service sweeps expired records every ten minutes, but bbolt only
+reuses the pages that frees: the file never shrinks. Since `/register` and `/authorize` answer
+anyone, a burst of requests can leave the file large for good. `AuthService.CompactStore` gives
+the space back: it sweeps, copies the live data into a new file beside the store, and renames it
+over the old one.
+
+- Writes (sign-ins, token refreshes) wait for the whole run; reads, which is every authenticated
+  `/mcp` request, wait only for the final close, rename and reopen.
+- The rename is atomic: a crash leaves the complete old file or the complete new one.
+- The copy needs free space for the live data on the same volume. With none it fails and the
+  store is left as it was.
+
+The service never runs it on its own. Call it on a timer, on a signal, or both:
+
+```go
+go func() {
+	tick := time.NewTicker(time.Hour)
+	defer tick.Stop()
+	usr1 := make(chan os.Signal, 1)
+	signal.Notify(usr1, syscall.SIGUSR1) // kill -USR1 <pid> compacts now
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		case <-usr1:
+		}
+		res, err := authService.CompactStore(ctx)
+		if err != nil {
+			logging.Error("auth store compaction failed", "error", err)
+			continue
+		}
+		logging.Info("auth store compacted", "swept", res.Swept,
+			"bytes_before", res.BytesBefore, "bytes_after", res.BytesAfter, "took", res.Duration)
+	}
+}()
+```
+
+
 ## Documentation
 
 - **[CLAUDE-new-project-harness.md](CLAUDE-new-project-harness.md)** - Complete guide to building MCP servers with this library

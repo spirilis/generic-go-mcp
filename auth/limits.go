@@ -122,10 +122,11 @@ func (svc *AuthService) stopSweeper() {
 // self-registered clients older than unusedClientAge that hold no consent, token, code or
 // pending request. It returns how many records it removed.
 //
-// bbolt reuses the freed pages, so the file stops growing; it does not shrink.
+// bbolt reuses the freed pages, so the file stops growing; it does not shrink. Compact
+// rewrites the file to give the space back.
 func (s *BoltStorage) Sweep(ctx context.Context, now time.Time, unusedClientAge time.Duration) (int, error) {
 	removed := 0
-	err := s.db.Update(func(tx *bolt.Tx) error {
+	err := s.update(func(tx *bolt.Tx) error {
 		inUse := map[string]bool{}
 		for _, name := range []string{BucketAuthRequests, BucketPendingConsents, BucketAuthCodes, BucketAccessTokens, BucketRefreshTokens} {
 			b := tx.Bucket([]byte(name))

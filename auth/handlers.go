@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/spirilis/generic-go-mcp/logging"
 )
 
 // RegisterRoutes adds all OAuth endpoints to the mux
@@ -339,14 +341,25 @@ func (svc *AuthService) handleRefreshTokenGrant(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// Generate the new tokens first: if the store cannot take them (a full disk, say), the
+	// old refresh token must survive so the client can try again.
+	accessToken, err := svc.tokenService.GenerateAccessToken(
+		refreshToken.UserID, clientID, refreshToken.Scope, refreshToken.Resource)
+	if err != nil {
+		logging.Error("refresh grant: storing the access token failed", "error", err)
+		svc.tokenError(w, "server_error", "Failed to issue tokens")
+		return
+	}
+	newRefreshToken, err := svc.tokenService.GenerateRefreshToken(
+		refreshToken.UserID, clientID, refreshToken.Scope, refreshToken.Resource)
+	if err != nil {
+		logging.Error("refresh grant: storing the refresh token failed", "error", err)
+		svc.tokenError(w, "server_error", "Failed to issue tokens")
+		return
+	}
+
 	// Delete old refresh token (rotation)
 	svc.storage.DeleteRefreshToken(r.Context(), refreshTokenStr)
-
-	// Generate new tokens
-	accessToken, _ := svc.tokenService.GenerateAccessToken(
-		refreshToken.UserID, clientID, refreshToken.Scope, refreshToken.Resource)
-	newRefreshToken, _ := svc.tokenService.GenerateRefreshToken(
-		refreshToken.UserID, clientID, refreshToken.Scope, refreshToken.Resource)
 
 	resp := TokenResponse{
 		AccessToken:  accessToken.Token,
