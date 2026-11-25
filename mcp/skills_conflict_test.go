@@ -9,6 +9,11 @@ func fm(name, desc string) map[string]interface{} {
 	return map[string]interface{}{"name": name, "description": desc}
 }
 
+// skillMD renders a SKILL.md whose frontmatter is exactly fm(name, desc), followed by body.
+func skillMD(name, desc, body string) []byte {
+	return []byte("---\nname: " + name + "\ndescription: " + desc + "\n---\n" + body)
+}
+
 // A nested skill that re-publishes an enclosing skill's file with DIFFERENT bytes would make
 // skills/list advertise a digest resources/read can't reproduce. Register must reject it.
 func TestRegisterRejectsConflictingSharedDigest(t *testing.T) {
@@ -18,8 +23,8 @@ func TestRegisterRejectsConflictingSharedDigest(t *testing.T) {
 		URI:         "skill://bundle/SKILL.md",
 		Frontmatter: fm("bundle", "parent"),
 		Files: map[string]SkillContent{
-			"skill://bundle/SKILL.md":       {Bytes: []byte("parent skill")},
-			"skill://bundle/inner/SKILL.md": {Bytes: []byte("VERSION A")},
+			"skill://bundle/SKILL.md":       {Bytes: skillMD("bundle", "parent", "parent skill")},
+			"skill://bundle/inner/SKILL.md": {Bytes: skillMD("inner", "nested", "VERSION A")},
 		},
 	}
 	if err := skills.Register(parent); err != nil {
@@ -30,7 +35,7 @@ func TestRegisterRejectsConflictingSharedDigest(t *testing.T) {
 		URI:         "skill://bundle/inner/SKILL.md",
 		Frontmatter: fm("inner", "nested"),
 		Files: map[string]SkillContent{
-			"skill://bundle/inner/SKILL.md": {Bytes: []byte("VERSION B")}, // divergent
+			"skill://bundle/inner/SKILL.md": {Bytes: skillMD("inner", "nested", "VERSION B")}, // divergent
 		},
 	}
 	err := skills.Register(nested)
@@ -45,13 +50,13 @@ func TestRegisterRejectsConflictingSharedDigest(t *testing.T) {
 // Identical bytes for the shared file are the normal nested case and must register cleanly.
 func TestRegisterAcceptsMatchingSharedDigest(t *testing.T) {
 	skills := NewSkillRegistry(NewResourceRegistry())
-	shared := []byte("same bytes both places")
+	shared := skillMD("inner", "nested", "same bytes both places")
 
 	parent := SkillDef{
 		URI:         "skill://bundle/SKILL.md",
 		Frontmatter: fm("bundle", "parent"),
 		Files: map[string]SkillContent{
-			"skill://bundle/SKILL.md":       {Bytes: []byte("parent skill")},
+			"skill://bundle/SKILL.md":       {Bytes: skillMD("bundle", "parent", "parent skill")},
 			"skill://bundle/inner/SKILL.md": {Bytes: shared},
 		},
 	}
@@ -81,7 +86,7 @@ func TestRegisterReplacementChangingOwnFileIsNotAConflict(t *testing.T) {
 			URI:         "skill://solo/SKILL.md",
 			Frontmatter: fm("solo", "d"),
 			Files: map[string]SkillContent{
-				"skill://solo/SKILL.md": {Bytes: []byte("entry")},
+				"skill://solo/SKILL.md": {Bytes: skillMD("solo", "d", "entry")},
 				"skill://solo/ref.md":   {Bytes: []byte(body)},
 			},
 		}

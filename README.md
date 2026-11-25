@@ -137,9 +137,11 @@ rationale, the hard-cutover decisions, and a worked wire-to-Go-types example.
 - **Parameterized Resources** - RFC 6570 resource templates (`resources/templates/list`) for
   unbounded keyspaces no `resources/list` could enumerate, with optional `completion/complete`
   to help clients narrow a template variable
-- **Skills (experimental)** - Opt-in support for the `io.modelcontextprotocol/skills` extension
-  (SEP-2640): `skills/list`, `skills/get`, and `resources/directory/read`, with a loader that turns
-  an `embed.FS` of skill directories into a digest-correct catalog. Off unless you configure it
+- **Skills (beta)** - Opt-in support for the `io.modelcontextprotocol/skills` extension
+  (SEP-2640), which Claude and Claude Code load skills through: `skills/list`, `skills/get`, and
+  `resources/directory/read`, with a loader that turns an `embed.FS` of skill directories into a
+  catalog whose digests, sizes and frontmatter cannot disagree with the files. Off unless you
+  configure it
 - **Production Ready** - BoltDB token storage, HMAC-signed MRTR request state, graceful shutdown
 - **Small Dependency Surface** - `transport` imports nothing beyond the Go standard library; `mcp`
   adds only `gopkg.in/yaml.v3` (for parsing skill frontmatter). `auth` (BoltDB) is opt-in, pulled in
@@ -237,7 +239,7 @@ generic-go-mcp/
 ├── compat/               # Optional legacy (2025-11-25 and earlier) compatibility overlay
 ├── examples/
 │   ├── go-mcp/           # Complete example server application
-│   │   └── skills/       # Embedded demonstration skill (SEP-2640, UNIX-socket mode)
+│   │   └── skills/       # Embedded demonstration skill (Skills extension, every mode)
 │   └── tools/            # Reference tools (date, fortune, confirm_delete/MRTR)
 ├── CLAUDE-new-project-harness.md  # Comprehensive getting started guide
 ├── CLAUDE.md             # Architecture and design patterns
@@ -553,21 +555,28 @@ Back it with a prefix index or a paged upstream query; never materialize the key
 fitting in memory is why the template exists. The server truncates `Values` to the spec's 100-value
 ceiling and sets `hasMore` if it had to.
 
-### Skills (experimental)
+### Skills (beta)
 
-**Status: opt-in and unstable.** This implements [SEP-2640, the Skills
-Extension](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640) — an
-Extensions Track proposal that is **open and not merged**, written here against head `641d1eb`
-(2026-08-20). Nothing about skills appears in the ratified 2026-07-28 specification, and **no
-public client consumes it yet**: Claude Code's skills are local-only (`~/.claude/skills`, project
-directories, plugins, claude.ai sync) with no `skill://` support, and SEP-2640 says Anthropic's
-own support is prototyped internally. Wire shapes may change. Adopt it to be ready, not to be
-consumed today.
+**Status: opt-in, Beta.** This implements the [Skills
+extension](https://modelcontextprotocol.io/extensions/skills/overview)
+(`io.modelcontextprotocol/skills`), following
+[`specification/beta/skills.mdx`](https://github.com/modelcontextprotocol/ext-skills/blob/main/specification/beta/skills.mdx)
+as read on 2026-11-25. SEP-2640 is Final; the extension itself is at stage Beta, which means real
+use is welcome and a breaking change is possible but expected to be rare. It is an extension, not
+part of the 2026-07-28 core specification.
+
+Hosts consume it now. Claude Code (v2.1.331 or later) and claude.ai connectors load skills from MCP
+servers in public beta, and VS Code does too. The example server passes the skills scenarios of the
+official [conformance suite](https://github.com/modelcontextprotocol/conformance)
+(`@modelcontextprotocol/conformance@alpha`) as a 2026-07-28 client and as a 2025-11-25 client
+through the legacy overlay, and the MCP Inspector's `--verify` accepts its digests, sizes and
+frontmatter. **Nobody has loaded a skill from this library into Claude itself yet**: treat that
+path as untested until you have done it.
 
 A *skill* is a directory holding a `SKILL.md` with YAML frontmatter, plus any supporting files.
 Serving one over MCP lets a host load a procedure written against **your** tools rather than
 generic advice. The library's job is the catalog: publishing each skill's frontmatter verbatim
-along with a sha256 digest per file, and serving those files as ordinary resources.
+along with a sha256 digest and byte size per file, and serving those files as ordinary resources.
 
 ```go
 //go:embed all:skills
@@ -587,28 +596,56 @@ server := mcp.NewServer(tools, resources, &mcp.ServerConfig{
 })
 ```
 
-`LoadFS` walks the filesystem, parses and validates frontmatter, computes digests over raw bytes,
-and registers every file as a readable resource. That single call is the point of the API: a
-hand-maintained digest rots silently, and this one cannot — `SkillRegistry` derives digests from
-the same bytes `resources/read` returns and offers no way to supply one.
+`LoadFS` walks the filesystem, parses and validates frontmatter, computes digests and sizes over
+raw bytes, and registers every file as a readable resource. That single call is the point of the
+API. A host refuses a skill whose file does not match its manifest entry, or whose `SKILL.md`
+frontmatter differs from the entry's, so a hand-maintained copy of either is a skill that silently
+stops loading. `SkillRegistry` derives all three from the same bytes `resources/read` returns and
+offers no way to supply a digest or a size.
+
+Each entry on the wire:
+
+```json
+{
+  "uri": "skill://pdf-processing/SKILL.md",
+  "frontmatter": { "name": "pdf-processing", "description": "Extract, fill, and assemble PDF documents" },
+  "resources": [
+    { "uri": "skill://pdf-processing/SKILL.md", "digest": "sha256:99b7…b19e", "size": 151 },
+    { "uri": "skill://pdf-processing/templates/invoice.md", "digest": "sha256:61f4…d9ee", "size": 29 }
+  ]
+}
+```
+
+`resources` is always present: the complete manifest, or the string `"dynamic"` for a skill whose
+content is generated (below).
 
 Registering a skill (or a whole `LoadFS`) fires the ordinary
-`notifications/resources/list_changed`, once per skill rather than once per file. SEP-2640 defines
-no skills-specific notification, so none is invented here.
+`notifications/resources/list_changed`, once per skill rather than once per file. The extension
+defines no skills-specific notification, so none is invented here.
 
-**Validation**, from the [Agent Skills specification](https://agentskills.io/specification), applied
-at registration:
+**Validation**, applied at registration:
 
-| Field | Rule |
+| What | Rule |
 |---|---|
+| `SKILL.md` | begins with a `---` line, YAML frontmatter, and a closing `---` line |
 | `name` | required, 1–64 chars, `[a-z0-9]` in single-hyphen-separated groups, and equal to the skill directory's name |
 | `description` | required, non-empty, ≤ 1024 chars |
 | `compatibility` | optional, ≤ 500 chars |
-| everything else | passed through verbatim and uninterpreted |
+| every other frontmatter key | passed through verbatim and uninterpreted |
+| size | at most 512 files and 16 MiB per skill (`MaxSkillResources`, `MaxSkillBytes`); `AllowOversizedSkills(true)` lifts it |
 
-`allowed-tools` is deliberately in that last row. It is a host-side consent matter that SEP-2640
-says hosts MUST ignore for MCP-origin skills absent explicit per-skill approval, so this library
-must not act on it.
+`allowed-tools` is deliberately in the pass-through row. It is a host-side consent matter that
+hosts MUST ignore for MCP-origin skills absent explicit per-skill approval, so this library must
+not act on it.
+
+The two size limits are what every conforming host must accept; a larger skill may load nowhere,
+which is why registration refuses it by default.
+
+**Frontmatter is converted the way a YAML 1.2 parser reads it**, because the host parses the same
+file and compares. An unquoted `2026-11-25` stays the string `"2026-11-25"`, `014` is 14, `yes` is
+a string, and `<<` is an ordinary key. Hosts may still differ on unusual scalars, so quote any
+value that is not plainly a string, a number or `true`/`false`. `SkillDef.Frontmatter` is optional
+when the skill has files; if you set it, it must equal the file's frontmatter or `Register` fails.
 
 Things worth knowing:
 
@@ -616,27 +653,62 @@ Things worth knowing:
   its domain (`github://owner/repo/skills/refunds/SKILL.md`), and everything works identically.
 - **Skill-ness is established only by `skills/list` and `skills/get`.** Registering a `skill://`
   resource directly on the `ResourceRegistry` does *not* make it a skill, and this library never
-  scans for a URI shape to invent one.
+  scans for a URI shape to invent one. A server that used to publish skills as plain `skill://`
+  resources, or through a `skill://index.json`, is invisible to a host until it registers them here.
 - **The last path segment must equal the frontmatter `name`.** `skill://acme/billing/refunds/SKILL.md`
   needs `name: refunds`; the segments before it are a free organizational prefix.
+- **Declaring the extension declares `resources`.** A configured `SkillRegistry`, even an empty
+  one, puts both in `server/discover`, as the specification requires.
 - **Nested skills publish flat.** A skill directory may contain further skills; the nested skill's
   files also appear in the enclosing skill's `resources` list, and the nested skill is listed as an
   ordinary top-level entry. Unregistering one leaves files the other still publishes readable.
+- **Generated skills are `Dynamic`.** `Register(SkillDef{URI, Frontmatter, Dynamic: true})` lists an
+  entry with `"resources": "dynamic"` and registers no files: you serve the `SKILL.md` and the rest
+  yourself, usually with a `ResourceTemplate`. Such a skill has no content integrity and hosts may
+  decline it, so prefer a manifest whenever the bytes are stable.
 - **`skills/get` answers for URIs `skills/list` never returned.** Attach a `SkillResolver` for a
-  catalog too large or too dynamic to enumerate; it is consulted only when a registered lookup
-  misses, and pair it with a `ResourceTemplate` so the files stay readable.
-- **`skills/get`'s cache envelope is this library's call, not the spec's.** SEP-2640 defines `ttlMs`
-  and `cacheScope` for `skills/list` and leaves `skills/get` open; a single entry gets the same
-  hints with the same list TTL.
+  catalog too large to enumerate; it is consulted only when a registered lookup misses. It returns
+  the entry itself, with a full `Resources` manifest (digest and size per file) or `Dynamic`, and
+  the entry is checked before it is sent: an invalid one is logged and answered `-32603`.
+- **`ttlMs` and `cacheScope` are on all three results**, as the specification requires. `skills/get`
+  uses the list TTL (`ListTTLMs`). Neither is an integrity property.
+
+**What Claude does with a skill** (from [Claude Code's
+documentation](https://code.claude.com/docs/en/mcp#use-skills-from-mcp-servers), read 2026-11-25;
+check it before relying on any of this):
+
+- The skill appears as `<server>:<skill>`, for example `/docs:pdf`; a connector's server name gets a
+  prefix (`claude_ai_Docs:pdf`).
+- At most 100 skills per server are shown.
+- These frontmatter fields are ignored for an MCP skill: `allowed-tools`, `disallowed-tools`,
+  `hooks`, `model`, `effort`, `context`, `agent`, `background`, `shell`, `paths`, `metadata`.
+  `!` commands do not run and `@` references are not attached.
+- Skills from connectors that Anthropic scans must fit 100 KB per text file and 400 KB per skill,
+  and a skill with an archive, or a binary file such as WebP or OTF, does not load. PNG, JPEG, GIF,
+  SVG, PDF and several font and media formats are neither scanned nor counted.
+- Not available in `claude -p`, the Agent SDK, cloud sessions or GitHub Actions.
 
 `resources/directory/read` is a separate opt-in (`SkillsDirectoryRead`) reported as the extension's
 `directoryRead` setting. It lists the direct children of a directory in the resource namespace,
 derived lexically from registered resource URIs — nothing to keep in step, and it is
 scheme-agnostic rather than skill-exclusive. A directory with no registered descendants is
-indistinguishable from one that never existed, and both answer `-32602`.
+indistinguishable from one that never existed, and both answer `-32602`. Template-backed files are
+not enumerable, so do not turn it on for a namespace you serve only through a `ResourceTemplate`.
 
 With `ServerConfig.Skills` left nil there is no `extensions` key in `server/discover` and all three
 methods answer `-32601` — the same probe clients use to detect an unimplemented extension.
+
+**Upgrading from v0.10.x** (which followed an August 2026 draft):
+
+- Every manifest entry gains `size`, and `resources` is never omitted. No code change is needed for
+  skills registered through `LoadFS` or `Register`.
+- A `SkillResolver` must now return a complete `Resources` manifest with `Size` set, or
+  `Dynamic: true`. An entry with neither used to go out without `resources`; it is now `-32603`.
+- `Register` parses the frontmatter from the `SKILL.md` bytes. A `SKILL.md` without frontmatter, or
+  a `SkillDef.Frontmatter` that differs from the file's, is now an error.
+- A skill over 512 files or 16 MiB is refused unless `AllowOversizedSkills(true)`.
+- Frontmatter values that YAML 1.1 would have typed (an unquoted date, `014`) now reach the wire as
+  a YAML 1.2 parser reads them.
 
 ### Change Notifications
 

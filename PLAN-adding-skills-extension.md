@@ -1,5 +1,11 @@
 # PLAN: SEP-2640 Skills Extension (`io.modelcontextprotocol/skills`)
 
+> **Historical.** This plan was written against an August 2026 draft of SEP-2640. The extension
+> has since been released at stage Beta and the implementation was brought up to it on 2026-11-25
+> (`size` on every manifest entry, `"resources": "dynamic"`, per-skill limits, frontmatter taken
+> from the `SKILL.md` bytes). The README's "Skills (beta)" section is the current description;
+> where this plan disagrees with it, the README is right.
+
 ## Context
 
 A downstream consumer (`~/src/mcp-kube-baker`, a Kubernetes MCP server) wants to

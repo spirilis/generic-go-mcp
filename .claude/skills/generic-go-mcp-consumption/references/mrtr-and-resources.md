@@ -247,25 +247,29 @@ decides how to surface them), while tools are *model*-driven. If the model needs
 up mid-reasoning, give it a **tool** — implement templates for the linkable, citable surface, not as
 a replacement for a lookup tool.
 
-## Skills over MCP (experimental, SEP-2640)
+## Skills over MCP (the Skills extension, Beta)
 
-**Read this first.** [SEP-2640](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640)
-is an Extensions Track proposal that is **open and not merged** — this library implements it against
-head `641d1eb` (2026-08-20). Nothing about skills is in the ratified 2026-07-28 specification, and
-no public client consumes it yet (Claude Code's skills are local-only; the SEP says Anthropic's
-support is prototyped internally). Everything below may change with the SEP. Every exported symbol
-carries an `EXPERIMENTAL:` doc comment naming the SEP and that commit.
+**Status.** The [Skills extension](https://modelcontextprotocol.io/extensions/skills/overview)
+(`io.modelcontextprotocol/skills`) is released at stage **Beta**: SEP-2640 is Final, real use is
+welcome, a breaking change is possible but expected to be rare. This library follows
+`specification/beta/skills.mdx` in modelcontextprotocol/ext-skills as read on 2026-11-25. Hosts
+consume it: Claude Code (v2.1.331+) and claude.ai connectors in public beta, VS Code, and others.
+It is an extension, not part of the 2026-07-28 core specification.
 
-If what you actually want today is "let the model pull in a procedure mid-reasoning", write a
-**tool** whose description carries the catalog — that works with every client right now. The skills
-extension is the complementary thing: it lets a *host* deliberately load a skill.
+The Beta wire shape described here (`size` on every file, `resources` always present,
+`"dynamic"`) is on `main` **after `v0.10.2`** and in any later tag. `v0.8.0` to `v0.10.2` implement
+an August 2026 draft that current hosts reject, because their entries carry no `size`.
+
+If what you want is "let the model pull in a procedure mid-reasoning" in a client that does not
+implement the extension, write a **tool** whose description carries the catalog. The extension is
+the complementary thing: it lets a *host* list, approve, verify and load a skill.
 
 ### What you serve
 
 A skill is a directory with a `SKILL.md` at its root ([Agent Skills
 specification](https://agentskills.io/specification)) plus supporting files. The library publishes
-each skill's frontmatter verbatim along with a `sha256` digest per file, and serves the files as
-ordinary resources.
+each skill's frontmatter verbatim along with a `sha256` digest and a byte size per file, and serves
+the files as ordinary resources.
 
 ```go
 //go:embed all:skills
@@ -289,11 +293,14 @@ server := mcp.NewServer(tools, resources, &mcp.ServerConfig{
 ```
 
 That is the whole integration. `LoadFS` walks the filesystem, parses and validates frontmatter,
-computes digests over raw bytes, and registers every file as a readable resource.
+computes digests and sizes over raw bytes, and registers every file as a readable resource.
 
-**Never hand-maintain a digest**, and note that the API gives you no way to: `SkillRegistry` derives
-every digest from the same bytes `resources/read` returns. `Register(mcp.SkillDef{...})` is the
-non-filesystem path and takes `Files map[string]mcp.SkillContent` — bytes in, digests out.
+**Never hand-maintain a digest, a size or a copy of the frontmatter**, and note that the API gives
+you no way to supply the first two. A host verifies every file it reads against the manifest and
+compares the `SKILL.md` frontmatter with the entry field by field; any difference and the skill
+does not load. `Register(mcp.SkillDef{...})` is the non-filesystem path and takes
+`Files map[string]mcp.SkillContent`: bytes in; digests, sizes and frontmatter out. Leave
+`SkillDef.Frontmatter` nil. If you set it, it must equal what the `SKILL.md` bytes contain.
 
 ### The rules that bite
 
@@ -302,26 +309,37 @@ non-filesystem path and takes `Files map[string]mcp.SkillContent` — bytes in, 
 - **`name` is `[a-z0-9]` in single-hyphen-separated groups, 1–64 chars**, and must match the
   directory name. `description` is required, non-empty, ≤ 1024 chars. `compatibility` ≤ 500.
   Everything else in the frontmatter is passed through **verbatim and uninterpreted** — including
-  `allowed-tools`, which is a host consent matter the SEP says hosts MUST ignore for MCP-origin
-  skills. Do not build server behavior on it.
+  `allowed-tools`, which is a host consent matter that hosts MUST ignore for MCP-origin skills. Do
+  not build server behavior on it.
+- **`SKILL.md` must start with a `---` line and close its frontmatter with a `---` line.**
+- **Quote frontmatter values that are not plainly a string, a number or `true`/`false`.** The
+  library converts YAML the way a YAML 1.2 parser reads it (an unquoted `2026-11-25` stays a string,
+  `014` is 14, `yes` is a string), but hosts parse the file themselves and may differ on oddities.
+- **At most 512 files and 16 MiB per skill** (`mcp.MaxSkillResources`, `mcp.MaxSkillBytes`), the
+  limits every host must accept. `Register` refuses more unless `skills.AllowOversizedSkills(true)`.
+  Claude is stricter for scanned connectors: 100 KB per text file, 400 KB per skill, 100 skills per
+  server. Keep skills small.
 - **The `skill://` scheme is not privileged.** `github://owner/repo/skills/refunds/SKILL.md` works
   identically. Correspondingly, registering a `skill://` resource straight on the `ResourceRegistry`
-  does **not** make it a skill — skill-ness comes only from `skills/list` / `skills/get`.
+  does **not** make it a skill — skill-ness comes only from `skills/list` / `skills/get`. A server
+  that used to expose skills as plain `skill://` resources must register them here.
+- **A configured `SkillRegistry` declares `resources` too**, even when empty, as the specification
+  requires.
 - **Nested skills publish flat.** A skill directory may contain further skills; the nested skill's
   files appear in the enclosing skill's `resources` list *and* the nested skill is listed as an
   ordinary top-level entry. Unregistering one leaves files the other still publishes readable.
 - **Registration fires the ordinary `notifications/resources/list_changed`** — once per skill, not
-  once per file. SEP-2640 defines no skills-specific notification, so a client that cached
-  `skills/list` has no way to learn a skill's frontmatter changed while its file set did not.
+  once per file. The extension defines no skills-specific notification; a host learns of a change
+  when a read fails verification or when it refreshes the entry.
 
-### Catalogs too big to list
+### Generated skills and catalogs too big to list
 
 `skills/get` must answer for skills `skills/list` never returned. Attach a resolver, consulted only
 when a registered lookup misses:
 
 ```go
 skills.SetResolver(func(ctx context.Context, uri string) (mcp.Skill, bool, error) {
-	fm, files, ok := generateSkill(ctx, uri)
+	fm, files, ok := generateSkill(ctx, uri) // files is []mcp.SkillResource{{URI, Digest, Size}, ...}
 	if !ok {
 		return mcp.Skill{}, false, nil // -> -32602, not a fabricated entry
 	}
@@ -329,10 +347,17 @@ skills.SetResolver(func(ctx context.Context, uri string) (mcp.Skill, bool, error
 })
 ```
 
-A resolver returns the wire shape directly, so **it owns digest correctness**, and nothing is
+A resolver returns the entry directly, so **it owns digest and size correctness**, and nothing is
 registered on the `ResourceRegistry` on its behalf — pair it with a `ResourceTemplate` over the same
-URI namespace or the files will not be readable. Omitting `Resources` entirely is legal for a
-dynamically generated skill (hosts MAY decline to load one).
+URI namespace or the files will not be readable. The entry is checked before it is sent (URI, name,
+a complete manifest with `sha256:` + 64 lowercase hex digests and non-negative sizes); an invalid
+one is logged and answered `-32603`.
+
+When the content has no stable bytes to digest, say so: return `mcp.Skill{URI: uri, Frontmatter: fm,
+Dynamic: true}`, or list such a skill with `skills.Register(mcp.SkillDef{URI: uri, Frontmatter: fm,
+Dynamic: true})`, which registers the entry and no files. On the wire `resources` is then the string
+`"dynamic"`. Such a skill has no content integrity, hosts may decline to load it, and a persisted
+approval never covers it. Prefer a manifest whenever you can produce one.
 
 ### `resources/directory/read`
 
@@ -350,8 +375,20 @@ descendants is indistinguishable from one that never existed — both `-32602`. 
 ... server/discover | jq '.result.capabilities.extensions'
 # {"io.modelcontextprotocol/skills":{"directoryRead":true}}
 
-# the invariant worth automating: published digest == sha256 of what resources/read returns
-... skills/list | jq -r '.result.skills[].resources[] | .uri'
+# the invariant worth automating: published digest and size == what resources/read returns
+... skills/list | jq -r '.result.skills[].resources[] | "\(.uri) \(.size) \(.digest)"'
+```
+
+Better than checking by hand, run the official conformance scenarios and a host-side verifier
+against the server over HTTP (`--force` because extension scenarios are not on the spec timeline):
+
+```bash
+for s in enumeration manifest directory; do
+  npx @modelcontextprotocol/conformance@alpha server --url http://127.0.0.1:8080/mcp \
+    --scenario sep-2640-skills-$s --spec-version 2026-07-28 --force
+done
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:8080/mcp --transport http \
+  --method skills/list --verify
 ```
 
 With `ServerConfig.Skills` left `nil`, `server/discover` has no `extensions` key and all three

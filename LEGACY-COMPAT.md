@@ -99,7 +99,7 @@ compat off restores the strict answer.
 | `notifications/initialized` | Swallowed; extends the session's idle TTL. No response, as required for a notification. |
 | `ping` | `{}`. Mandatory in these revisions, unlike the modern stack (which doesn't route it at all). |
 | `tools/list`, `tools/call`, `resources/list`, `resources/read`, `resources/templates/list`, `completion/complete`, `skills/list`, `skills/get`, `resources/directory/read` | Translated to the modern shape using the calling session's declared capabilities, forwarded to the inner handler unchanged, and downgraded back. |
-| `skills/list` / `skills/get` / `resources/directory/read` specifics | The skills extension (SEP-2640) defines an identical params object regardless of era, so forwarding is all that is needed. `capabilities.extensions` reaches the legacy handshake too, because `buildInitializeResult` rebuilds capabilities through the typed `mcp.ServerCapabilities`, which has a field for it — a legacy client that understands the extension can use it, one that does not ignores an unknown key. A server with no `SkillRegistry` answers all three with the inner stack's `-32601`. See known limitation 7 below. |
+| `skills/list` / `skills/get` / `resources/directory/read` specifics | The skills extension (SEP-2640, Beta) defines an identical params object regardless of era, so forwarding is all that is needed. `capabilities.extensions` reaches the legacy handshake too, because `buildInitializeResult` rebuilds capabilities through the typed `mcp.ServerCapabilities`, which has a field for it — a legacy client that understands the extension can use it, one that does not ignores an unknown key. A server with no `SkillRegistry` answers all three with the inner stack's `-32601`. See known limitation 7 below. |
 | `resources/templates/list` / `completion/complete` specifics | Both predate 2026-07-28 and share an identical params object across eras, so forwarding is all that is needed. A server with no `CompletionProvider` registered answers `completion/complete` with the inner stack's `-32601`, which passes straight through — the same "unsupported" signal a legacy client probes for. |
 | everything else (including `resources/subscribe`/`unsubscribe`) | `-32601` — the correct answer for a capability the handshake never declared. |
 
@@ -184,12 +184,16 @@ applies to modern requests only. Otherwise a `404` for, say, an unadvertised met
    through unchanged. Clients on those revisions are expected to accept `-32602` as well; this
    applies to reads of both concrete resources and resource-template members.
 
-7. **The skills extension is forwarded, but it is experimental on both sides of the boundary.**
-   SEP-2640 is an unmerged proposal, the `extensions` capability mechanism itself postdates every
-   revision this overlay serves, and no public client consumes either. Forwarding it costs nothing —
-   a legacy client that does not understand the key ignores it — but do not read "it works over the
-   overlay" as "a 2025-11-25 client out there will use it". A server that never sets
-   `ServerConfig.Skills` exposes none of this in either era.
+7. **The skills extension is forwarded, minus the cache fields.** The Skills extension is specified
+   against 2026-07-28 or later, but extensions were already negotiated through
+   `capabilities.extensions` in the `initialize` handshake on earlier revisions, and clients do use
+   skills that way. So the overlay declares the extension (and `resources` with it) at handshake and
+   forwards the three methods. Entries cross intact: `frontmatter`, and `uri`, `digest` and `size`
+   for every file. `resultType`, `ttlMs` and `cacheScope` are stripped as on every other result,
+   because the cacheable-result envelope does not exist before 2026-07-28. The official conformance
+   suite agrees: it skips its cache-attribute checks for a 2025-11-25 client and passes the rest
+   against this overlay. A server that never sets `ServerConfig.Skills` exposes none of this in
+   either era.
 
 **Nothing about the tools changes between eras.** Same registry, same schemas, same data, same auth.
 Only the envelope differs — "legacy mode" is not a degraded mode.

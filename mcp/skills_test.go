@@ -331,6 +331,7 @@ func TestSkillsGetResolverConsultedOnlyOnMiss(t *testing.T) {
 		return Skill{
 			URI:         uri,
 			Frontmatter: map[string]interface{}{"name": "generated", "description": "made up on demand"},
+			Dynamic:     true,
 		}, true, nil
 	})
 
@@ -358,10 +359,10 @@ func TestSkillsGetResolverConsultedOnlyOnMiss(t *testing.T) {
 	if body.Skill.URI != "skill://generated/SKILL.md" {
 		t.Errorf("uri = %q", body.Skill.URI)
 	}
-	// A dynamically generated skill offers no integrity, so "resources" is omitted rather
-	// than sent empty.
-	if strings.Contains(string(env.Result), `"resources"`) {
-		t.Errorf("result %s should omit resources for a resolver-generated skill", env.Result)
+	// A dynamically generated skill has no manifest: "resources" is the string "dynamic",
+	// never absent and never an empty array.
+	if !body.Skill.Dynamic || !strings.Contains(string(env.Result), `"resources":"dynamic"`) {
+		t.Errorf("result %s should carry \"resources\":\"dynamic\"", env.Result)
 	}
 
 	// A resolver that declines still produces -32602, not a fabricated entry.
@@ -737,9 +738,27 @@ func TestRegisterRejectsMalformedDefinitions(t *testing.T) {
 			want: "does not equal frontmatter name",
 		},
 		{
-			name: "no frontmatter",
+			name: "SKILL.md without frontmatter",
 			def: SkillDef{URI: "skill://refunds/SKILL.md",
+				Files: map[string]SkillContent{"skill://refunds/SKILL.md": {Bytes: []byte("# Refunds\n")}}},
+			want: "missing YAML frontmatter",
+		},
+		{
+			name: "supplied frontmatter differs from the file's",
+			def: SkillDef{URI: "skill://refunds/SKILL.md",
+				Frontmatter: map[string]interface{}{"name": "refunds", "description": "something else"},
+				Files:       map[string]SkillContent{"skill://refunds/SKILL.md": {Bytes: good}}},
+			want: "differs from the frontmatter in the SKILL.md bytes",
+		},
+		{
+			name: "dynamic skill with files",
+			def: SkillDef{URI: "skill://refunds/SKILL.md", Frontmatter: fm, Dynamic: true,
 				Files: map[string]SkillContent{"skill://refunds/SKILL.md": {Bytes: good}}},
+			want: "takes no Files",
+		},
+		{
+			name: "dynamic skill without frontmatter",
+			def:  SkillDef{URI: "skill://refunds/SKILL.md", Dynamic: true},
 			want: "frontmatter is required",
 		},
 	}

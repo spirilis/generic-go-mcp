@@ -2,16 +2,16 @@ package mcp
 
 // Skills: the io.modelcontextprotocol/skills extension (SEP-2640).
 //
-// EXPERIMENTAL. SEP-2640 is an Extensions Track proposal that is open and not merged; this
-// file was written against head 641d1eb of modelcontextprotocol/modelcontextprotocol's
-// sep/skills-extension branch, 2026-08-20. Nothing about skills appears in the ratified
-// 2026-07-28 specification. Every exported symbol here may change with the SEP.
+// BETA. SEP-2640 is Final and the extension is published at stage Beta (SEP-3392): real use
+// is welcome, and a breaking change is possible but expected to be rare. This file follows
+// specification/beta/skills.mdx in modelcontextprotocol/ext-skills as read on 2026-11-25.
+// The extension is not part of the 2026-07-28 core specification.
 //
 // The whole surface is opt-in: with ServerConfig.Skills nil there is no capability key and
 // skills/list, skills/get, and resources/directory/read all answer -32601, so a server that
 // does not serve skills is byte-for-byte the server it was before this file existed.
 //
-// Two rules from the SEP constrain the design and must not be softened:
+// Two rules from the specification constrain the design and must not be softened:
 //
 //  1. The skill:// scheme is not privileged. A server MAY serve skills under any scheme
 //     native to its domain, so nothing here inspects or requires a particular scheme.
@@ -24,12 +24,16 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/url"
 	"path"
+	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -40,8 +44,6 @@ import (
 
 // SkillsExtensionID is the extension identifier under which this server declares skills
 // support in ServerCapabilities.Extensions.
-//
-// EXPERIMENTAL: tracks SEP-2640, which is not merged.
 const SkillsExtensionID = "io.modelcontextprotocol/skills"
 
 // SkillsMetaPrefix is the reserved reverse-domain prefix SEP-2640 sets aside for exposing
@@ -57,96 +59,175 @@ const skillFileName = "SKILL.md"
 // mimeTypeDirectory marks a directory entry in a resources/directory/read result.
 const mimeTypeDirectory = "inode/directory"
 
+// skillResourcesDynamic is what a skill entry's "resources" carries in place of a manifest
+// when the skill's content is generated and has no stable digests.
+const skillResourcesDynamic = "dynamic"
+
+// The two per-skill limits the specification fixes. Every conforming host accepts a skill
+// up to both; nothing promises that any host accepts a larger one, so Register refuses to
+// publish one unless AllowOversizedSkills is set.
+const (
+	// MaxSkillResources bounds the entries of one skill's manifest, SKILL.md included.
+	MaxSkillResources = 512
+	// MaxSkillBytes bounds the summed size of one skill's files: 16 MiB.
+	MaxSkillBytes = 16 << 20
+)
+
 // skillsExtensionSettings is the value of the extension's capability object. directoryRead
-// carries no omitempty: the SEP gives it a default of false, and saying so explicitly is
+// carries no omitempty: the specification gives it a default of false, and saying so explicitly is
 // friendlier to a client than an absent key it has to know the default for.
 type skillsExtensionSettings struct {
 	DirectoryRead bool `json:"directoryRead"`
 }
 
-// Skill is one entry in a skills/list result: the wire shape, produced by a SkillRegistry
-// and never assembled by hand.
+// Skill is one skill entry, the shape skills/list and skills/get both return. A
+// SkillRegistry produces it; only a SkillResolver assembles one by hand.
 //
 // Frontmatter is the SKILL.md YAML rendered verbatim as JSON. Unknown keys survive
-// deliberately — the Agent Skills format permits license, metadata, compatibility,
+// deliberately: the Agent Skills format permits license, metadata, compatibility,
 // allowed-tools and more, and hosts ship supersets of their own. This library validates the
 // two required keys and passes everything else through uninterpreted.
-//
-// EXPERIMENTAL: tracks SEP-2640, which is not merged.
 type Skill struct {
+	URI         string
+	Frontmatter map[string]interface{}
+	// Resources is the complete manifest: SKILL.md and every supporting file, each once,
+	// with its digest and size. It is what a host verifies reads against and what a user's
+	// approval binds to. Empty exactly when Dynamic is set.
+	Resources []SkillResource
+	// Dynamic marks a skill whose content is generated, so no stable digests exist. On the
+	// wire "resources" is then the string "dynamic" instead of an array. Such a skill has
+	// no content integrity, and hosts may decline to load it.
+	Dynamic bool
+	// Meta is the entry's optional _meta. Keys this extension defines start with
+	// SkillsMetaPrefix; use your own reverse-domain prefix for anything else.
+	Meta map[string]interface{}
+}
+
+// skillWire is Skill as JSON. "resources" is a union, an array or the string "dynamic",
+// which a struct tag cannot express.
+type skillWire struct {
 	URI         string                 `json:"uri"`
 	Frontmatter map[string]interface{} `json:"frontmatter"`
-	// Resources is the complete enumeration of the skill's files with their digests. It is
-	// omitted only for a dynamically generated skill whose content cannot be pre-digested
-	// (a SkillResolver may return one); hosts MAY decline to load such a skill.
-	Resources []SkillResource `json:"resources,omitempty"`
+	Resources   interface{}            `json:"resources"`
+	Meta        map[string]interface{} `json:"_meta,omitempty"`
+}
+
+// MarshalJSON writes "resources" as the manifest array or as "dynamic". The key is never
+// omitted and never null: the specification makes an entry without it invalid.
+func (s Skill) MarshalJSON() ([]byte, error) {
+	w := skillWire{URI: s.URI, Frontmatter: s.Frontmatter, Meta: s.Meta}
+	switch {
+	case s.Dynamic:
+		w.Resources = skillResourcesDynamic
+	case s.Resources == nil:
+		w.Resources = []SkillResource{}
+	default:
+		w.Resources = s.Resources
+	}
+	return json.Marshal(w)
+}
+
+// UnmarshalJSON accepts either form of "resources".
+func (s *Skill) UnmarshalJSON(b []byte) error {
+	var w struct {
+		URI         string                 `json:"uri"`
+		Frontmatter map[string]interface{} `json:"frontmatter"`
+		Resources   json.RawMessage        `json:"resources"`
+		Meta        map[string]interface{} `json:"_meta"`
+	}
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	out := Skill{URI: w.URI, Frontmatter: w.Frontmatter, Meta: w.Meta}
+	var marker string
+	switch {
+	case len(w.Resources) == 0 || string(w.Resources) == "null":
+		return fmt.Errorf("skill %q: resources is required: an array or %q", w.URI, skillResourcesDynamic)
+	case json.Unmarshal(w.Resources, &marker) == nil:
+		if marker != skillResourcesDynamic {
+			return fmt.Errorf("skill %q: resources is %q, want an array or %q", w.URI, marker, skillResourcesDynamic)
+		}
+		out.Dynamic = true
+	default:
+		if err := json.Unmarshal(w.Resources, &out.Resources); err != nil {
+			return fmt.Errorf("skill %q: resources: %w", w.URI, err)
+		}
+	}
+	*s = out
+	return nil
 }
 
 // SkillResource names one file belonging to a skill.
-//
-// EXPERIMENTAL: tracks SEP-2640, which is not merged.
 type SkillResource struct {
 	URI string `json:"uri"`
 	// Digest is "sha256:" followed by 64 lowercase hex characters over the file's RAW
 	// BYTES, and matches what resources/read returns for URI. Clients verify it; this
 	// library computes it, so the two cannot drift.
 	Digest string `json:"digest"`
+	// Size is the length in bytes of the same raw content. A host treats a read of any
+	// other length as a verification failure before it computes the digest.
+	Size int64 `json:"size"`
 }
 
 // SkillContent is one skill file's bytes. The digest, the size, and the choice between a
 // text and a base64 blob payload are all derived from Bytes; MimeType, if set, overrides
 // this package's extension-based detection.
-//
-// EXPERIMENTAL: tracks SEP-2640, which is not merged.
 type SkillContent struct {
 	Bytes    []byte
 	MimeType string
 }
 
 // SkillDef is the input side of registration: everything a consumer supplies. Files is
-// keyed by absolute resource URI and is the single source of truth for both the published
-// digests and what resources/read serves, which is what makes it impossible to publish a
-// digest that disagrees with the bytes.
-//
-// EXPERIMENTAL: tracks SEP-2640, which is not merged.
+// keyed by absolute resource URI and is the single source of truth for the published
+// digests and sizes, for the frontmatter, and for what resources/read serves. That is what
+// makes it impossible to publish an entry that disagrees with the bytes.
 type SkillDef struct {
 	// URI is the skill's SKILL.md and must end in "/SKILL.md". The last segment of the
-	// path above it is the skill root and must equal frontmatter["name"].
+	// path above it is the skill root and must equal the frontmatter name.
 	URI string
-	// Frontmatter is the parsed SKILL.md YAML. Use LoadFS to get it from a filesystem, or
-	// parse it yourself and pass it here.
+	// Frontmatter is optional for a skill with Files: the registry parses it from the
+	// SKILL.md bytes. If it is set anyway it must equal what those bytes contain, or
+	// Register fails. A Dynamic skill has no bytes to parse, so there it is required.
 	Frontmatter map[string]interface{}
 	// Files must contain URI plus every other file the skill publishes. Each key must be
-	// under the skill root.
+	// under the skill root. Empty for a Dynamic skill.
 	Files map[string]SkillContent
+	// Dynamic lists a skill whose content is generated: the entry carries
+	// "resources": "dynamic" and the registry registers no files. Serving the SKILL.md
+	// and everything else through the ResourceRegistry (usually a ResourceTemplate over
+	// the same URI namespace) is then the caller's job, and so is keeping the served
+	// frontmatter equal to Frontmatter.
+	Dynamic bool
+	// Meta becomes the entry's _meta.
+	Meta map[string]interface{}
 }
 
 // SkillResolver backs skills/get for catalogs too large or too dynamic to enumerate, which
-// is how the SEP's "the server MUST answer for every skill it serves, listed or not"
+// is how the rule "a server MUST answer for every skill it serves, listed or not"
 // becomes implementable without materializing the keyspace. It is consulted only after a
 // registered lookup misses.
 //
-// A resolver returns the wire shape directly and therefore owns digest correctness itself.
-// It is also responsible for making the skill's files readable — pair it with a
-// ResourceTemplate registered over the same URI namespace, since nothing is registered on
-// the ResourceRegistry on its behalf.
+// A resolver returns the entry directly and therefore owns digest and size correctness
+// itself: either a complete Resources manifest, or Dynamic. It is also responsible for
+// making the skill's files readable — pair it with a ResourceTemplate registered over the
+// same URI namespace, since nothing is registered on the ResourceRegistry on its behalf.
 //
-// EXPERIMENTAL: tracks SEP-2640, which is not merged.
+// The entry is checked before it is sent (see validateSkillEntry). One that fails is a
+// server bug, logged and answered with -32603, never passed to a host that would refuse it.
 type SkillResolver func(ctx context.Context, uri string) (Skill, bool, error)
 
 // SkillRegistry holds the skills this server serves and keeps the resource registry in step
 // with them: registering a skill also registers every file it publishes, so skills/list and
 // resources/read can never disagree about what exists.
-//
-// EXPERIMENTAL: tracks SEP-2640, which is not merged.
 type SkillRegistry struct {
-	mu       sync.RWMutex
-	rr       *ResourceRegistry
-	skills   []Skill             // registration order, stable
-	owns     map[string][]string // skill URI -> the file URIs it registered
-	refs     map[string]int      // file URI -> how many skills publish it
-	digests  map[string]string   // file URI -> published sha256 digest, for conflict detection
-	resolver SkillResolver
+	mu        sync.RWMutex
+	rr        *ResourceRegistry
+	skills    []Skill             // registration order, stable
+	owns      map[string][]string // skill URI -> the file URIs it registered
+	refs      map[string]int      // file URI -> how many skills publish it
+	digests   map[string]string   // file URI -> published sha256 digest, for conflict detection
+	resolver  SkillResolver
+	oversized bool // AllowOversizedSkills
 }
 
 // NewSkillRegistry creates a skill registry backed by rr.
@@ -154,8 +235,6 @@ type SkillRegistry struct {
 // It takes the resource registry because a skill's files ARE resources: registering a skill
 // registers its files so resources/read can serve them, and unregistering it takes them
 // away again. rr must not be nil.
-//
-// EXPERIMENTAL: tracks SEP-2640, which is not merged.
 func NewSkillRegistry(rr *ResourceRegistry) *SkillRegistry {
 	if rr == nil {
 		panic("mcp: NewSkillRegistry requires a non-nil ResourceRegistry")
@@ -178,9 +257,13 @@ func NewSkillRegistry(rr *ResourceRegistry) *SkillRegistry {
 // notifications/resources/list_changed, rather than one per file.
 //
 // It returns an error if def.URI does not end in "/SKILL.md", if def.Files omits def.URI or
-// names a file outside the skill root, if the frontmatter is missing or fails the Agent
-// Skills naming rules, or if the last segment of the skill root does not equal
-// frontmatter["name"].
+// names a file outside the skill root, if the SKILL.md does not begin with YAML frontmatter
+// or that frontmatter fails the Agent Skills naming rules, if def.Frontmatter is set and
+// differs from the file's, if the last segment of the skill root does not equal the
+// frontmatter name, or if the skill exceeds MaxSkillResources or MaxSkillBytes (see
+// AllowOversizedSkills).
+//
+// A def with Dynamic set registers the entry alone: see SkillDef.Dynamic.
 func (r *SkillRegistry) Register(def SkillDef) error {
 	skill, resources, fns, err := buildSkill(def)
 	if err != nil {
@@ -188,6 +271,13 @@ func (r *SkillRegistry) Register(def SkillDef) error {
 	}
 
 	r.mu.Lock()
+
+	if !r.oversized {
+		if err := checkSkillLimits(skill); err != nil {
+			r.mu.Unlock()
+			return err
+		}
+	}
 
 	// Validate before mutating: a file URI this skill publishes that another skill also
 	// publishes must carry identical bytes, or skills/list would advertise a digest that
@@ -280,8 +370,8 @@ func (r *SkillRegistry) Get(uri string) (Skill, bool) {
 
 // Has reports whether any skill is registered. Note that the extension is declared whenever
 // a SkillRegistry is configured, empty or not: an empty listing is legitimate (a
-// resolver-backed catalog is unenumerable by design) and the SEP says hosts MUST NOT read
-// one as proof that a server has no skills.
+// resolver-backed catalog is unenumerable by design) and the specification says hosts MUST
+// NOT read one as proof that a server has no skills.
 func (r *SkillRegistry) Has() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -294,6 +384,33 @@ func (r *SkillRegistry) SetResolver(f SkillResolver) {
 	r.mu.Lock()
 	r.resolver = f
 	r.mu.Unlock()
+}
+
+// AllowOversizedSkills lets Register publish a skill beyond MaxSkillResources or
+// MaxSkillBytes. The specification says a server SHOULD NOT: a host is only required to
+// accept a skill within both limits, so a larger one may load nowhere. Set this only for
+// hosts you know take it. It affects later registrations, not skills already registered.
+func (r *SkillRegistry) AllowOversizedSkills(allow bool) {
+	r.mu.Lock()
+	r.oversized = allow
+	r.mu.Unlock()
+}
+
+// checkSkillLimits applies the specification's two per-skill limits to a manifest.
+func checkSkillLimits(skill Skill) error {
+	if n := len(skill.Resources); n > MaxSkillResources {
+		return fmt.Errorf("skill %q: %d files exceeds the %d a host must accept (AllowOversizedSkills overrides)",
+			skill.URI, n, MaxSkillResources)
+	}
+	var total int64
+	for _, sr := range skill.Resources {
+		total += sr.Size
+	}
+	if total > MaxSkillBytes {
+		return fmt.Errorf("skill %q: %d bytes exceeds the %d a host must accept (AllowOversizedSkills overrides)",
+			skill.URI, total, MaxSkillBytes)
+	}
+	return nil
 }
 
 // resolve runs the resolver, if one is installed. Callers must have already tried Get.
@@ -371,53 +488,76 @@ const (
 )
 
 // buildSkill validates a definition and derives everything the wire and the resource
-// registry need from it: the digests, the mime types, and one ResourceFunction per file.
+// registry need from it: the frontmatter, the digests and sizes, the mime types, and one
+// ResourceFunction per file.
 func buildSkill(def SkillDef) (Skill, []Resource, []ResourceFunction, error) {
+	fail := func(format string, args ...interface{}) (Skill, []Resource, []ResourceFunction, error) {
+		return Skill{}, nil, nil, fmt.Errorf(format, args...)
+	}
+
 	root, ok := skillRoot(def.URI)
 	if !ok {
-		return Skill{}, nil, nil, fmt.Errorf("skill uri %q must end in %q", def.URI, "/"+skillFileName)
+		return fail("skill uri %q must end in %q", def.URI, "/"+skillFileName)
 	}
 
-	name, err := validateSkillFrontmatter(def.Frontmatter)
+	frontmatter := def.Frontmatter
+	if def.Dynamic {
+		if len(def.Files) > 0 {
+			return fail("skill %q: a Dynamic skill takes no Files; serve them through the ResourceRegistry", def.URI)
+		}
+	} else {
+		manifest, present := def.Files[def.URI]
+		if !present {
+			return fail("skill %q: Files must contain the SKILL.md uri itself", def.URI)
+		}
+		// The entry's frontmatter comes from the bytes a host will read, not from a
+		// second copy that could drift: a host compares the two field by field and
+		// refuses the skill on any difference.
+		parsed, err := parseFrontmatter(manifest.Bytes)
+		if err != nil {
+			return fail("skill %q: %w", def.URI, err)
+		}
+		if def.Frontmatter != nil && !sameJSON(def.Frontmatter, parsed) {
+			return fail("skill %q: Frontmatter differs from the frontmatter in the SKILL.md bytes; leave it nil to use the file's", def.URI)
+		}
+		frontmatter = parsed
+	}
+
+	name, err := validateSkillFrontmatter(frontmatter)
 	if err != nil {
-		return Skill{}, nil, nil, fmt.Errorf("skill %q: %w", def.URI, err)
+		return fail("skill %q: %w", def.URI, err)
 	}
 
-	// The SEP: "the final segment of <skill-path> MUST equal the skill's name". Compared
-	// lexically so it holds for skill://git-workflow/SKILL.md, where the name occupies the
-	// URI's authority component, as well as for skill://acme/billing/refunds/SKILL.md.
+	// "The final segment of <skill-path> MUST equal the skill's name". Compared lexically
+	// so it holds for skill://git-workflow/SKILL.md, where the name occupies the URI's
+	// authority component, as well as for skill://acme/billing/refunds/SKILL.md.
 	if seg := lastSegment(root); seg != name {
-		return Skill{}, nil, nil, fmt.Errorf(
-			"skill %q: final path segment %q does not equal frontmatter name %q", def.URI, seg, name)
+		return fail("skill %q: final path segment %q does not equal frontmatter name %q", def.URI, seg, name)
 	}
 
-	if _, present := def.Files[def.URI]; !present {
-		return Skill{}, nil, nil, fmt.Errorf("skill %q: Files must contain the SKILL.md uri itself", def.URI)
+	skill := Skill{URI: def.URI, Frontmatter: frontmatter, Dynamic: def.Dynamic, Meta: def.Meta}
+	if def.Dynamic {
+		return skill, nil, nil, nil
 	}
 
 	// SKILL.md first, then the rest lexically: deterministic output, and the entry point
-	// leads the resources array the way the SEP's examples show it.
+	// leads the resources array the way the specification's examples show it.
 	uris := make([]string, 0, len(def.Files))
 	for u := range def.Files {
 		if u == def.URI {
 			continue
 		}
 		if !strings.HasPrefix(u, root+"/") {
-			return Skill{}, nil, nil, fmt.Errorf(
-				"skill %q: file %q is not under the skill root %q", def.URI, u, root)
+			return fail("skill %q: file %q is not under the skill root %q", def.URI, u, root)
 		}
 		uris = append(uris, u)
 	}
 	sort.Strings(uris)
 	uris = append([]string{def.URI}, uris...)
 
-	description, _ := def.Frontmatter["description"].(string)
+	description, _ := frontmatter["description"].(string)
 
-	skill := Skill{
-		URI:         def.URI,
-		Frontmatter: def.Frontmatter,
-		Resources:   make([]SkillResource, 0, len(uris)),
-	}
+	skill.Resources = make([]SkillResource, 0, len(uris))
 	resources := make([]Resource, 0, len(uris))
 	fns := make([]ResourceFunction, 0, len(uris))
 
@@ -428,12 +568,15 @@ func buildSkill(def SkillDef) (Skill, []Resource, []ResourceFunction, error) {
 			mimeType = skillMimeType(u, content.Bytes)
 		}
 
+		// One length and one hash of one byte slice: the manifest entry, the resource's
+		// size and what resources/read serves cannot disagree.
+		size := int64(len(content.Bytes))
 		skill.Resources = append(skill.Resources, SkillResource{
 			URI:    u,
 			Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(content.Bytes)),
+			Size:   size,
 		})
 
-		size := int64(len(content.Bytes))
 		res := Resource{
 			URI:      u,
 			Name:     displaySegment(strings.TrimPrefix(u, root+"/")),
@@ -441,7 +584,7 @@ func buildSkill(def SkillDef) (Skill, []Resource, []ResourceFunction, error) {
 			Size:     &size,
 		}
 		if u == def.URI {
-			// The SEP: a SKILL.md resource SHOULD take its name and description from the
+			// A SKILL.md resource SHOULD take its name and description from the
 			// frontmatter.
 			res.Name = name
 			res.Description = description
@@ -451,6 +594,79 @@ func buildSkill(def SkillDef) (Skill, []Resource, []ResourceFunction, error) {
 	}
 
 	return skill, resources, fns, nil
+}
+
+// sameJSON reports whether a and b render to the same JSON value. It is how a supplied
+// frontmatter map is compared with the parsed one: the wire carries JSON, so two maps that
+// differ only in Go types (int versus float64, say) are the same frontmatter.
+func sameJSON(a, b interface{}) bool {
+	norm := func(v interface{}) (interface{}, bool) {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return nil, false
+		}
+		var out interface{}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, false
+		}
+		return out, true
+	}
+	na, okA := norm(a)
+	nb, okB := norm(b)
+	return okA && okB && reflect.DeepEqual(na, nb)
+}
+
+// skillDigestPattern is the only digest form the specification allows.
+var skillDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// validateSkillEntry checks an entry a SkillResolver assembled by hand against the rules a
+// host enforces on receipt, so a resolver bug surfaces here and not as a skill that
+// silently fails to load. want is the URI the client asked for. Entries built by Register
+// satisfy all of this by construction and are not re-checked.
+func validateSkillEntry(skill Skill, want string) error {
+	if skill.URI != want {
+		return fmt.Errorf("resolver returned entry %q for %q", skill.URI, want)
+	}
+	root, ok := skillRoot(skill.URI)
+	if !ok {
+		return fmt.Errorf("skill uri %q must end in %q", skill.URI, "/"+skillFileName)
+	}
+	name, err := validateSkillFrontmatter(skill.Frontmatter)
+	if err != nil {
+		return fmt.Errorf("skill %q: %w", skill.URI, err)
+	}
+	if seg := lastSegment(root); seg != name {
+		return fmt.Errorf("skill %q: final path segment %q does not equal frontmatter name %q", skill.URI, seg, name)
+	}
+	if skill.Dynamic {
+		if len(skill.Resources) > 0 {
+			return fmt.Errorf("skill %q: Dynamic and Resources are mutually exclusive", skill.URI)
+		}
+		return nil
+	}
+	if len(skill.Resources) == 0 {
+		return fmt.Errorf("skill %q: Resources must list SKILL.md and every other file, or Dynamic must be set", skill.URI)
+	}
+	seen := make(map[string]struct{}, len(skill.Resources))
+	for _, sr := range skill.Resources {
+		if sr.URI != skill.URI && !strings.HasPrefix(sr.URI, root+"/") {
+			return fmt.Errorf("skill %q: file %q is not under the skill root %q", skill.URI, sr.URI, root)
+		}
+		if _, dup := seen[sr.URI]; dup {
+			return fmt.Errorf("skill %q: file %q is listed twice", skill.URI, sr.URI)
+		}
+		seen[sr.URI] = struct{}{}
+		if !skillDigestPattern.MatchString(sr.Digest) {
+			return fmt.Errorf("skill %q: file %q: digest %q is not sha256: plus 64 lowercase hex characters", skill.URI, sr.URI, sr.Digest)
+		}
+		if sr.Size < 0 {
+			return fmt.Errorf("skill %q: file %q: negative size", skill.URI, sr.URI)
+		}
+	}
+	if _, ok := seen[skill.URI]; !ok {
+		return fmt.Errorf("skill %q: Resources must include the SKILL.md itself", skill.URI)
+	}
+	return nil
 }
 
 // staticResourceFunction serves a fixed byte slice. The payload is decided once, at
@@ -469,9 +685,9 @@ func staticResourceFunction(b []byte, mimeType string) ResourceFunction {
 // validateSkillFrontmatter enforces the Agent Skills specification's rules for the two
 // required keys (and the one optional key with a documented bound), and confirms the whole
 // map can be rendered as JSON. Everything else — license, metadata, allowed-tools — passes
-// through uninterpreted. allowed-tools in particular is a host-side consent matter that the
-// SEP says hosts MUST ignore for MCP-origin skills absent explicit per-skill approval, so
-// this library must not act on it.
+// through uninterpreted. allowed-tools in particular is a host-side consent matter that
+// hosts MUST ignore for MCP-origin skills absent explicit per-skill approval, so this
+// library must not act on it.
 func validateSkillFrontmatter(fm map[string]interface{}) (string, error) {
 	if len(fm) == 0 {
 		return "", fmt.Errorf("frontmatter is required and must contain name and description")
@@ -622,7 +838,7 @@ func skillMimeType(uri string, b []byte) string {
 // Walk rules:
 //
 //   - A directory is a skill if and only if it directly contains SKILL.md.
-//   - A skill's files are every regular file at or below its directory. Per the SEP, that
+//   - A skill's files are every regular file at or below its directory. That
 //     includes the files of any nested skill, which is also registered as its own ordinary
 //     top-level entry — publication is flat and nesting is not marked.
 //   - A directory with no SKILL.md that is not inside a skill is an organizational prefix
@@ -632,8 +848,6 @@ func skillMimeType(uri string, b []byte) string {
 //
 // Registration is per skill, so a filesystem holding three skills fires three
 // notifications/resources/list_changed, not one per file.
-//
-// EXPERIMENTAL: tracks SEP-2640, which is not merged.
 func (r *SkillRegistry) LoadFS(fsys fs.FS, uriPrefix string) error {
 	if !strings.HasSuffix(uriPrefix, "://") && !strings.HasSuffix(uriPrefix, "/") {
 		return fmt.Errorf("uri prefix %q must end in %q or %q", uriPrefix, "://", "/")
@@ -704,13 +918,6 @@ func (r *SkillRegistry) LoadFS(fsys fs.FS, uriPrefix string) error {
 				return fmt.Errorf("reading %q: %w", f, err)
 			}
 			def.Files[uriPrefix+escapeURIPath(f)] = SkillContent{Bytes: b}
-			if f == root+"/"+skillFileName {
-				fm, err := parseFrontmatter(b)
-				if err != nil {
-					return fmt.Errorf("%s: %w", f, err)
-				}
-				def.Frontmatter = fm
-			}
 		}
 		if err := r.Register(def); err != nil {
 			return fmt.Errorf("%s/%s: %w", root, skillFileName, err)
@@ -730,20 +937,22 @@ func escapeURIPath(p string) string {
 }
 
 // parseFrontmatter extracts the leading "---"-delimited YAML block of a SKILL.md and
-// decodes it into the map that goes on the wire verbatim. yaml.v3 (unlike v2) decodes
-// mappings into map[string]interface{} when the target is interface{}, which is exactly
-// what rendering the frontmatter as JSON needs.
+// decodes it into the map that goes on the wire verbatim.
+//
+// The fences are read strictly, the way the hosts that will re-parse this file read them:
+// the first line is exactly "---", and the block ends at the next line that is "---"
+// (trailing spaces or tabs allowed). A file a host cannot split is refused here.
 func parseFrontmatter(b []byte) (map[string]interface{}, error) {
 	s := strings.TrimPrefix(string(b), "\ufeff")
-	if !strings.HasPrefix(s, "---") {
+	var rest string
+	switch {
+	case strings.HasPrefix(s, "---\n"):
+		rest = s[4:]
+	case strings.HasPrefix(s, "---\r\n"):
+		rest = s[5:]
+	default:
 		return nil, fmt.Errorf("missing YAML frontmatter: file does not begin with a --- line")
 	}
-	rest := s[3:]
-	nl := strings.IndexByte(rest, '\n')
-	if nl < 0 || strings.TrimSpace(rest[:nl]) != "" {
-		return nil, fmt.Errorf("missing YAML frontmatter: file does not begin with a --- line")
-	}
-	rest = rest[nl+1:]
 
 	end := -1
 	for offset := 0; offset < len(rest); {
@@ -751,7 +960,7 @@ func parseFrontmatter(b []byte) (map[string]interface{}, error) {
 		if i := strings.IndexByte(line, '\n'); i >= 0 {
 			line = line[:i]
 		}
-		if t := strings.TrimRight(line, "\r"); t == "---" || t == "..." {
+		if strings.TrimRight(line, " \t\r") == "---" && strings.HasPrefix(line, "---") {
 			end = offset
 			break
 		}
@@ -761,14 +970,156 @@ func parseFrontmatter(b []byte) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("unterminated YAML frontmatter: no closing --- line")
 	}
 
-	var fm map[string]interface{}
-	if err := yaml.Unmarshal([]byte(rest[:end]), &fm); err != nil {
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(rest[:end]), &doc); err != nil {
 		return nil, fmt.Errorf("parsing YAML frontmatter: %w", err)
 	}
-	if fm == nil {
+	if doc.Kind == 0 || len(doc.Content) == 0 {
+		return nil, fmt.Errorf("YAML frontmatter is empty")
+	}
+	budget := maxFrontmatterNodes
+	v, err := yamlJSONValue(doc.Content[0], 0, &budget)
+	if err != nil {
+		return nil, fmt.Errorf("parsing YAML frontmatter: %w", err)
+	}
+	fm, ok := v.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("YAML frontmatter must be a mapping")
+	}
+	if len(fm) == 0 {
 		return nil, fmt.Errorf("YAML frontmatter is empty")
 	}
 	return fm, nil
+}
+
+// Bounds on walking a frontmatter document. Aliases can make a few bytes of YAML expand
+// without limit, or refer to themselves.
+const (
+	maxFrontmatterDepth = 64
+	maxFrontmatterNodes = 10000
+)
+
+// yamlJSONValue converts a YAML node to the JSON value a YAML 1.2 core-schema parser would
+// produce for it, which is what the hosts comparing this entry with the file use.
+//
+// Decoding straight into interface{} would follow yaml.v3's own resolution instead, which
+// keeps some YAML 1.1 habits: an unquoted 2026-11-25 becomes a time.Time (and then a
+// different string in JSON), 014 is read as octal, and << merges maps. A host would see a
+// frontmatter that differs from the entry and refuse the skill.
+func yamlJSONValue(n *yaml.Node, depth int, budget *int) (interface{}, error) {
+	if depth > maxFrontmatterDepth {
+		return nil, fmt.Errorf("nested deeper than %d levels", maxFrontmatterDepth)
+	}
+	if *budget--; *budget < 0 {
+		return nil, fmt.Errorf("more than %d values", maxFrontmatterNodes)
+	}
+	switch n.Kind {
+	case yaml.AliasNode:
+		return yamlJSONValue(n.Alias, depth+1, budget)
+	case yaml.MappingNode:
+		out := make(map[string]interface{}, len(n.Content)/2)
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			k := n.Content[i]
+			if k.Kind == yaml.AliasNode {
+				k = k.Alias
+			}
+			if k.Kind != yaml.ScalarNode {
+				return nil, fmt.Errorf("line %d: a mapping key must be a scalar", k.Line)
+			}
+			if _, dup := out[k.Value]; dup {
+				return nil, fmt.Errorf("line %d: duplicate key %q", k.Line, k.Value)
+			}
+			v, err := yamlJSONValue(n.Content[i+1], depth+1, budget)
+			if err != nil {
+				return nil, err
+			}
+			out[k.Value] = v
+		}
+		return out, nil
+	case yaml.SequenceNode:
+		out := make([]interface{}, 0, len(n.Content))
+		for _, c := range n.Content {
+			v, err := yamlJSONValue(c, depth+1, budget)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, v)
+		}
+		return out, nil
+	case yaml.ScalarNode:
+		return yamlScalar(n)
+	default:
+		return nil, fmt.Errorf("line %d: unsupported YAML node", n.Line)
+	}
+}
+
+// The YAML 1.2 core schema's plain-scalar forms.
+var (
+	yamlDecimalPattern = regexp.MustCompile(`^[-+]?[0-9]+$`)
+	yamlOctalPattern   = regexp.MustCompile(`^0o[0-7]+$`)
+	yamlHexPattern     = regexp.MustCompile(`^0x[0-9a-fA-F]+$`)
+	yamlFloatPattern   = regexp.MustCompile(`^[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?$`)
+	yamlInfNaNPattern  = regexp.MustCompile(`^([-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN))$`)
+)
+
+// yamlScalar resolves one scalar by the YAML 1.2 core schema. Anything quoted, in block
+// style or explicitly tagged !!str is a string; a plain scalar is null, a boolean or a
+// number only in the forms that schema names, and a string otherwise.
+func yamlScalar(n *yaml.Node) (interface{}, error) {
+	if n.Style&(yaml.DoubleQuotedStyle|yaml.SingleQuotedStyle|yaml.LiteralStyle|yaml.FoldedStyle) != 0 || n.Tag == "!!str" && n.Style&yaml.TaggedStyle != 0 {
+		return n.Value, nil
+	}
+	v := n.Value
+	switch v {
+	case "", "~", "null", "Null", "NULL":
+		return nil, nil
+	case "true", "True", "TRUE":
+		return true, nil
+	case "false", "False", "FALSE":
+		return false, nil
+	}
+	switch {
+	case yamlDecimalPattern.MatchString(v):
+		return yamlInt(v, strings.TrimPrefix(v, "+"), 10), nil
+	case yamlOctalPattern.MatchString(v):
+		return yamlInt(v, v[2:], 8), nil
+	case yamlHexPattern.MatchString(v):
+		return yamlInt(v, v[2:], 16), nil
+	case yamlFloatPattern.MatchString(v):
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil && !errors.Is(err, strconv.ErrRange) {
+			return v, nil
+		}
+		if math.IsInf(f, 0) {
+			return nil, fmt.Errorf("line %d: %s is out of range for JSON", n.Line, v)
+		}
+		return f, nil
+	case yamlInfNaNPattern.MatchString(v):
+		return nil, fmt.Errorf("line %d: %s cannot be rendered as JSON; quote it", n.Line, v)
+	}
+	return v, nil
+}
+
+// yamlInt parses digits in base. A value too large for int64 becomes a float64, the same
+// number a JavaScript host ends up holding, and "-0" stays negative zero for the same
+// reason.
+func yamlInt(literal, digits string, base int) interface{} {
+	i, err := strconv.ParseInt(digits, base, 64)
+	if err != nil {
+		f, _ := strconv.ParseFloat(digits, 64)
+		if base != 10 {
+			u, uerr := strconv.ParseUint(digits, base, 64)
+			if uerr == nil {
+				return float64(u)
+			}
+			return literal
+		}
+		return f
+	}
+	if i == 0 && strings.HasPrefix(literal, "-") {
+		return math.Copysign(0, -1)
+	}
+	return i
 }
 
 // ---------------------------------------------------------------------------
@@ -804,11 +1155,13 @@ func (s *Server) handleSkillsList(ctx context.Context, params json.RawMessage) (
 }
 
 // SkillsGetResult is the result of skills/get. The entry sits under a "skill" key rather
-// than being the result itself — that is the SEP's shape.
+// than being the result itself.
 //
-// The cache envelope here is this library's call, not the specification's: SEP-2640 gives
-// skills/list ttlMs and cacheScope per SEP-2549 and leaves skills/get open. A single entry
-// is as cacheable as a listing of one, so it carries the same hints with the same list TTL.
+// ttlMs and cacheScope are required here as on every cacheable result. ttlMs says how long
+// a host may treat the entry as current before calling skills/get again, so it is the list
+// TTL (an entry is a listing of one), not the resources/read TTL. Neither field is an
+// integrity property: a host verifies every read against the manifest however fresh its
+// copy of the entry is.
 type SkillsGetResult struct {
 	CacheableResult
 	Skill Skill `json:"skill"`
@@ -834,6 +1187,11 @@ func (s *Server) handleSkillsGet(ctx context.Context, params json.RawMessage) (R
 		if err != nil {
 			return nil, internalErr(err)
 		}
+		if ok {
+			if err := validateSkillEntry(skill, p.URI); err != nil {
+				return nil, internalErr(fmt.Errorf("skill resolver returned an invalid entry: %w", err))
+			}
+		}
 	}
 	if !ok {
 		// -32602, the same code resources/read uses for an unknown resource. A URI that is
@@ -855,9 +1213,9 @@ type ResourcesDirectoryReadResult struct {
 	NextCursor string     `json:"nextCursor,omitempty"`
 }
 
-// handleResourcesDirectoryRead answers the SEP's scoped directory listing. The method is
-// gated behind the skills extension's directoryRead setting because that is where the SEP
-// declares it, but the method itself is scheme-agnostic and not skill-exclusive: it lists
+// handleResourcesDirectoryRead answers the extension's scoped directory listing. The method
+// is gated behind the skills extension's directoryRead setting because that is where it is
+// declared, but the method itself is scheme-agnostic and not skill-exclusive: it lists
 // any directory in this server's resource namespace.
 func (s *Server) handleResourcesDirectoryRead(ctx context.Context, params json.RawMessage) (Result, *transport.RPCError) {
 	var p struct {

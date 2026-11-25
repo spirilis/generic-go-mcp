@@ -1,3 +1,44 @@
+# Skills extension: August draft -> released Beta spec (2026-11-25) — DONE
+
+Target: `specification/beta/skills.mdx` in modelcontextprotocol/ext-skills (SEP-2640 Final,
+extension stage Beta per SEP-3392). Claude Code >= 2.1.331 and claude.ai connectors consume it
+(public beta, 2026-11-24). Acceptance: `@modelcontextprotocol/conformance@alpha` server skills
+scenarios against the example over HTTP.
+
+## Wire and API
+- [x] `SkillResource.size` (required): byte length of the same bytes the digest covers.
+- [x] `Skill.resources` is always present: an array, or the string `"dynamic"` (`Skill.Dynamic`).
+- [x] `Skill._meta` (optional), from `SkillDef.Meta`.
+- [x] `SkillDef.Dynamic`: list a generated skill without files.
+- [x] Resolver output is validated before it is sent (shape, name, digest format, size).
+- [x] Frontmatter is derived from the SKILL.md bytes; a supplied map that differs is rejected.
+- [x] YAML -> JSON as a YAML 1.2 host parser reads it (unquoted dates stay strings).
+- [x] Per-skill limits: 512 files, 16 MiB; `AllowOversizedSkills` opts out.
+- [x] Declaring the extension always declares `resources`.
+
+## Around it
+- [x] Example serves skills in every mode (conformance needs a URL).
+- [x] Legacy overlay: tests for `initialize` (extension + resources) and `size` on skills/list.
+- [x] Comments, README, CLAUDE.md, consumption skill: Beta, clients exist, Claude's host limits.
+- [x] `go test -race ./...`, `go vet`, `gofmt`; conformance run on 2026-07-28 and 2025-11-25.
+
+## Review
+- Conformance (`@modelcontextprotocol/conformance@alpha`, skills scenarios) against the example:
+  45/45 as a 2026-07-28 client; 43/43 as a 2025-11-25 client through the overlay, the two
+  cache-attribute checks skipped as not applicable before 2026-07-28. The v0.10.2 code fails
+  `sep-2640-resources-size-required`, so the suite does discriminate.
+- Same result against a scratch server with a nested skill, a `Dynamic` skill, a resolver-only
+  skill and frontmatter holding an unquoted date, `014` and `yes`.
+- MCP Inspector `--cli --method skills/list --verify`: every digest, size and frontmatter
+  verified; the dynamic skill reported `unverifiable`, as it should be.
+- Not tested: loading a skill in Claude or Claude Code. MCP skills are not available in the
+  session type this work ran in.
+- The legacy overlay still strips `ttlMs`/`cacheScope` from skills results. That is deliberate:
+  the fields are undefined before 2026-07-28 and the conformance suite skips them there.
+
+## Not doing
+- No tag: a module tag is permanent and no Claude client has loaded these skills yet.
+
 # Audit remediation — Skills (SEP-2640) & general codebase — DONE
 
 Source: security/correctness audit (plan file take-a-look-at-encapsulated-creek.md).

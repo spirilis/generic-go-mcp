@@ -13,9 +13,10 @@ implemented here; Prompts are not yet implemented (see that document's "Out of s
 Parameterized resources **are** implemented: RFC 6570 resource templates via
 `resources/templates/list`, matched back to a concrete URI on `resources/read`, plus an opt-in
 `completion/complete` provider for narrowing a template variable — see "Resource Templates" below.
-The `io.modelcontextprotocol/skills` extension (SEP-2640) is implemented as an explicitly
-**experimental, opt-in** surface: `skills/list`, `skills/get`, and `resources/directory/read`, off
-entirely unless `ServerConfig.Skills` is set — see "Skills" below. An optional `compat` package (off
+The `io.modelcontextprotocol/skills` extension (SEP-2640 Final, extension stage **Beta**; Claude
+and Claude Code load skills through it) is implemented as an **opt-in** surface: `skills/list`,
+`skills/get`, and `resources/directory/read`, off entirely unless `ServerConfig.Skills` is set — see
+"Skills" below. An optional `compat` package (off
 by default) can additionally serve clients still on 2025-11-25 or earlier alongside this native
 2026-07-28 support — see [LEGACY-COMPAT.md](LEGACY-COMPAT.md).
 
@@ -155,7 +156,8 @@ everywhere else in this file. See [LEGACY-COMPAT.md](LEGACY-COMPAT.md).
   Resource templates, `completion/complete`, and the skills extension's three methods
   (`skills/list`, `skills/get`, `resources/directory/read`) are all era-neutral and share an
   identical params object across eras, so they are forwarded like any other method. Downgrading does
-  not descend into nested values, so a skill's frontmatter and per-file digests survive untouched,
+  not descend into nested values, so a skill's frontmatter and per-file digests and sizes survive
+  untouched,
   and `capabilities.extensions` reaches the legacy handshake because `mcp.ServerCapabilities` has a
   typed field for it
 - Refusing MRTR (`input_required`) results visibly to legacy clients, which have no way to answer one
@@ -374,21 +376,36 @@ content is never the right way to say "not found".
 See `mcp/templates.go`, `mcp/completion.go`, and the template API on `ResourceRegistry` in
 `mcp/resources.go`.
 
-### Skills (EXPERIMENTAL — SEP-2640)
+### Skills (Beta — SEP-2640)
 
-`examples/go-mcp/main.go`'s UNIX-socket mode embeds `examples/go-mcp/skills/` and hands it to
-`SkillRegistry.LoadFS`, which is what makes that server declare the
+`examples/go-mcp/main.go` embeds `examples/go-mcp/skills/` and hands it to
+`SkillRegistry.LoadFS` in every mode, which is what makes that server declare the
 `io.modelcontextprotocol/skills` extension and answer `skills/list`, `skills/get`, and (because it
 also sets `SkillsDirectoryRead`) `resources/directory/read`.
 
-**This tracks an unmerged proposal.** SEP-2640 is Extensions Track, open, written here against head
-`641d1eb` (2026-08-20). Nothing about skills is in the ratified 2026-07-28 spec and no public client
-consumes it yet. Every exported symbol in `mcp/skills.go` carries an `EXPERIMENTAL:` doc comment
-naming the SEP and that commit, so drift is visible in `go doc`. The single most important design
-property is that `ServerConfig.Skills == nil` means *nothing changes*: no capability key, no method
-answering anything but `-32601`.
+**Status.** SEP-2640 is Final and the extension is published at stage Beta
+(`specification/beta/skills.mdx` in modelcontextprotocol/ext-skills, read 2026-11-25): a breaking
+change is possible but expected to be rare. It is an extension, not part of the 2026-07-28 core
+spec. Claude Code (v2.1.331+) and claude.ai connectors consume it in public beta. The single most
+important design property is that `ServerConfig.Skills == nil` means *nothing changes*: no
+capability key, no method answering anything but `-32601`.
 
-Two rules from the SEP that the code must never soften:
+**Acceptance test for any change here:** the skills scenarios of
+`@modelcontextprotocol/conformance@alpha` against the example over HTTP, once as a 2026-07-28
+client and once with `-legacy-compat` as a 2025-11-25 client:
+
+```bash
+go build -o /tmp/go-mcp ./examples/go-mcp && /tmp/go-mcp -config config-http.yaml -legacy-compat &
+for s in enumeration manifest directory; do
+  npx @modelcontextprotocol/conformance@alpha server --url http://127.0.0.1:8080/mcp \
+    --scenario sep-2640-skills-$s --spec-version 2026-07-28 --force
+done   # then again with --spec-version 2025-11-25
+```
+
+(`--force` is needed because extension scenarios are not on the spec timeline. On 2025-11-25 the two
+cache-attribute checks are skipped as not applicable.)
+
+Two rules from the specification that the code must never soften:
 
 1. **`skill://` is not privileged.** A server MAY serve skills under any scheme native to its domain,
    so nothing inspects or requires a scheme.
@@ -398,18 +415,25 @@ Two rules from the SEP that the code must never soften:
 Key behaviors: a skill's files ARE resources, registered through the same `ResourceRegistry`, so
 `resources/read` serves them and registration fires the ordinary
 `notifications/resources/list_changed` — once per skill, not once per file, via the unexported
-`ResourceRegistry.mutateBatch`. Digests are derived from the bytes, never supplied by a caller, so
-the published `sha256:` and what `resources/read` returns cannot drift. The last path segment of a
-skill's URI must equal its frontmatter `name`. Nested skills publish flat and share files with the
+`ResourceRegistry.mutateBatch`. **Everything a host verifies is derived from the file bytes, never
+supplied by a caller**: the `sha256:` digest, the `size`, and the entry's `frontmatter` (parsed
+from the `SKILL.md`; a supplied `SkillDef.Frontmatter` that differs is an error). Frontmatter is
+converted by `yamlJSONValue` under the YAML 1.2 core schema, not by yaml.v3's own resolution, because
+hosts re-parse the file and compare field by field; `TestFrontmatterIsWhatAYAML12HostParserReads`
+pins it against output from the npm `yaml` package. An entry's `resources` is always on the wire: the
+manifest array, or the string `"dynamic"` (`Skill.Dynamic`, custom `MarshalJSON`). `Register` refuses
+a skill over `MaxSkillResources` (512) or `MaxSkillBytes` (16 MiB) unless `AllowOversizedSkills`. A
+configured `SkillRegistry` always declares the `resources` capability too. The last path segment of
+a skill's URI must equal its frontmatter `name`. Nested skills publish flat and share files with the
 enclosing skill, which is why `SkillRegistry` refcounts file URIs. `skills/get` falls back to an
-optional `SkillResolver` for unenumerable catalogs (that resolver owns its own digests and must be
-paired with a `ResourceTemplate` to keep the files readable). `resources/directory/read` derives
+optional `SkillResolver` for unenumerable catalogs; that resolver owns its own digests and sizes,
+must be paired with a `ResourceTemplate` to keep the files readable, and its entry goes through
+`validateSkillEntry` before it is sent (`-32603` if invalid). `resources/directory/read` derives
 direct children lexically from registered resource URIs rather than bookkeeping directories, so it
 is scheme-agnostic and cannot go stale; a directory with no registered descendants and one that
-never existed both answer `-32602`. `skills/get`'s cache envelope is this library's choice — the SEP
-leaves it open. SEP-2640 defines no skills notification and none is invented here, which does leave a
-real gap: a client that cached `skills/list` cannot learn a skill's frontmatter changed while its
-file set stayed identical.
+never existed both answer `-32602`. `skills/list`, `skills/get` and `resources/directory/read` all
+carry the required `ttlMs`/`cacheScope` (list TTL). The extension defines no skills notification and
+none is invented here.
 
 See `mcp/skills.go` (types, registry, loader, handlers), `DirectoryChildren` and `mutateBatch` in
 `mcp/resources.go`, and the `Skills` / `SkillsDirectoryRead` fields on `ServerConfig`.
@@ -426,7 +450,7 @@ generic-go-mcp/
 ├── compat/               # PUBLIC: Optional legacy (2025-11-25 and earlier) compatibility overlay
 ├── examples/             # Example implementations
 │   ├── go-mcp/           # Example MCP server application
-│   │   └── skills/       # Embedded demonstration skill (SEP-2640, UNIX-socket mode)
+│   │   └── skills/       # Embedded demonstration skill (Skills extension, every mode)
 │   └── tools/            # Reference tool implementations (date, fortune, confirm_delete/MRTR)
 ├── CLAUDE.md             # This file
 └── go.mod                # Go module definition

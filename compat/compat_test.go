@@ -829,6 +829,33 @@ func TestLegacyInitializeCarriesSkillsExtension(t *testing.T) {
 	if string(raw) != `{"directoryRead":true}` {
 		t.Errorf("extension settings = %s, want {\"directoryRead\":true}", raw)
 	}
+	// Skill files are read with resources/read, so the extension is useless to a legacy
+	// client unless the same handshake also declares resources.
+	if result.Capabilities.Resources == nil {
+		t.Errorf("legacy handshake declares the skills extension without resources: %s", bw.Message())
+	}
+}
+
+// A server whose skill catalog is empty (resolver-backed, or not yet loaded) holds no
+// resources of its own, and must still declare resources beside the extension.
+func TestLegacyInitializeDeclaresResourcesForAnEmptySkillRegistry(t *testing.T) {
+	resourceRegistry := mcp.NewResourceRegistry()
+	server := mcp.NewServer(mcp.NewToolRegistry(), resourceRegistry, &mcp.ServerConfig{
+		Name: "test-server", Version: "0.0.1",
+		AdvertisedVersions: append([]string{mcp.ProtocolVersion}, LegacyVersions...),
+		Skills:             mcp.NewSkillRegistry(resourceRegistry),
+	})
+	o := New(server, Config{})
+
+	bw := transport.NewBufferedResponseWriter()
+	o.HandleMessage(context.Background(),
+		mustMarshal(t, json.RawMessage("1"), "initialize", legacyInitParams("2025-11-25", map[string]interface{}{})), bw)
+
+	var result legacyInitializeResult
+	decodeResult(t, bw.Message(), &result)
+	if _, ok := result.Capabilities.Extensions[mcp.SkillsExtensionID]; !ok || result.Capabilities.Resources == nil {
+		t.Errorf("want the skills extension and resources both declared: %s", bw.Message())
+	}
 }
 
 func TestLegacySkillsListForwardsAndDowngrades(t *testing.T) {
@@ -859,7 +886,12 @@ func TestLegacySkillsListForwardsAndDowngrades(t *testing.T) {
 		if !strings.HasPrefix(res.Digest, "sha256:") || len(res.Digest) != len("sha256:")+64 {
 			t.Errorf("digest %q did not survive the downgrade", res.Digest)
 		}
+		if res.Size <= 0 {
+			t.Errorf("%s: size %d did not survive the downgrade", res.URI, res.Size)
+		}
 	}
+	// ttlMs and cacheScope go: the cacheable-result envelope is defined from 2026-07-28,
+	// and the revision this client negotiated has no such fields on any result.
 	assertDowngraded(t, bw.Message())
 }
 

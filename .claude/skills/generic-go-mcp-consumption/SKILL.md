@@ -10,9 +10,9 @@ description: |
   tools, RFC 6570 resource templates (resources/templates/list) for
   parameterized resources over unbounded keyspaces plus the optional
   completion/complete provider for narrowing a template variable,
-  the experimental opt-in skills extension (SEP-2640: skills/list,
-  skills/get, resources/directory/read, and SkillRegistry.LoadFS over an
-  embed.FS of SKILL.md directories),
+  the opt-in Skills extension that Claude loads skills through (SEP-2640,
+  Beta: skills/list, skills/get, resources/directory/read, and
+  SkillRegistry.LoadFS over an embed.FS of SKILL.md directories),
   mutating the tool/resource catalog at runtime and pushing change
   notifications to clients (subscriptions/listen, list_changed,
   resources/updated), the optional compat.Overlay for serving legacy
@@ -50,7 +50,10 @@ one thing from this file, remember that — it's the failure mode you'll hit fir
 go get github.com/spirilis/generic-go-mcp@v0.8.0
 ```
 
-Skills (SEP-2640) landed in `v0.8.0`; everything on this page is in `v0.8.0`.
+Skills (SEP-2640) landed in `v0.8.0` against a draft. The released Beta shape of the extension, the
+one hosts such as Claude accept, is on `main` after `v0.10.2` and in any later tag; `v0.10.2` and
+earlier do not have it (check for `mcp.SkillResource.Size`). Everything else on this page is in
+`v0.8.0`.
 
 Import weight depends on what you use:
 - `transport` alone → **pure standard library**, nothing else.
@@ -141,7 +144,7 @@ correct for a deployed HTTP one.
 | `DefaultCacheScope` | `"public"` | Set `"private"` when the catalog or resource content varies per user (i.e. whenever auth is on) |
 | `ListTTLMs` | `300000` (5 min) | `ttlMs` cache hint on `server/discover`, `tools/list`, `resources/list`, `resources/templates/list`, `skills/list`, `skills/get` |
 | `ReadTTLMs` | `0` (always refetch) | `ttlMs` cache hint on `resources/read` |
-| `Skills` | `nil` | A `*mcp.SkillRegistry` turns on the experimental `io.modelcontextprotocol/skills` extension. `nil` means the extension does not exist at all — see `references/mrtr-and-resources.md` |
+| `Skills` | `nil` | A `*mcp.SkillRegistry` turns on the `io.modelcontextprotocol/skills` extension (Beta), and with it the `resources` capability. `nil` means the extension does not exist at all — see `references/mrtr-and-resources.md` |
 | `SkillsDirectoryRead` | `false` | Opts into `resources/directory/read`; reported as the extension's `directoryRead` setting. Ignored when `Skills` is `nil` |
 
 `ListTTLMs`/`ReadTTLMs` are `*int64`, so `0` and "unset" are distinguishable — take the address of a
@@ -184,7 +187,7 @@ curl recipes for exercising a running server by hand.
 |---|---|
 | Define a tool's schema, handler signature, content/error conventions | `references/tool-authoring.md` |
 | Choose stdio vs UNIX socket vs Streamable HTTP; wire optional GitHub OAuth; serve legacy (pre-2026-07-28) clients via `compat.Overlay` | `references/transports-and-auth.md` |
-| Build a confirm-before-act tool (delete, send, pay), a readable resource, a parameterized resource family (RFC 6570 templates + optional completion), or serve Agent Skills over MCP (experimental, SEP-2640) | `references/mrtr-and-resources.md` |
+| Build a confirm-before-act tool (delete, send, pay), a readable resource, a parameterized resource family (RFC 6570 templates + optional completion), or serve Agent Skills over MCP (the Skills extension, Beta) | `references/mrtr-and-resources.md` |
 | Mutate the tool/resource catalog at runtime, or push change notifications to clients | `references/notifications-and-registries.md` |
 | Debug a client that can't complete its first request; header/error reference | `references/protocol-essentials.md` |
 
@@ -196,11 +199,14 @@ and including resource templates was verified against `v0.7.0` (`mcp/templates.g
 `mcp/completion.go`, and the template API on `ResourceRegistry` in `mcp/resources.go`); the example
 above was compiled verbatim against the working tree.
 
-The **skills** material shipped in `v0.8.0`: it was verified against `mcp/skills.go`,
-`DirectoryChildren`/`mutateBatch` in `mcp/resources.go`, and `examples/go-mcp/main.go`, and driven
-end-to-end against the built example server over a UNIX socket (digests recomputed from what
-`resources/read` actually returned). It tracks SEP-2640 at head `641d1eb` (2026-08-20), which is
-**not merged** — re-read the SEP before trusting a wire shape here.
+The **skills** material follows the released Beta specification
+(`specification/beta/skills.mdx` in modelcontextprotocol/ext-skills, read 2026-11-25). It was
+verified against `mcp/skills.go`, `DirectoryChildren`/`mutateBatch` in `mcp/resources.go`, and
+`examples/go-mcp/main.go`, and the built example server passed the skills scenarios of
+`@modelcontextprotocol/conformance@alpha` (as a 2026-07-28 client, and as a 2025-11-25 client
+through the legacy overlay) and the MCP Inspector's `--verify`. It has **not** been loaded into
+Claude itself. The extension can still change while it is Beta: re-read the specification before
+trusting a wire shape here.
 
 Cross-checked from a downstream consumer's `go get github.com/spirilis/generic-go-mcp@v0.8.0` — the
 *tagged* module resolved through the proxy, with no `replace` directive — and not just this checkout,

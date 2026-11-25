@@ -69,14 +69,12 @@ type ServerConfig struct {
 	// answering. Leaving it nil is not a degraded mode — those methods genuinely do not
 	// exist, no capability key is emitted, and nothing else changes.
 	//
-	// EXPERIMENTAL: tracks SEP-2640, an Extensions Track proposal that is open and not
-	// merged. Wire shapes may change. See mcp/skills.go.
+	// BETA: SEP-2640 is Final and the extension is published at stage Beta, so a breaking
+	// change is possible but expected to be rare. See mcp/skills.go.
 	Skills *SkillRegistry
 
 	// SkillsDirectoryRead opts into resources/directory/read and is reported as the skills
 	// extension's directoryRead setting. Ignored when Skills is nil.
-	//
-	// EXPERIMENTAL: tracks SEP-2640, which is not merged.
 	SkillsDirectoryRead bool
 }
 
@@ -184,7 +182,10 @@ func (s *Server) capabilities() ServerCapabilities {
 	// declare resources — otherwise a client (or the legacy compat overlay's handshake,
 	// which derives its capabilities from server/discover) would conclude this server
 	// serves no resources at all and never probe resources/templates/list.
-	if s.resourceRegistry.HasResources() || s.resourceRegistry.HasTemplates() {
+	// The skills extension counts too: skill files are served through resources/read, so a
+	// server that declares the extension MUST declare resources, even while its
+	// SkillRegistry is empty or backed only by a resolver.
+	if s.resourceRegistry.HasResources() || s.resourceRegistry.HasTemplates() || s.skillsEnabled() {
 		caps.Resources = &ResourcesCapability{ListChanged: true}
 	}
 	if s.resourceRegistry.hasTemplateCompleters() {
@@ -193,12 +194,8 @@ func (s *Server) capabilities() ServerCapabilities {
 	if s.skillsEnabled() {
 		// Declared whenever a SkillRegistry is configured, even with nothing registered:
 		// unlike tools and resources, an empty skills/list is legitimate (a
-		// resolver-backed catalog is unenumerable by design) and the SEP says hosts MUST
-		// NOT read one as proof that a server has no skills.
-		//
-		// SEP-2640's own text says this goes in the "initialize response" because it was
-		// drafted before 2026-07-28 removed the handshake. server/discover is where
-		// capabilities live in this revision — do not "fix" this back.
+		// resolver-backed catalog is unenumerable by design) and hosts MUST NOT read one
+		// as proof that a server has no skills.
 		settings, _ := json.Marshal(skillsExtensionSettings{DirectoryRead: s.config.SkillsDirectoryRead})
 		caps.Extensions = map[string]json.RawMessage{SkillsExtensionID: settings}
 	}
