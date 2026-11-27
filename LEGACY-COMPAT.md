@@ -196,7 +196,12 @@ applies to modern requests only. Otherwise a `404` for, say, an unadvertised met
    either era.
 
 **Nothing about the tools changes between eras.** Same registry, same schemas, same data, same auth.
-Only the envelope differs — "legacy mode" is not a degraded mode.
+Only the envelope differs — "legacy mode" is not a degraded mode. That includes role gating: legacy
+`tools/list` and `tools/call` are forwarded to the inner server with the request's context, so a
+tool registered with `mcp.RequireRoles` is hidden from a legacy caller without the role exactly as
+from a modern one, and calling it answers the same `-32602` as an unknown tool. The legacy
+`list_changed` stream names no tools. (`cacheScope: "private"` is stripped like every other cache
+hint; legacy clients have no cache to scope.)
 
 ## Sunsetting
 

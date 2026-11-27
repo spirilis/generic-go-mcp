@@ -38,6 +38,9 @@ type Storage interface {
 	StoreUser(ctx context.Context, user *User) error
 	GetUser(ctx context.Context, userID string) (*User, error)
 	GetUserByGitHubLogin(ctx context.Context, login string) (*User, error)
+	// GetUserByIdentity finds the user a provider identity was stored for (User.Provider,
+	// Issuer and Subject). Records from before v0.12.0 are not indexed until their next login.
+	GetUserByIdentity(ctx context.Context, provider, issuer, subject string) (*User, error)
 
 	// Sessions
 	StoreSession(ctx context.Context, session *AuthSession) error
@@ -51,8 +54,8 @@ type Storage interface {
 	GetAuthRequest(ctx context.Context, id string) (*PendingAuthRequest, error)
 	DeleteAuthRequest(ctx context.Context, id string) error
 
-	// Consent. A pending consent is an authorization that has passed GitHub login and the
-	// allowlist and is waiting on the user to approve the client; TakePendingConsent claims it
+	// Consent. A pending consent is an authorization that has passed the provider login and
+	// the access rules and is waiting on the user to approve the client; TakePendingConsent claims it
 	// exactly once, and only for the browser that holds the matching binding cookie.
 	StorePendingConsent(ctx context.Context, pc *PendingConsent) error
 	TakePendingConsent(ctx context.Context, id, bindingHash string) (*PendingConsent, error)
@@ -107,6 +110,7 @@ const (
 	BucketClients         = "clients"
 	BucketUsers           = "users"
 	BucketUsersByGitHub   = "users_by_github"
+	BucketUsersByIdentity = "users_by_identity"
 	BucketSessions        = "sessions"
 	BucketSessionsByToken = "sessions_by_token"
 	BucketAuthRequests    = "auth_requests"
@@ -125,7 +129,7 @@ func NewBoltStorage(path string) (*BoltStorage, error) {
 	err = db.Update(func(tx *bolt.Tx) error {
 		buckets := []string{
 			BucketAuthCodes, BucketAccessTokens, BucketRefreshTokens,
-			BucketClients, BucketUsers, BucketUsersByGitHub,
+			BucketClients, BucketUsers, BucketUsersByGitHub, BucketUsersByIdentity,
 			BucketSessions, BucketSessionsByToken, BucketAuthRequests,
 			BucketPendingConsents, BucketConsents,
 		}
@@ -313,9 +317,58 @@ func (s *BoltStorage) StoreUser(ctx context.Context, user *User) error {
 			return err
 		}
 
-		// Index by GitHub login
+		// Index by provider identity, once a login has recorded one.
+		if user.Provider != "" && user.Issuer != "" && user.Subject != "" {
+			key := identityKey(user.Provider, user.Issuer, user.Subject)
+			if err := tx.Bucket([]byte(BucketUsersByIdentity)).Put(key, []byte(user.ID)); err != nil {
+				return err
+			}
+		}
+
+		// Index by GitHub login. Users of other providers have none (and bbolt refuses an
+		// empty key).
+		if user.GitHubLogin == "" {
+			return nil
+		}
 		bGH := tx.Bucket([]byte(BucketUsersByGitHub))
 		return bGH.Put([]byte(user.GitHubLogin), []byte(user.ID))
+	})
+}
+
+// identityKey is the users_by_identity key. NUL cannot occur in a provider name or an issuer
+// URL, so distinct triples cannot collide.
+func identityKey(provider, issuer, subject string) []byte {
+	return []byte(provider + "\x00" + issuer + "\x00" + subject)
+}
+
+func (s *BoltStorage) GetUserByIdentity(ctx context.Context, provider, issuer, subject string) (*User, error) {
+	var user *User
+	err := s.view(func(tx *bolt.Tx) error {
+		userID := tx.Bucket([]byte(BucketUsersByIdentity)).Get(identityKey(provider, issuer, subject))
+		if userID == nil {
+			return ErrUserNotFound
+		}
+		data := tx.Bucket([]byte(BucketUsers)).Get(userID)
+		if data == nil {
+			return ErrUserNotFound
+		}
+		user = &User{}
+		return json.Unmarshal(data, user)
+	})
+	return user, err
+}
+
+// forEachUser calls fn with every stored user, stopping at the first error. It is for startup
+// checks, not for the request path.
+func (s *BoltStorage) forEachUser(fn func(*User) error) error {
+	return s.view(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(BucketUsers)).ForEach(func(key, data []byte) error {
+			var u User
+			if err := json.Unmarshal(data, &u); err != nil {
+				return fmt.Errorf("auth store %s: user record %q: %w", s.path, key, err)
+			}
+			return fn(&u)
+		})
 	})
 }
 

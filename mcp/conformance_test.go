@@ -389,6 +389,22 @@ func TestMRTRRoundTrip(t *testing.T) {
 	if env.Error.Code != transport.InvalidParams {
 		t.Errorf("code = %d, want %d (InvalidParams)", env.Error.Code, transport.InvalidParams)
 	}
+
+	// inputResponses with no requestState at all: an answer the server never asked for. The
+	// tool must not run, or a client could pre-confirm a confirm-before-act tool.
+	env = call(t, srv, 5, "tools/call", map[string]interface{}{
+		"_meta": metaObject(ProtocolVersion, capsWithElicitation),
+		"name":  "needs_input", "arguments": map[string]interface{}{},
+		"inputResponses": map[string]interface{}{
+			"x": map[string]interface{}{"action": "accept", "content": map[string]interface{}{}},
+		},
+	})
+	if env.Error == nil {
+		t.Fatalf("expected inputResponses without requestState to be rejected, got result %s", env.Result)
+	}
+	if env.Error.Code != transport.InvalidParams {
+		t.Errorf("code = %d, want %d (InvalidParams)", env.Error.Code, transport.InvalidParams)
+	}
 }
 
 func TestPaginationRoundTrip(t *testing.T) {
@@ -888,7 +904,7 @@ func TestCallAfterConcurrentUnregister(t *testing.T) {
 	_, registry, _ := newTestServer(t)
 	registry.Unregister("echo")
 
-	_, err := registry.call(context.Background(), &ToolRequest{Name: "echo"})
+	_, err := registry.call(context.Background(), &ToolRequest{Name: "echo"}, func([]string, bool) bool { return true })
 	if !errors.Is(err, errToolNotFound) {
 		t.Fatalf("call on an unregistered tool: err = %v, want errToolNotFound", err)
 	}

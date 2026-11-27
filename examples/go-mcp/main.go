@@ -30,6 +30,17 @@ import (
 //go:embed all:skills
 var skillFS embed.FS
 
+// exampleRoles are the roles this application understands. Access rules in the config grant
+// them (auth.access.rules[].roles); a rule naming any other role refuses to start.
+var exampleRoles = []auth.Role{
+	{Name: "admin", Description: "may use destructive tools such as confirm_delete"},
+	{Name: "reader", Description: "may use the read-only tools"},
+}
+
+// exampleAuthOptions declare the roles and let admins, and only them, use the admin API
+// (/admin/clients). Without WithAdminRole a new-form config gets no admin API at all.
+var exampleAuthOptions = []auth.Option{auth.WithRoles(exampleRoles...), auth.WithAdminRole("admin")}
+
 // cliFlags holds all command-line flag values
 type cliFlags struct {
 	mode         string
@@ -222,11 +233,27 @@ func main() {
 	// Initialize logger early
 	logging.Initialize(cfg.Logging.Level, cfg.Logging.Format, os.Stderr)
 
-	// Create tool registry and register tools
+	// Initialize auth service if enabled. It comes before the MCP server because the server's
+	// role gate reads the principal this service puts in each request's context.
+	var authService *auth.AuthService
+	if cfg.Auth != nil && cfg.Auth.Enabled {
+		var err error
+		authService, err = auth.NewAuthService(cfg.Auth, exampleAuthOptions...)
+		if err != nil {
+			logging.Error("Error initializing auth", "error", err)
+			os.Exit(1)
+		}
+		defer authService.Close()
+	}
+
+	// Create tool registry and register tools. confirm_delete is the one destructive tool,
+	// so only callers holding "admin" see it (when auth is on; see RolesFromContext below).
+	// The legacy auth.github + auth.allowlist form grants no roles, so under it nobody sees
+	// confirm_delete over HTTP; grant admin with an auth.access rule.
 	registry := mcp.NewToolRegistry()
 	registry.Register(tools.GetDateToolDefinition(), tools.DateTool)
 	registry.Register(tools.GetFortuneToolDefinition(), tools.FortuneTool)
-	registry.Register(tools.GetConfirmToolDefinition(), tools.ConfirmTool)
+	registry.RegisterWithOptions(tools.GetConfirmToolDefinition(), tools.ConfirmTool, mcp.RequireRoles("admin"))
 
 	// Create resource registry
 	resourceRegistry := mcp.NewResourceRegistry()
@@ -260,13 +287,27 @@ func main() {
 	}
 
 	// Create MCP server
-	server := mcp.NewServer(registry, resourceRegistry, &mcp.ServerConfig{
+	serverCfg := &mcp.ServerConfig{
 		Name:                serverName,
 		Version:             serverVersion,
 		AdvertisedVersions:  advertisedVersions,
 		Skills:              skillRegistry,
 		SkillsDirectoryRead: true,
-	})
+	}
+	// Only HTTP runs the auth middleware, so only there does a request carry a principal.
+	// Setting RolesFromContext anywhere else would hide the gated tool from everyone; leaving
+	// it nil serves every tool, which is right for a local stdio or UNIX socket server.
+	if authService != nil && cfg.Server.Mode == "http" {
+		serverCfg.RolesFromContext = authService.RolesFromContext
+		// Bound into signed MRTR requestState, so a retry cannot be replayed by another user.
+		serverCfg.PrincipalFromContext = func(ctx context.Context) string {
+			if p, ok := auth.PrincipalFromContext(ctx); ok {
+				return p.ID
+			}
+			return ""
+		}
+	}
+	server := mcp.NewServer(registry, resourceRegistry, serverCfg)
 
 	// Wrap in the legacy-compatibility overlay if enabled. handler is what actually gets
 	// passed to the transport; legacySessions (nil unless compat is enabled) is what
@@ -295,18 +336,6 @@ func main() {
 		"modern", mcp.ProtocolVersion,
 		"legacy_compat", legacyCompatEnabled,
 		"advertised_versions", advertisedVersions)
-
-	// Initialize auth service if enabled
-	var authService *auth.AuthService
-	if cfg.Auth != nil && cfg.Auth.Enabled {
-		var err error
-		authService, err = auth.NewAuthService(cfg.Auth)
-		if err != nil {
-			logging.Error("Error initializing auth", "error", err)
-			os.Exit(1)
-		}
-		defer authService.Close()
-	}
 
 	// Create and start transport based on config
 	var trans transport.Transport

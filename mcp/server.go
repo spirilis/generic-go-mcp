@@ -34,6 +34,15 @@ type ServerConfig struct {
 	// principal when unset (fine for unauthenticated servers).
 	PrincipalFromContext func(ctx context.Context) string
 
+	// RolesFromContext reports the roles the caller of a request holds (auth.AuthService's
+	// RolesFromContext fits). When set, tools registered with RequireRoles are visible only to
+	// callers holding one of their roles, and tools/list is marked cacheScope "private" while
+	// any tool is gated. nil turns gating off: every tool is served to everyone.
+	//
+	// server/discover is not per caller: it declares the tools capability whenever any tool is
+	// registered, gated or not.
+	RolesFromContext func(ctx context.Context) []string
+
 	// DefaultCacheScope is used for every CacheableResult this server produces. Defaults
 	// to "public"; set to "private" if served tools/resources vary by caller (e.g. an
 	// authenticated, per-user catalog).
@@ -108,6 +117,7 @@ func NewServer(registry *ToolRegistry, resourceRegistry *ResourceRegistry, confi
 		}
 		cfg.RequestStateKey = config.RequestStateKey
 		cfg.PrincipalFromContext = config.PrincipalFromContext
+		cfg.RolesFromContext = config.RolesFromContext
 		cfg.DefaultCacheScope = config.DefaultCacheScope
 		cfg.ListTTLMs = config.ListTTLMs
 		cfg.ReadTTLMs = config.ReadTTLMs

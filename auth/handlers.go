@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -28,8 +29,9 @@ func (svc *AuthService) RegisterRoutes(mux *http.ServeMux) {
 	// OAuth 2.1 Token Endpoint
 	mux.HandleFunc("/token", svc.handleToken)
 
-	// GitHub OAuth callback
-	mux.HandleFunc("/callback", svc.handleGitHubCallback)
+	// Sign-in provider chooser (see chooser.go), and every provider's callback
+	mux.HandleFunc("/authorize/provider", svc.handleChooseProvider)
+	mux.HandleFunc("/callback", svc.handleCallback)
 
 	// Consent screen submission (see consent.go)
 	mux.HandleFunc("/consent", svc.handleConsent)
@@ -64,7 +66,7 @@ func (svc *AuthService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 	codeChallengeMethod := params.Get("code_challenge_method")
 	resource := params.Get("resource") // RFC 8707
 
-	// The request is stored until the GitHub callback, and anyone can send one.
+	// The request is stored until the provider's callback, and anyone can send one.
 	if problem := authorizeProblem(state, scope, resource, codeChallenge, codeChallengeMethod, redirectURI); problem != "" {
 		http.Error(w, "Invalid request: "+problem, http.StatusBadRequest)
 		return
@@ -97,10 +99,8 @@ func (svc *AuthService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Store authorization request in pending storage and redirect to GitHub
-	authRequestID := generateSecureToken(16)
-	if err := svc.storage.StoreAuthRequest(r.Context(), &PendingAuthRequest{
-		ID:                  authRequestID,
+	svc.startSignIn(w, r, &PendingAuthRequest{
+		ID:                  generateSecureToken(16),
 		ClientID:            clientID,
 		RedirectURI:         redirectURI,
 		Scope:               scope,
@@ -110,24 +110,19 @@ func (svc *AuthService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 		Resource:            resource,
 		CreatedAt:           time.Now(),
 		ExpiresAt:           time.Now().Add(10 * time.Minute),
-	}); err != nil {
-		// Sending the user to GitHub now would only fail at the callback, with a misleading error.
-		http.Error(w, "Could not start authorization; try again later", http.StatusServiceUnavailable)
-		return
-	}
-
-	// Redirect to GitHub OAuth
-	githubCallbackURL := svc.config.Issuer + "/callback"
-	githubAuthURL := svc.githubClient.GetAuthorizationURL(githubCallbackURL, authRequestID)
-	http.Redirect(w, r, githubAuthURL, http.StatusFound)
+	})
 }
 
-// handleGitHubCallback handles the GitHub OAuth callback
-func (svc *AuthService) handleGitHubCallback(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
-	state := r.URL.Query().Get("state") // This is our authRequestID
+// handleCallback receives every provider's redirect back (the path registered in live GitHub
+// OAuth Apps, so it never changes). The pending request, found by state, says which provider
+// the browser was sent to.
+func (svc *AuthService) handleCallback(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	code := q.Get("code")
+	state := q.Get("state") // This is our authRequestID
+	upstreamErr := q.Get("error")
 
-	if code == "" {
+	if code == "" && upstreamErr == "" {
 		http.Error(w, "Missing authorization code", http.StatusBadRequest)
 		return
 	}
@@ -149,51 +144,53 @@ func (svc *AuthService) handleGitHubCallback(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Exchange code for GitHub token
-	githubCallbackURL := svc.config.Issuer + "/callback"
-	githubToken, err := svc.githubClient.ExchangeCode(r.Context(), code, githubCallbackURL)
-	if err != nil {
-		svc.authError(w, authReq.RedirectURI, "server_error",
-			"Failed to authenticate with GitHub", authReq.State)
+	prov := svc.callbackProvider(authReq)
+	if prov == nil {
+		// The browser never left the chooser (or the provider was removed from config): no
+		// code from anywhere can belong to this request.
+		http.Error(w, "This sign-in has no identity provider; start it again", http.StatusBadRequest)
+		return
+	}
+	if upstreamErr != "" {
+		// The user cancelled, or the IdP refused them. Its description is not relayed: it is
+		// whatever the IdP (or whoever crafted this URL) put there.
+		logging.Info("Sign-in refused at the identity provider", "provider", prov.Name(), "error", upstreamErr)
+		svc.authError(w, authReq.RedirectURI, "access_denied",
+			"Sign-in was cancelled or refused at "+prov.DisplayName(), authReq.State)
 		return
 	}
 
-	// Get user info from GitHub
-	githubUser, err := svc.githubClient.GetUser(r.Context(), githubToken)
+	identity, err := prov.Exchange(r.Context(), code, svc.callbackURL(), authReq.UpstreamVerifier, authReq.Nonce)
 	if err != nil {
-		svc.authError(w, authReq.RedirectURI, "server_error",
-			"Failed to get user info", authReq.State)
+		logging.Warn("Sign-in failed at the identity provider", "provider", prov.Name(), "error", err)
+		errCode := "server_error"
+		if errors.Is(err, ErrProviderUnavailable) {
+			errCode = "temporarily_unavailable"
+		}
+		svc.authError(w, authReq.RedirectURI, errCode,
+			"Failed to authenticate with "+prov.DisplayName(), authReq.State)
 		return
 	}
 
-	// Check authorization (allowlist)
-	if !svc.isUserAuthorized(r.Context(), githubUser, githubToken) {
+	// Check authorization against the access rules (the legacy allowlist is one of them)
+	if _, ok := svc.access.evaluate(identity); !ok {
+		logging.Info("Sign-in refused: no access rule matches",
+			"provider", identity.Provider, "username", identity.Username, "subject", identity.Subject)
 		svc.authError(w, authReq.RedirectURI, "access_denied",
 			"User not authorized", authReq.State)
 		return
 	}
 
-	// Check if user already exists
-	existingUser, _ := svc.storage.GetUserByGitHubLogin(r.Context(), githubUser.Login)
-	var user *User
-	if existingUser != nil {
-		// Update existing user
-		user = existingUser
-		user.Email = githubUser.Email
-		user.Name = githubUser.Name
-		user.AvatarURL = githubUser.AvatarURL
-	} else {
-		// Create new user
-		user = &User{
-			ID:          generateSecureToken(16),
-			GitHubLogin: githubUser.Login,
-			GitHubID:    githubUser.ID,
-			Email:       githubUser.Email,
-			Name:        githubUser.Name,
-			AvatarURL:   githubUser.AvatarURL,
-		}
+	user, err := svc.userForIdentity(r.Context(), identity)
+	if err == nil {
+		err = svc.storage.StoreUser(r.Context(), user)
 	}
-	svc.storage.StoreUser(r.Context(), user)
+	if err != nil {
+		// Without the snapshot every request would be judged on stale identity.
+		logging.Error("callback: storing the user failed", "error", err)
+		svc.authError(w, authReq.RedirectURI, "server_error", "Failed to store user", authReq.State)
+		return
+	}
 
 	// Straight back to the client if it is pre-registered or already approved by this user;
 	// otherwise via the consent screen.
@@ -341,6 +338,41 @@ func (svc *AuthService) handleRefreshTokenGrant(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	// The rules may have changed since the login, and Middleware would refuse the new access
+	// token anyway; invalid_grant sends the client back to /authorize, where a fresh login
+	// re-reads the user's identity.
+	user, err := svc.storage.GetUser(r.Context(), refreshToken.UserID)
+	if err != nil && !errors.Is(err, ErrUserNotFound) {
+		logging.Error("refresh grant: reading the user failed", "error", err)
+		svc.tokenError(w, "server_error", "Failed to issue tokens")
+		return
+	}
+	if user == nil || err != nil {
+		svc.tokenError(w, "invalid_grant", "Unknown user")
+		return
+	}
+	if _, ok := svc.authorizeUser(user); !ok {
+		svc.tokenError(w, "invalid_grant", "User is no longer authorized; sign in again")
+		return
+	}
+	// Groups are snapshotted at the browser login, so a refresh is bounded by how old that
+	// snapshot may get: past identityMaxAge the client must send the user through the IdP
+	// again, which picks up group changes and accounts disabled there. A record from before
+	// v0.12.0 has no login time; its age counts from the chain's first refresh after the
+	// upgrade, or it could refresh forever and never take a snapshot.
+	identityAt, legacyAgeFrom := user.LastLoginAt, time.Time{}
+	if identityAt.IsZero() {
+		legacyAgeFrom = refreshToken.LegacyAgeFrom
+		if legacyAgeFrom.IsZero() {
+			legacyAgeFrom = time.Now().UTC()
+		}
+		identityAt = legacyAgeFrom
+	}
+	if time.Since(identityAt) > svc.maxIdentityAge() {
+		svc.tokenError(w, "invalid_grant", "The sign-in is too old to refresh; sign in again")
+		return
+	}
+
 	// Generate the new tokens first: if the store cannot take them (a full disk, say), the
 	// old refresh token must survive so the client can try again.
 	accessToken, err := svc.tokenService.GenerateAccessToken(
@@ -350,8 +382,8 @@ func (svc *AuthService) handleRefreshTokenGrant(w http.ResponseWriter, r *http.R
 		svc.tokenError(w, "server_error", "Failed to issue tokens")
 		return
 	}
-	newRefreshToken, err := svc.tokenService.GenerateRefreshToken(
-		refreshToken.UserID, clientID, refreshToken.Scope, refreshToken.Resource)
+	newRefreshToken, err := svc.tokenService.generateRefreshToken(
+		refreshToken.UserID, clientID, refreshToken.Scope, refreshToken.Resource, legacyAgeFrom)
 	if err != nil {
 		logging.Error("refresh grant: storing the refresh token failed", "error", err)
 		svc.tokenError(w, "server_error", "Failed to issue tokens")

@@ -132,8 +132,9 @@ type HTTPTransportConfig struct {
 	//
 	// Registering "/mcp" here is undefined behavior: Start registers it afterwards, and
 	// http.ServeMux panics on a duplicate pattern. The auth routes registered after this hook
-	// would panic the same way, so an embedder must not claim /authorize, /token, /callback,
-	// /register, /consent, /admin/ or /.well-known/ either when AuthService is set. An embedder
+	// would panic the same way, so an embedder must not claim /authorize, /authorize/provider,
+	// /token, /callback, /register, /consent, /admin/ or /.well-known/ either when AuthService
+	// is set. An embedder
 	// that owns its own http.Server mounts Handler instead.
 	ExtraRoutes func(mux *http.ServeMux)
 }
@@ -367,7 +368,7 @@ func (t *HTTPTransport) handleMCP(w http.ResponseWriter, r *http.Request) {
 		// Add user info if available
 		if t.authService != nil {
 			if id, login, ok := t.authService.UserFromContext(r.Context()); ok {
-				logArgs = append(logArgs, "user_id", id, "github_login", login)
+				logArgs = append(logArgs, "user_id", id, "login", login)
 			}
 		}
 

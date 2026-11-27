@@ -261,6 +261,7 @@ func (failingStore) StoreAccessToken(context.Context, *AccessToken) error {
 // refresh token usable. It used to delete the token and then crash.
 func TestRefreshGrantSurvivesStoreFailure(t *testing.T) {
 	svc, client := newTestAuthService(t)
+	testUser(t, svc) // the refresh grant re-checks the user against the access rules
 	rt, err := svc.tokenService.GenerateRefreshToken("user-1", client.ClientID, "mcp", "")
 	if err != nil {
 		t.Fatal(err)

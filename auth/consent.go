@@ -14,7 +14,7 @@ const ConsentTTL = 5 * time.Minute
 
 // Why there is a consent screen at all.
 //
-// Registration at /register is open (RFC 7591), and GitHub skips its own approval prompt for an
+// Registration at /register is open (RFC 7591), and GitHub (like most IdPs) skips its own approval prompt for an
 // OAuth app the user has already authorized. Without a screen here, an attacker could register a
 // client whose redirect_uri is their own host, send an allowlisted user to /authorize, and have
 // that user's browser deliver a working authorization code to the attacker — with no click beyond
@@ -27,7 +27,7 @@ const ConsentTTL = 5 * time.Minute
 // is remembered per (user, client). Dynamically registered clients get fresh IDs, so an attacker
 // cannot inherit consent that was granted to a legitimate client.
 
-// grantOrAskConsent finishes an authorization that has passed GitHub login and the allowlist:
+// grantOrAskConsent finishes an authorization that has passed the provider login and the access rules:
 // straight to the client for a config-registered client or one the user already approved,
 // otherwise via the consent screen.
 func (svc *AuthService) grantOrAskConsent(w http.ResponseWriter, r *http.Request, authReq *PendingAuthRequest, user *User) {
@@ -85,11 +85,33 @@ func (svc *AuthService) grantOrAskConsent(w http.ResponseWriter, r *http.Request
 		ClientName:     clientName,
 		SelfRegistered: !client.IsStatic,
 		Destination:    redirectDestination(authReq.RedirectURI),
-		Login:          user.GitHubLogin,
+		Login:          consentLogin(user),
+		ProviderName:   svc.providerDisplayName(identityFromUser(user).Provider),
 		Issuer:         svc.config.Issuer,
 		Action:         svc.config.Issuer + "/consent",
 		ConsentID:      pc.ID,
 	})
+}
+
+// consentLogin is how the consent screen names the signed-in user: the username, else the
+// email, else the subject (an IdP need not send either).
+func consentLogin(u *User) string {
+	id := identityFromUser(u)
+	for _, s := range []string{id.Username, id.Email, id.Subject} {
+		if s != "" {
+			return s
+		}
+	}
+	return u.ID
+}
+
+// providerDisplayName names a provider for the user; a provider since removed from config
+// keeps its config name.
+func (svc *AuthService) providerDisplayName(name string) string {
+	if p, ok := svc.providerByName[name]; ok {
+		return p.DisplayName()
+	}
+	return name
 }
 
 // handleConsent receives the consent screen's Approve or Deny.
@@ -213,6 +235,7 @@ type consentView struct {
 	SelfRegistered bool
 	Destination    string
 	Login          string
+	ProviderName   string
 	Issuer         string
 	Action         string
 	ConsentID      string
@@ -229,13 +252,7 @@ type consentView struct {
 //     is not the same as allowing everything else.
 //   - no-store and no-referrer keep the consent ID out of caches and out of Referer headers.
 func (svc *AuthService) renderConsent(w http.ResponseWriter, v consentView) {
-	h := w.Header()
-	h.Set("Content-Type", "text/html; charset=utf-8")
-	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
-	h.Set("X-Frame-Options", "DENY")
-	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("Cache-Control", "no-store")
-	h.Set("Referrer-Policy", "no-referrer")
+	setPageHeaders(w)
 	w.WriteHeader(http.StatusOK)
 	_ = consentTemplate.Execute(w, v)
 }
@@ -270,7 +287,7 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!DOCTYPE htm
 <body>
 <main>
   <h1>Authorize {{.ClientName}}?</h1>
-  <p>You are signed in to GitHub as <strong>{{.Login}}</strong>.</p>
+  <p>You are signed in to {{.ProviderName}} as <strong>{{.Login}}</strong>.</p>
   <p><strong>{{.ClientName}}</strong> is asking for access to <strong>{{.Issuer}}</strong> on your behalf.</p>
   {{if .SelfRegistered}}<p class="warn">This application registered itself, so its name is not verified. Decide by where it will send you, below.</p>{{end}}
   <p>If you approve, your browser will be sent to:</p>

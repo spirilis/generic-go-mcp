@@ -1,11 +1,15 @@
 # MCP Server Configuration with OAuth 2.1 Authentication
 #
-# This example demonstrates how to configure OAuth authentication for your MCP server.
-# To use this config:
-# 1. Create a GitHub OAuth App at https://github.com/settings/developers
-# 2. Set the callback URL to: http://your-domain/callback
-# 3. Replace the clientId and clientSecret below with your GitHub OAuth App credentials
-# 4. Configure the allowlist to restrict access
+# This server is the OAuth authorization server MCP clients talk to. Users prove who they are
+# by signing in with an upstream identity provider: GitHub, and/or any OpenID Connect provider
+# (Keycloak, Entra ID, Google, Okta, Authentik, ...). Access rules then decide who is admitted
+# and which of the application's roles they hold.
+#
+# Every provider redirects back to ONE URL on this server: <issuer>/callback
+# (here https://mcp.example.com/callback). Register exactly that at each provider.
+#
+# For GitHub: create an OAuth App at https://github.com/settings/developers with that
+# callback URL, then copy its client ID and a client secret below. That's it.
 
 server:
   mode: "http"
@@ -20,36 +24,101 @@ auth:
   # OAuth issuer URL - must match your server's public URL
   issuer: "https://mcp.example.com"
 
-  github:
-    # GitHub OAuth App credentials
-    clientId: "Iv1.xxxxxxxxxxxxxxxxxx"
-    clientSecret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
-    # Alternative: Load credentials from mounted secret files (for Docker/Kubernetes)
-    # clientIdFile: "/run/secrets/github_client_id"
-    # clientSecretFile: "/run/secrets/github_client_secret"
-
   storage:
     # Path to BoltDB file for storing OAuth tokens, sessions, and client registrations
     dbPath: "/var/lib/go-mcp/oauth.db"
 
-  allowlist:
-    # GitHub usernames allowed to access the MCP server
-    users:
-      - "my-github-user"
-      - "another-user"
+  # --- The legacy (v0.11 and earlier) form still works unchanged. ---------------------------
+  # GitHub only, pass/fail, no roles. An empty allowlist admits every GitHub user (with a
+  # warning); in the new form below, a provider with no rule admits nobody.
+  #
+  # github:
+  #   clientId: "Iv1.xxxxxxxxxxxxxxxxxx"
+  #   clientSecret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  #   # clientIdFile: "/run/secrets/github_client_id"
+  #   # clientSecretFile: "/run/secrets/github_client_secret"
+  # allowlist:
+  #   users: ["my-github-user"]
+  #   orgs: ["my-company"]
+  #   teams:
+  #     - org: "my-company"
+  #       team: "platform-team"   # team slug, not display name
 
-    # GitHub organizations - any member can access
-    orgs:
-      - "my-company"
-      - "partner-org"
+  # --- The new form: providers + access rules. ----------------------------------------------
+  providers:
+    # GitHub stays a two-value setup. The name "github" makes principal ids "github:<login>",
+    # the same ids the legacy form produced.
+    - name: github
+      type: github
+      displayName: GitHub
+      clientId: "Iv1.xxxxxxxxxxxxxxxxxx"
+      clientSecret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      # In Kubernetes, mount a Secret instead. A *File entry wins over the inline value, and an
+      # unreadable or empty file refuses to start.
+      # clientIdFile: "/run/secrets/github/client-id"
+      # clientSecretFile: "/run/secrets/github/client-secret"
+      # GitHub Enterprise Server:
+      # baseURL: "https://github.example.com"      # apiURL defaults to <baseURL>/api/v3
 
-    # GitHub teams - only members of these teams can access
-    teams:
-      - org: "my-company"
-        team: "platform-team"  # Use team slug, not display name
-      - org: "my-company"
-        team: "security-team"
+    # Any OpenID Connect provider. This one is Keycloak, with a "groups" client scope mapper
+    # (Group Membership, "Full group path" off) adding a groups claim to the id_token.
+    - name: corp
+      type: oidc
+      displayName: Corp SSO
+      # Discovery: <issuerURL>/.well-known/openid-configuration. Must be https and equal the
+      # issuer the IdP reports, character for character. (http only on localhost/127.0.0.1, for
+      # a local IdP in development.) Its keys, and userinfo when userInfo is on, must be on the
+      # issuer's host or one listed in allowedJWKSHosts.
+      issuerURL: "https://login.example.com/realms/corp"
+      clientId: "mcp-server"
+      clientSecret: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # omit (with method none) for a public client
+      # clientSecretFile: "/run/secrets/corp/client-secret"
+      # tokenEndpointAuthMethod: client_secret_basic     # or client_secret_post, none
+      # scopes: [openid, profile, email]                 # the default; openid is always sent
+      claims:
+        username: preferred_username    # the default
+        groups: groups                  # dotted paths work: realm_access.roles, cognito:groups
+      # userInfo: true                  # also merge the userinfo endpoint (some IdPs put groups there)
+      # authParams: {prompt: select_account}
+      # caFile: "/etc/ssl/corp-ca.pem"  # private CA, added to the system roots
+
+  access:
+    # A user is admitted when at least one rule matches. Their roles are the union of the
+    # roles of every matching rule. Roles must be ones the application declared
+    # (the example app declares admin and reader).
+    rules:
+      # Pass/fail entry: these GitHub users get in, with no role.
+      - provider: github
+        users: ["my-github-user", "another-user"]
+      # Roles by identity: one GitHub login is admin.
+      - provider: github
+        users: ["my-github-user"]
+        roles: [admin]
+      # Roles by group: GitHub team membership ("org/team-slug"; orgs: ["org"] for a whole org).
+      - provider: github
+        teams: ["my-company/platform-team"]
+        roles: [reader]
+      # OIDC by group: mcp-users get in as reader; mcp-admins also get admin.
+      - provider: corp
+        groups: ["mcp-users"]
+        roles: [reader]
+      - provider: corp
+        groups: ["mcp-admins"]
+        roles: [admin, reader]
+      # By verified email domain, or by exact subject (the IdP's stable user id):
+      # - provider: corp
+      #   emailDomains: ["example.com"]
+      # - provider: corp
+      #   subjects: ["0b5c3c1e-6f0e-4a8e-9d55-1f2e3d4c5b6a"]
+      #   roles: [admin]
+      # Every user the IdP authenticates (logged as a warning at startup):
+      # - provider: corp
+      #   anyone: true
+
+    # Groups are read at browser login. A client may keep refreshing its tokens for this long
+    # after the user last signed in; then the user must sign in through the browser again,
+    # which picks up group changes made at the IdP. 0 means the refresh token lifetime (30d).
+    identityMaxAge: 168h
 
   # Pre-configured static clients (for apps like Claude Desktop)
   clients:

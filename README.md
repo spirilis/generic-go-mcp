@@ -127,7 +127,9 @@ rationale, the hard-cutover decisions, and a worked wire-to-Go-types example.
 
 - **Three Transports** - stdio (desktop integration), UNIX domain socket (local IPC), and
   Streamable HTTP (web services), behind one `Transport` interface
-- **OAuth Authentication** - Built-in GitHub OAuth 2.0 support with PKCE for HTTP mode
+- **OAuth Authentication** - OAuth 2.1 authorization server for HTTP mode (PKCE, dynamic client
+  registration). Users sign in with GitHub or any OpenID Connect provider; access rules admit them
+  and grant app-defined roles, which can hide tools from callers who lack them
 - **YAML Configuration** - File-based config with defaults; OAuth credentials may instead be read
   from mounted secret files (Docker/Kubernetes)
 - **Structured Logging** - Multi-level logging (trace/debug/info/warn/error) with JSON and text formats
@@ -150,13 +152,8 @@ rationale, the hard-cutover decisions, and a worked wire-to-Go-types example.
 ## Using this library from another project
 
 ```bash
-go get github.com/spirilis/generic-go-mcp@v0.2.0
+go get github.com/spirilis/generic-go-mcp@v0.12.0
 ```
-
-If you're using an AI coding agent to build on top of this library, point it at
-[`.claude/skills/generic-go-mcp-consumption/SKILL.md`](.claude/skills/generic-go-mcp-consumption/SKILL.md)
-in this repo — it covers tool/resource authoring, transport and auth setup, and the Multi
-Round-Trip Requests pattern, with every example checked against the real API.
 
 ## Quick Start
 
@@ -233,7 +230,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{
 generic-go-mcp/
 ├── config/               # Configuration loading (YAML, env vars, secrets)
 ├── logging/              # Structured logging with multiple levels
-├── auth/                 # OAuth 2.0 authentication (GitHub)
+├── auth/                 # OAuth 2.1 authorization server: GitHub and OIDC sign-in, access rules, roles
 ├── transport/            # Transport abstractions (stdio, UNIX socket, Streamable HTTP)
 ├── mcp/                  # MCP protocol implementation (JSON-RPC 2.0)
 ├── compat/               # Optional legacy (2025-11-25 and earlier) compatibility overlay
@@ -307,20 +304,28 @@ server:
 auth:
   enabled: true
   issuer: "https://mcp.example.com"   # must match the server's public URL
-  github:
-    clientId: "your-github-oauth-app-id"
-    clientSecret: "your-github-oauth-secret"
-    # Or read from mounted secret files instead:
-    # clientIdFile: "/run/secrets/github_client_id"
-    # clientSecretFile: "/run/secrets/github_client_secret"
   storage:
     dbPath: "/var/lib/go-mcp/oauth.db"
-  allowlist:
-    users: ["my-github-user"]
-    orgs: ["my-company"]
-    teams:
-      - org: "my-company"
-        team: "platform-team"   # team slug, not display name
+  providers:
+    - name: github
+      type: github
+      clientId: "your-github-oauth-app-id"
+      clientSecretFile: "/run/secrets/github/client-secret"
+    - name: corp
+      type: oidc
+      displayName: Corp SSO
+      issuerURL: "https://login.example.com/realms/corp"
+      clientId: "mcp-server"
+      clientSecretFile: "/run/secrets/corp/client-secret"
+  access:
+    rules:
+      - provider: github
+        users: ["my-github-user"]
+        roles: [admin]
+      - provider: corp
+        groups: ["mcp-users"]
+        roles: [reader]
+    identityMaxAge: 168h
   # Optional: only these hosts may appear in a self-registered client's redirect_uris.
   # registration:
   #   allowedRedirectHosts: ["claude.ai", "localhost", "127.0.0.1"]
@@ -331,21 +336,275 @@ logging:
 ```
 
 Note the key names: they are camelCase under `auth:` and snake_case under `server:`, matching the
-struct tags in `config/config.go`. There is no `redirect_url` key: the callback URL you register
-with GitHub is always `<issuer>/callback`. See
+struct tags in `config/config.go` and `config/auth_providers.go`. See
 [config-oauth-example.yaml](config-oauth-example.yaml) for the fully annotated version, including
-pre-registered static clients.
+the legacy form and pre-registered static clients.
+
+### Authentication
+
+With `auth.enabled`, the server is an OAuth 2.1 authorization server for its MCP clients (`/register`,
+`/authorize`, `/token`, PKCE required), and `/mcp` takes only its bearer tokens. Users prove who they
+are by signing in, in the browser, with an upstream **provider**: GitHub, or any OpenID Connect
+identity provider. **Access rules** then decide who is admitted and which of the application's
+**roles** they hold.
+
+#### The redirect URI
+
+Every provider sends the browser back to one URL on this server: **`<issuer>/callback`** (for the
+config above, `https://mcp.example.com/callback`). Register exactly that URL at each provider: in the
+GitHub OAuth App's "Authorization callback URL", or as a valid redirect URI of the OIDC client (in
+Keycloak, the client's "Valid redirect URIs"; in Entra ID, a "Web" platform redirect URI). There is
+no per-provider path and no `redirect_url` key. The pending sign-in remembers which provider it went
+to.
+
+With more than one provider, `/authorize` shows a small chooser page (`POST /authorize/provider`);
+with one, it redirects straight to it.
+
+#### GitHub
+
+GitHub is the two-value setup: an [OAuth App](https://github.com/settings/developers) with the
+callback URL above, and its client ID and secret.
+
+```yaml
+providers:
+  - name: github          # principal ids are "github:<login>", as before v0.12
+    type: github
+    clientId: "Iv1.xxxxxxxxxxxxxxxxxx"
+    clientSecret: "xxxxxxxx"
+    # GitHub Enterprise Server: baseURL (apiURL defaults to <baseURL>/api/v3)
+    # baseURL: "https://github.example.com"
+```
+
+At each sign-in the library reads the user's organizations and team memberships (scope `read:org`)
+and stores them as groups `org` and `org/team-slug`, so a rule can match them. A failed lookup is
+logged and those groups are left out; the sign-in still succeeds.
+
+The legacy form, `auth.github` plus `auth.allowlist`, still loads and behaves exactly as before. It
+stands for one provider named `github` and one rule on it.
+
+#### OpenID Connect providers
+
+Any provider that publishes `<issuerURL>/.well-known/openid-configuration` works: Keycloak, Entra
+ID, Google, Okta, Authentik, Dex, Cognito. The library uses the authorization code flow with PKCE
+(S256) and a nonce, and verifies the id_token itself: RS256 or ES256 only, signature against the
+provider's JWKS, `iss`, `aud`/`azp`, `exp`/`iat`/`nbf` with 60 seconds of leeway, and the nonce.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `name` | (required) | `[a-z][a-z0-9-]{0,31}`, unique. Rules refer to it, and it prefixes principal ids (`corp:<sub>`). |
+| `type` | (required) | `oidc` (or `github`). |
+| `displayName` | the name | Shown on the chooser and consent pages. |
+| `issuerURL` | (required) | Must be https and equal the `issuer` the discovery document reports, exactly. http is accepted only on loopback (`localhost`, `127.0.0.1`), for a local IdP in development; only then may the discovery document's endpoints be http (on loopback) too. |
+| `clientId` / `clientIdFile` | (required) | The client registered at the IdP. |
+| `clientSecret` / `clientSecretFile` | none | Omit for a public client. |
+| `tokenEndpointAuthMethod` | `client_secret_basic` with a secret, else `none` | Or `client_secret_post`. Must agree with whether a secret is set. |
+| `scopes` | `[openid, profile, email]` | `openid` is always sent. |
+| `claims.username` | `preferred_username` | Dotted paths reach nested claims. A key that itself contains dots or colons (`https://x/groups`, `cognito:groups`) is tried whole first. |
+| `claims.email` | `email` | `email_verified` speaks only for the standard `email` claim, so with any other path (`upn`, `mail`) the email counts as unverified: email rules then match it only with `requireVerifiedEmail: false`. |
+| `claims.usernameIsUnique` | `false` | Allows `users` rules for this provider. Set it only when the IdP guarantees the username claim is unique and that users cannot choose or change it; OIDC promises neither for `preferred_username`. |
+| `claims.name` | `name` | |
+| `claims.groups` | `groups` | A string or an array of strings, e.g. `realm_access.roles` (Keycloak realm roles), `cognito:groups`. |
+| `claims.subject` | `sub` | Not configurable: users are always keyed by `(provider, issuer, sub)`, never by email or username. |
+| `userInfo` | `false` | Also fetch the userinfo endpoint and merge its claims (its `sub` must match). Some IdPs put groups only there. |
+| `authParams` | none | Extra `/authorize` parameters: `prompt`, `hd`, `domain_hint`, `acr_values`... The ones the library sets (`client_id`, `redirect_uri`, `state`, `nonce`, `code_challenge*`, `response_type`, `scope`) are refused. |
+| `allowedAlgorithms` | `[RS256, ES256]` | A subset of those two. `none` and `HS*` are never accepted. |
+| `caFile` | system roots | PEM bundle added to the system roots, for an IdP behind a private CA. |
+| `audience` | none | An `aud` value accepted besides the client id. |
+| `allowedJWKSHosts` | none | Hosts besides the issuer's that `jwks_uri`, and `userinfo_endpoint` when `userInfo` is on, may use (the userinfo claims are unsigned and decide admission as much as the keys do). Some IdPs (Google, for one) serve these from hosts other than the issuer's; list the hosts their discovery document names. |
+| `requireVerifiedEmail` | `true` | `emails` and `emailDomains` rules match only an email the IdP marks `email_verified`. OIDC only. |
+
+Discovery is lazy: startup makes no network calls, and an IdP that is down at startup does not stop
+the server. The first sign-in fetches discovery and keys in the background; until they arrive, that
+provider's `/authorize` answers 503 with `Retry-After`. Keys are refreshed hourly, and on an unknown
+`kid` at most once a minute. A discovery document whose `issuer` differs from `issuerURL`, or whose
+`jwks_uri` (or, with `userInfo`, `userinfo_endpoint`) is not https on an allowed host, disables the
+provider until restart.
+
+#### Access rules
+
+```yaml
+access:
+  rules:
+    - provider: github
+      users: ["spirilis"]              # pass/fail: admitted, no role
+    - provider: github
+      teams: ["acme/platform"]         # orgs: ["acme"] for a whole org
+      roles: [admin]
+    - provider: corp
+      groups: ["mcp-admins"]
+      roles: [admin, reader]
+    - provider: corp
+      emailDomains: ["example.com"]    # verified email only
+      roles: [reader]
+  identityMaxAge: 168h
+```
+
+- A user is admitted when **at least one rule** matches, and holds the **union** of the roles of
+  every matching rule. A rule matches when **any one** of its matchers does.
+- Matchers: `users` (GitHub login, case-insensitive; for OIDC only with `claims.usernameIsUnique`),
+  `subjects` (exact `sub`; for GitHub the numeric user id), `emails` (case-insensitive) and
+  `emailDomains` (the exact domain after the last `@`, no suffix match), both OIDC only and verified
+  emails only, `groups` (exact for OIDC, case-insensitive for GitHub), and, for GitHub only, `orgs`
+  and `teams` (`org/team-slug`). `anyone: true` admits every user the provider authenticates; it
+  stands alone in its rule and is logged as a warning.
+- **Fail closed:** in this form, a provider no rule names admits nobody (a startup warning says so).
+  Only the legacy form with an empty `allowlist` still admits every GitHub user.
+- Startup refuses a rule naming an unknown provider, an empty rule, `orgs`/`teams` on an OIDC rule,
+  `emails`/`emailDomains` on a GitHub rule (GitHub does not say whether the profile email is
+  verified), `users` on an OIDC rule without `claims.usernameIsUnique`, an empty or malformed entry,
+  and a role the application did not declare.
+- Rules are evaluated **on every request**, against an identity snapshot (username, email, groups)
+  taken at the user's last browser sign-in. A config change applies at once; a user no rule matches
+  any more gets `403 insufficient_scope`.
+- **`identityMaxAge`** bounds how stale that snapshot can get. A client can refresh its tokens for
+  this long after the user last signed in through the browser; then the refresh grant answers
+  `invalid_grant` and the client sends the user through `/authorize` again, which takes a new
+  snapshot. `0` (the default) means the refresh token lifetime, 30 days. The refresh grant also
+  re-checks the rules.
+
+#### Roles and the Go API
+
+Roles are an enumerated list your application declares. Config can grant only those, so a typo in a
+rule fails at startup instead of granting nothing.
+
+```go
+authService, err := auth.NewAuthService(cfg.Auth,
+    auth.WithRoles(
+        auth.Role{Name: "admin", Description: "may use destructive tools"},
+        auth.Role{Name: "reader", Description: "may use the read-only tools"},
+    ))
+
+// Gate a tool: callers holding none of the roles never see it.
+registry.RegisterWithOptions(deleteTool, deleteFn, mcp.RequireRoles("admin"))
+
+server := mcp.NewServer(registry, resources, &mcp.ServerConfig{
+    RolesFromContext: authService.RolesFromContext,
+    PrincipalFromContext: func(ctx context.Context) string {
+        p, _ := auth.PrincipalFromContext(ctx)
+        if p == nil {
+            return ""
+        }
+        return p.ID
+    },
+})
+```
+
+Inside a tool, or anywhere downstream of the middleware:
+
+```go
+p, ok := auth.PrincipalFromContext(ctx) // *auth.Principal
+p.ID            // "<provider>:<sub>" for OIDC; "github:<login>" (login lowercased) for GitHub
+p.Provider, p.Subject // never reassigned: key data by these where a renamed and reclaimed
+                      // GitHub login must not inherit it (GitHub's Subject is the numeric id)
+p.Provider      // "github", "corp"
+p.Username, p.Email, p.EmailVerified, p.Name, p.Groups
+p.Roles         // sorted, from the current rules
+p.HasRole("admin")
+auth.HasRole(ctx, "admin")
+authService.Roles() // what the application declared, for docs or a UI
+```
+
+`mcp.RequireRoles(roles...)` is any-of, passed to `RegisterWithOptions` (`Register` keeps its
+two-argument signature, which embedders' own `Registrar` interfaces rely on). With `ServerConfig.RolesFromContext` set, a gated tool is left
+out of `tools/list` for a caller without one of its roles, and `tools/call` on it answers exactly
+the `-32602` an unknown tool name gets, so a probe cannot tell the two apart. The same holds for
+legacy clients through the `compat` overlay. While any tool is gated, `tools/list` results carry
+`cacheScope: "private"`. `RequireRoles()` with no roles hides the tool from everyone. With
+`RolesFromContext` nil (stdio, UNIX sockets, HTTP without auth) nothing is gated. Two things stay
+caller-independent: `server/discover` declares the tools capability whenever any tool is registered,
+and `notifications/tools/list_changed` goes to every listener (it names no tool).
+
+The admin API (`POST`/`GET /admin/clients`, which mints and lists static clients) is served only to
+holders of the role you name with `auth.WithAdminRole("admin")` (it must be a declared role); others
+get 403. Without `WithAdminRole`, a config in the new form (`auth.providers` or `auth.access`) does
+not serve it at all, and only the pure legacy form keeps the v0.11 behaviour of serving it to every
+admitted user. Legacy rules grant no roles, so `WithAdminRole` with a legacy config closes the
+admin API to everyone.
+
+`transport.AuthProvider.UserFromContext` still returns the store's user id and the username, and
+`auth.GetUserFromContext` the stored `*auth.User`. Do not build principal ids from
+`User.GitHubLogin`: it is empty for OIDC users and for GitHub providers not named `github`, so all of
+them would share one id. Use `auth.PrincipalFromContext`.
+
+#### Secrets from files (Helm, Kubernetes)
+
+Every `clientId` and `clientSecret` has a `clientIdFile` / `clientSecretFile` twin that reads the
+value from a file and wins over the inline one, so a chart can mount a Secret and keep credentials
+out of its ConfigMap:
+
+```yaml
+providers:
+  - name: github
+    type: github
+    clientIdFile: /run/secrets/github/client-id
+    clientSecretFile: /run/secrets/github/client-secret
+```
+
+Surrounding whitespace is trimmed. A file that cannot be read, or is empty, refuses to start, with
+an error naming the key and the file. An `access:` key left present but empty (rules commented out,
+or Helm rendering `null`) counts as the new form when the config is read with `config.Load` (or
+`LoadFromBytes`): it admits nobody rather than falling back to the legacy admit-everyone. An
+embedder that decodes `config.AuthConfig` into its own struct gets a nil `Access` for a null
+`access:` (yaml.v3 leaves a null pointer nil), which is the legacy form; write `access: {}` or
+`access: {rules: []}` there, or set `Access` to `&config.AccessConfig{}` in code.
+
+#### Upgrading to v0.12.0
+
+Existing configs and code keep working: `auth.github` + `auth.allowlist` load and admit the same
+users, `/callback` is unchanged (no OAuth App needs editing), stored users and their consents carry
+over, and `NewAuthService(cfg)`, `ToolRegistry.Register(tool, fn)` and `transport.AuthProvider` keep
+their exact signatures (so interfaces you declared around them still hold; gating uses the new
+`RegisterWithOptions`). A few behaviors did change:
+
+- **MRTR answers need their `requestState`.** A `tools/call` carrying `inputResponses` without a
+  `requestState` is refused with -32602 before the tool runs. Earlier versions passed such answers
+  to the tool unverified, so a client could pre-confirm a confirm-before-act tool. Real clients echo
+  the `requestState` they were given and are unaffected.
+- **Refresh is no longer forever.** Each user must sign in through the browser again at least every
+  `identityMaxAge` (30 days unless set). Clients handle this as an ordinary `invalid_grant`.
+- **Refresh is bounded for users stored before v0.12 too.** Their age counts from their first
+  token refresh after the upgrade, so they sign in again within `identityMaxAge` of it.
+- **Stored users from before v0.12 have no groups on record.** When no rule matches such a user but
+  some rule for their provider matches on `orgs`, `teams` or `groups`, `/mcp` answers 401 ("Sign in
+  again"), not 403, so a user admitted through an org or team signs in once and that sign-in records
+  the groups. With no such rule (a `users`-only allowlist, say) a sign-in could not change the
+  outcome, so a removed user gets 403, as in v0.11. Users admitted by login are unaffected.
+- **A provider name is bound to its issuer.** `Principal.ID` is the provider name plus the sub or
+  login, without the issuer, so the server refuses to start when the store holds users of a
+  provider from another issuer than the one it has now: pointing the provider named `github` at an
+  Enterprise Server (`baseURL`), or changing an OIDC `issuerURL`, would otherwise give the new
+  issuer's users the ids (and your data keyed by them) of the old issuer's. Give the new issuer a
+  new provider name; the old name's users are no longer admitted once it is removed. The check
+  reads the auth store, so it does not survive replacing the database file while your own data
+  keyed by principal ids stays.
+- **The admin API needs a role in the new form.** `/admin/clients` is served to every admitted user
+  only for the pure legacy form; with `auth.providers` or `auth.access`, name the role that may use
+  it with `auth.WithAdminRole`, or it is not served (see "Roles and the Go API").
+- **A `*File` secret that is unreadable or empty now refuses to start** instead of being ignored.
+- **GitHub API errors are checked.** A failed orgs or teams lookup at sign-in drops those groups (and
+  any roles they grant) until the next successful sign-in.
+- **`auth.Storage` gained `GetUserByIdentity`.** A custom `Storage` implementation (the library's
+  own is `BoltStorage`) must add it.
+- Before enabling an OIDC provider, or a GitHub provider not named `github`, move any principal ids
+  built from `User.GitHubLogin` to `auth.PrincipalFromContext(ctx).ID`. `Principal.ID` lowercases
+  the login (`github:spirilis`), so if your stored ids kept the login's case (`"github:" +
+  User.GitHubLogin`), lowercase them, or compare case-insensitively, when you switch.
+- The debug access log names the signed-in user's login under `login` (it was `github_login`).
+
+What a new config gains: `auth.providers` (several, GitHub Enterprise, any OIDC IdP), `auth.access`
+rules with roles, and `identityMaxAge`. New-form configs fail closed: a provider with no rule admits
+nobody.
 
 #### The consent screen
 
-Dynamic client registration at `<issuer>/register` is open, as RFC 7591 intends, and GitHub skips its
-own approval prompt for an OAuth app the user has already authorized. Together those would let
-anyone register a client whose `redirect_uri` is their own host and harvest a working authorization
-code from an allowlisted user who merely follows a link — the confused-deputy problem the MCP
-security guidance describes. So after GitHub sign-in and the allowlist check, the first time a user
+Dynamic client registration at `<issuer>/register` is open, as RFC 7591 intends, and GitHub (like
+most IdPs) skips its own approval prompt for an app the user has already authorized. Together those
+would let anyone register a client whose `redirect_uri` is their own host and harvest a working
+authorization code from an admitted user who merely follows a link — the confused-deputy problem the
+MCP security guidance describes. So after sign-in and the access rules, the first time a user
 authorizes a client the operator did not list under `auth.clients`, the server shows a consent screen
-on the issuer's own origin. It names the client, the signed-in GitHub login, and the host the
-browser will be sent to. The approval is remembered per user and client, so it costs one click per
+on the issuer's own origin. It names the client, the provider and the signed-in user, and the host
+the browser will be sent to. The approval is remembered per user and client, so it costs one click per
 new client, not one per sign-in.
 
 The screen cannot be framed, and it is bound to the browser that started the sign-in by a one-shot
@@ -472,6 +731,7 @@ verification before your function runs):
 ```go
 registry := mcp.NewToolRegistry()
 registry.Register(toolDefinition, toolFunction)
+registry.RegisterWithOptions(adminTool, adminFn, mcp.RequireRoles("admin")) // see "Roles and the Go API"
 registry.Unregister("my_tool") // bool: whether a tool by that name was there to remove
 registry.List()                // All registered tools, in registration order (stable across calls)
 registry.Get("my_tool")        // (Tool, bool) lookup by name
@@ -872,6 +1132,8 @@ Every result carries a `resultType`, and list/read results carry `ttlMs` and `ca
 `resources/templates/list`; `ReadTTLMs` covers `resources/read`. Defaults are 5 minutes for
 catalogs and 0 (always refetch) for resource reads; override via `ServerConfig.ListTTLMs`,
 `ReadTTLMs`, and `DefaultCacheScope` (set `"private"` for per-user catalogs behind auth).
+`tools/list` switches to `"private"` on its own while `RolesFromContext` is set and any tool is
+gated, since its contents then depend on the caller.
 
 `completion/complete` deliberately carries neither: the spec does not list it among the cacheable
 operations, and a completion list is the last thing a client should be holding on to.

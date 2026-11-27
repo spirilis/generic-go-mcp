@@ -7,19 +7,41 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/spirilis/generic-go-mcp/config"
-	"github.com/spirilis/generic-go-mcp/logging"
 )
 
 // AuthService is the main entry point for all auth operations
 type AuthService struct {
 	config       *config.AuthConfig
 	storage      Storage
-	githubClient *GitHubClient
 	tokenService *TokenService
+
+	// providers are the identity providers users sign in with, in config order (the order the
+	// chooser lists them); providerByName indexes them.
+	providers      []Provider
+	providerByName map[string]Provider
+
+	// bg runs the providers' background fetches; Close stops them.
+	bg *background
+
+	// access is the compiled rule set every login and every request is checked against.
+	access *accessPolicy
+
+	// roles are the roles the application declared (WithRoles).
+	roles []Role
+
+	// adminRole is the role the admin API requires (WithAdminRole). adminForAll serves it to
+	// every admitted user instead, as before v0.12.0; only the pure legacy form, with no admin
+	// role named, gets that. With neither the admin API is not served.
+	adminRole   string
+	adminForAll bool
+
+	// identityMaxAge is config.AccessConfig.IdentityMaxAge (0: the refresh token lifetime).
+	identityMaxAge time.Duration
 
 	// trustedClients are the client IDs pre-registered in config. The operator vetted their
 	// redirect URIs, so they skip the consent screen. Membership is deliberately not
@@ -34,10 +56,16 @@ type AuthService struct {
 	stopSweep, sweepDone chan struct{}
 }
 
-// NewAuthService creates a new authentication service
-func NewAuthService(cfg *config.AuthConfig) (*AuthService, error) {
+// NewAuthService creates a new authentication service. It refuses to start on any
+// configuration error: an unknown provider or role in a rule, an unreadable secret file, and
+// the rest that config.AuthConfig.Resolve and the role checks reject.
+func NewAuthService(cfg *config.AuthConfig, opts ...Option) (*AuthService, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("auth config is required")
+	}
+	var o serviceOptions
+	for _, opt := range opts {
+		opt(&o)
 	}
 
 	// Validate before opening storage, so a bad entry fails startup without leaving the database
@@ -46,31 +74,60 @@ func NewAuthService(cfg *config.AuthConfig) (*AuthService, error) {
 	if err != nil {
 		return nil, err
 	}
+	resolved, err := cfg.Resolve()
+	if err != nil {
+		return nil, err
+	}
+	access, err := compileAccess(resolved, o.roles, o.adminRole)
+	if err != nil {
+		return nil, err
+	}
+
+	// Providers do no network I/O here: an unreachable IdP must not stop the server starting.
+	bg := newBackground()
+	providers := make([]Provider, 0, len(resolved.Providers))
+	byName := make(map[string]Provider, len(resolved.Providers))
+	for _, p := range resolved.Providers {
+		prov, err := newProvider(p, bg)
+		if err != nil {
+			bg.Close()
+			return nil, err
+		}
+		providers = append(providers, prov)
+		byName[p.Name] = prov
+	}
 
 	storage, err := NewBoltStorage(cfg.Storage.DBPath)
 	if err != nil {
+		bg.Close()
 		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}
-
-	githubClient := NewGitHubClient(cfg.GitHub)
-	tokenService := NewTokenService(cfg.Issuer, storage)
+	if err := checkStoredIssuers(storage, resolved.Providers); err != nil {
+		bg.Close()
+		storage.Close()
+		return nil, err
+	}
 
 	svc := &AuthService{
 		config:               cfg,
 		storage:              storage,
-		githubClient:         githubClient,
-		tokenService:         tokenService,
+		providers:            providers,
+		providerByName:       byName,
+		bg:                   bg,
+		tokenService:         NewTokenService(cfg.Issuer, storage),
+		access:               access,
+		roles:                slices.Clone(o.roles),
+		adminRole:            o.adminRole,
+		adminForAll:          o.adminRole == "" && resolved.LegacyForm,
+		identityMaxAge:       resolved.IdentityMaxAge,
 		trustedClients:       make(map[string]bool, len(cfg.Clients)),
 		allowedRedirectHosts: allowedHosts,
 	}
 
-	// A completely empty allowlist means isUserAuthorized admits every authenticated GitHub
-	// user (see github.go). That is a legitimate configuration, but a dangerous default to
-	// hit by accident on a deployed server, so make it loud rather than silent.
-	if len(cfg.Allowlist.Users) == 0 && len(cfg.Allowlist.Orgs) == 0 && len(cfg.Allowlist.Teams) == 0 {
-		logging.Warn("auth enabled with an empty allowlist: every authenticated GitHub user will be authorized; " +
-			"set auth.allowlist.users/orgs/teams to restrict access")
-	}
+	// Rules that admit everyone (including the legacy empty allowlist) and providers no rule
+	// admits from are legitimate, but dangerous or surprising to hit by accident on a deployed
+	// server, so make them loud rather than silent.
+	access.warn(resolved)
 
 	// Initialize static clients from config
 	for _, client := range cfg.Clients {
@@ -88,6 +145,8 @@ func NewAuthService(cfg *config.AuthConfig) (*AuthService, error) {
 			CreatedAt:               time.Now(),
 		})
 		if err != nil {
+			svc.bg.Close()
+			svc.storage.Close()
 			return nil, fmt.Errorf("failed to store static client %s: %w", client.ClientID, err)
 		}
 	}
@@ -96,8 +155,10 @@ func NewAuthService(cfg *config.AuthConfig) (*AuthService, error) {
 	return svc, nil
 }
 
-// Close closes the auth service and releases resources
+// Close closes the auth service and releases resources. Background work (the sweep, OIDC
+// discovery and key refresh) has stopped by the time it returns.
 func (svc *AuthService) Close() error {
+	svc.bg.Close()
 	svc.stopSweeper()
 	if svc.storage != nil {
 		return svc.storage.Close()
@@ -115,6 +176,21 @@ type User struct {
 	AvatarURL     string   `json:"avatar_url,omitempty"`
 	Organizations []string `json:"organizations,omitempty"`
 	Teams         []string `json:"teams,omitempty"` // Format: "org/team"
+
+	// The identity snapshot, rewritten at each browser login and evaluated against the access
+	// rules on every request. A record from before v0.12.0 has none of these: it is a GitHub
+	// user (Provider "" reads as "github") whose groups were never recorded, which
+	// LastLoginAt.IsZero() identifies.
+	//
+	// (Provider, Issuer, Subject) is the record's identity key: an OIDC user is found by it at
+	// login, never by email or username. Issuer is the OIDC issuer, or the GitHub web URL.
+	Provider      string    `json:"provider,omitempty"`
+	Issuer        string    `json:"issuer,omitempty"`
+	Subject       string    `json:"subject,omitempty"`
+	Username      string    `json:"username,omitempty"`
+	EmailVerified bool      `json:"email_verified,omitempty"`
+	Groups        []string  `json:"groups,omitempty"`
+	LastLoginAt   time.Time `json:"last_login_at,omitzero"`
 }
 
 // AuthorizationCode represents a pending authorization code
@@ -152,6 +228,13 @@ type RefreshToken struct {
 	Resource  string    `json:"resource,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
 	CreatedAt time.Time `json:"created_at"`
+
+	// LegacyAgeFrom is when the refresh chain of a user with no recorded login (a record from
+	// before v0.12.0) first refreshed after the upgrade. It is carried across rotations and
+	// stands in for User.LastLoginAt in the identityMaxAge check, so such a user too must sign
+	// in again within identityMaxAge of the upgrade. It lives on the token, not the user, so
+	// the refresh grant never rewrites a user record a concurrent login may be updating.
+	LegacyAgeFrom time.Time `json:"legacy_age_from,omitzero"`
 }
 
 // RegisteredClient represents an OAuth client (dynamic or static)
@@ -192,9 +275,16 @@ type PendingAuthRequest struct {
 	Resource            string    `json:"resource,omitempty"`
 	CreatedAt           time.Time `json:"created_at"`
 	ExpiresAt           time.Time `json:"expires_at"`
+
+	// The sign-in at the identity provider. Provider is empty while the user is on the
+	// chooser page (and on requests stored before v0.12.0, which all went to GitHub). Nonce
+	// and UpstreamVerifier (PKCE toward the IdP) are fresh for each redirect to a provider.
+	Provider         string `json:"provider,omitempty"`
+	Nonce            string `json:"nonce,omitempty"`
+	UpstreamVerifier string `json:"upstream_verifier,omitempty"`
 }
 
-// PendingConsent is an authorization that has passed GitHub login and the allowlist, parked
+// PendingConsent is an authorization that has passed the provider login and the access rules, parked
 // until the user approves or denies the requesting client on the consent screen.
 type PendingConsent struct {
 	ID string `json:"id"`

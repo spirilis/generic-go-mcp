@@ -7,14 +7,25 @@ import (
 	"time"
 )
 
-// RegisterAdminRoutes adds admin endpoints to the mux (protected by auth middleware)
+// RegisterAdminRoutes adds admin endpoints to the mux (protected by auth middleware). It adds
+// nothing when no one may use them: a new-form config without WithAdminRole.
 func (svc *AuthService) RegisterAdminRoutes(mux *http.ServeMux) {
+	if svc.adminRole == "" && !svc.adminForAll {
+		return
+	}
 	// Wrap admin endpoints with auth middleware
 	mux.Handle("/admin/clients", svc.Middleware(http.HandlerFunc(svc.handleAdminClients)))
 }
 
 // handleAdminClients handles admin client management endpoints
 func (svc *AuthService) handleAdminClients(w http.ResponseWriter, r *http.Request) {
+	// Checked here as well as at registration, so a handler mounted some other way still
+	// refuses a principal without the role.
+	if !svc.adminForAll && (svc.adminRole == "" || !HasRole(r.Context(), svc.adminRole)) {
+		svc.forbidden(w, "The admin API requires the application's admin role")
+		return
+	}
+
 	// Extract client ID from path if present
 	path := r.URL.Path
 	clientID := ""

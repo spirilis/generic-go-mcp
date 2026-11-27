@@ -70,6 +70,15 @@ type AuthConfig struct {
 	Allowlist AllowlistConfig `yaml:"allowlist"`         // Authorization allowlist
 	Clients   []StaticClient  `yaml:"clients,omitempty"` // Pre-configured static clients
 
+	// Providers are the identity providers users sign in with (see auth_providers.go). The
+	// legacy GitHub block above is the same as a provider named "github"; the two may be
+	// combined as long as Providers has no entry of its own named "github".
+	Providers []ProviderConfig `yaml:"providers,omitempty"`
+
+	// Access says who is admitted and with which roles. A pointer, because its presence (even
+	// empty) is what switches off the legacy rule that an empty allowlist admits everyone.
+	Access *AccessConfig `yaml:"access,omitempty"`
+
 	// Registration constrains RFC 7591 dynamic client registration at /register.
 	Registration RegistrationConfig `yaml:"registration,omitempty"`
 }
@@ -135,8 +144,15 @@ func Load(path string) (*Config, error) {
 // LoadFromBytes parses configuration from a YAML byte slice
 func LoadFromBytes(data []byte) (*Config, error) {
 	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+	if doc.Kind != 0 { // an empty document leaves the defaults
+		if err := doc.Decode(&cfg); err != nil {
+			return nil, fmt.Errorf("failed to parse config: %w", err)
+		}
+		markEmptyAccess(&doc, &cfg)
 	}
 
 	// Apply defaults

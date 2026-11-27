@@ -57,16 +57,22 @@ func (ts *TokenService) GenerateAccessToken(userID, clientID, scope, resource st
 
 // GenerateRefreshToken creates a new refresh token
 func (ts *TokenService) GenerateRefreshToken(userID, clientID, scope, resource string) (*RefreshToken, error) {
+	return ts.generateRefreshToken(userID, clientID, scope, resource, time.Time{})
+}
+
+// generateRefreshToken is GenerateRefreshToken carrying a refresh chain's LegacyAgeFrom.
+func (ts *TokenService) generateRefreshToken(userID, clientID, scope, resource string, legacyAgeFrom time.Time) (*RefreshToken, error) {
 	token := generateSecureToken(RefreshTokenLength)
 
 	refreshToken := &RefreshToken{
-		Token:     token,
-		ClientID:  clientID,
-		UserID:    userID,
-		Scope:     scope,
-		Resource:  resource,
-		ExpiresAt: time.Now().Add(RefreshTokenTTL),
-		CreatedAt: time.Now(),
+		Token:         token,
+		ClientID:      clientID,
+		UserID:        userID,
+		Scope:         scope,
+		Resource:      resource,
+		ExpiresAt:     time.Now().Add(RefreshTokenTTL),
+		CreatedAt:     time.Now(),
+		LegacyAgeFrom: legacyAgeFrom,
 	}
 
 	if err := ts.storage.StoreRefreshToken(context.Background(), refreshToken); err != nil {

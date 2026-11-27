@@ -201,8 +201,9 @@ tr := transport.NewHTTPTransport(transport.HTTPTransportConfig{
 
 The hook runs **before** `/mcp` and any auth routes are registered, so a pattern collision panics at
 startup instead of silently shadowing an endpoint the protocol depends on. That means the embedder
-must not claim `/mcp`, and — when `AuthService` is set — must not claim `/authorize`, `/token`,
-`/callback`, `/consent`, `/register`, `/admin/` or `/.well-known/` either.
+must not claim `/mcp`, and — when `AuthService` is set — must not claim `/authorize`,
+`/authorize/provider`, `/token`, `/callback`, `/consent`, `/register`, `/admin/` or `/.well-known/`
+either.
 
 Routes registered here are **not** behind the auth middleware: that wraps `/mcp` alone. A health
 endpoint should stay unauthenticated (a probe has no token), but do not use this hook for anything
@@ -264,6 +265,33 @@ package restores a legacy-compatible surface on this same `/mcp` endpoint when w
 
 With compat off, this binding is byte-for-byte what the rest of this document describes — that's a
 deliberate, tested property, not an incidental one.
+
+## Authentication
+
+Set `HTTPTransportConfig.AuthService` (an `*auth.AuthService`, through the `transport.AuthProvider`
+interface) and `/mcp` requires `Authorization: Bearer <access token>`, issued by the same service's
+OAuth endpoints. The middleware wraps `/mcp` alone.
+
+| Request | Status | Body |
+| --- | --- | --- |
+| No token, or an unknown or expired one | 401, `WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource"` | `{"error":"invalid_token"}` |
+| Valid token, but no access rule admits the user any more | 403 | `{"error":"insufficient_scope"}` |
+| Valid token, but only a new sign-in could admit the user: a user stored before v0.12 (no groups on record) while a group rule exists for the provider, or a user of the provider's former issuer (stored after startup; the server refuses to start over such users) | 401, as above | `{"error":"invalid_token","error_description":"Sign in again"}` |
+| Valid token, admitted | the MCP response | the request context carries `*auth.Principal` |
+
+The 401 is what starts an MCP client's OAuth flow: it reads the protected-resource metadata, finds
+the issuer, registers at `/register` if it must, and sends the user to `/authorize`. There the user
+signs in with GitHub or an OpenID Connect provider (a chooser page appears when several are
+configured), approves the client on the consent screen the first time, and the client exchanges the
+code at `/token`. Every provider returns to the one redirect URI `<issuer>/callback`.
+
+Access rules are evaluated on every `/mcp` request, so a config change takes effect immediately.
+Roles the rules grant reach the MCP layer through `mcp.ServerConfig.RolesFromContext`
+(`authService.RolesFromContext`), where `mcp.RequireRoles` hides tools from callers without them, in
+`tools/list` and `tools/call` alike, for modern and legacy clients. Providers, rules, roles and
+`identityMaxAge` are described in the README's
+[Authentication](README.md#authentication) section; every key is annotated in
+[config-oauth-example.yaml](config-oauth-example.yaml).
 
 ## Testing
 

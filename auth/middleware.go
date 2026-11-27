@@ -21,6 +21,7 @@ const (
 	ContextKeyUser        contextKey = "auth_user"
 	ContextKeyAccessToken contextKey = "auth_access_token"
 	ContextKeySession     contextKey = "auth_session"
+	ContextKeyPrincipal   contextKey = "auth_principal"
 )
 
 // Middleware creates an HTTP middleware for token validation
@@ -64,9 +65,30 @@ func (svc *AuthService) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Admission and roles come from the current rules, evaluated against the identity
+		// snapshot from the user's last login, so a config change applies to tokens already
+		// issued.
+		principal, admitted := svc.authorizeUser(user)
+		if !admitted {
+			if svc.reloginMayAdmit(user) {
+				// Stored before v0.12.0 (which did not record orgs and teams) while a group
+				// rule may well match, or under the provider's former issuer. A 401 makes the
+				// client sign in again, which takes a fresh snapshot; a 403 would strand it.
+				logging.Debug("Auth failed: no access rule matches the stored record, but a new sign-in may",
+					"user_id", user.ID, "remote_addr", r.RemoteAddr)
+				svc.unauthorized(w, "Sign in again")
+				return
+			}
+			logging.Debug("Auth failed: no access rule matches the user",
+				"user_id", user.ID, "provider", user.Provider, "remote_addr", r.RemoteAddr)
+			svc.forbidden(w, "User is not authorized")
+			return
+		}
+
 		logging.Debug("Auth successful",
 			"user_id", user.ID,
-			"github_login", user.GitHubLogin,
+			"principal", principal.ID,
+			"roles", principal.Roles,
 			"client_id", accessToken.ClientID,
 			"remote_addr", r.RemoteAddr)
 
@@ -74,6 +96,7 @@ func (svc *AuthService) Middleware(next http.Handler) http.Handler {
 		ctx := r.Context()
 		ctx = context.WithValue(ctx, ContextKeyUser, user)
 		ctx = context.WithValue(ctx, ContextKeyAccessToken, accessToken)
+		ctx = context.WithValue(ctx, ContextKeyPrincipal, principal)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -117,7 +140,7 @@ func (svc *AuthService) UserFromContext(ctx context.Context) (id, login string, 
 	if user == nil {
 		return "", "", false
 	}
-	return user.ID, user.GitHubLogin, true
+	return user.ID, identityFromUser(user).Username, true
 }
 
 // GetAccessTokenFromContext retrieves the access token from the request context
